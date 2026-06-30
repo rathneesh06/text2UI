@@ -1,0 +1,156 @@
+/* =============================================
+   CodeViewer — Figma image 7 App.tsx panel
+   ============================================= */
+
+.code-viewer {
+  background: var(--bg-card);
+  border: 1px solid var(--border-color);
+  border-radius: var(--border-radius-lg);
+  overflow: hidden;
+  display: flex;
+  flex-direction: column;
+}
+
+.code-viewer__header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  padding: 8px 10px;
+  border-bottom: 1px solid var(--border-color);
+}
+
+.code-viewer__tabs {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  min-width: 0;
+  overflow-x: auto;
+}
+
+.code-viewer__tab {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  padding: 5.5px 11px;
+  border-radius: var(--border-radius-full);
+  font-family: var(--font-mono);
+  font-size: 10px;
+  font-weight: 600;
+  color: var(--text-muted);
+  white-space: nowrap;
+  transition: color var(--transition-fast), background var(--transition-fast);
+}
+
+.code-viewer__tab:hover {
+  color: var(--text-secondary);
+}
+
+.code-viewer__tab--active {
+  background: rgba(139, 92, 246, 0.16);
+  color: #ede9fe;
+}
+
+.code-viewer__tab-icon {
+  font-size: 10px;
+}
+
+.code-viewer__actions {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  flex: none;
+}
+
+.code-viewer__action-btn {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  padding: 5.5px 11px;
+  border-radius: var(--border-radius-full);
+  font-size: 10.5px;
+  font-weight: 500;
+  color: var(--text-tertiary);
+  transition: color var(--transition-fast), background var(--transition-fast);
+}
+
+.code-viewer__action-btn:hover {
+  color: var(--text-primary);
+  background: rgba(255, 255, 255, 0.05);
+}
+
+.code-viewer__close-btn {
+  font-size: 11px;
+  padding: 5.5px 9px;
+}
+
+/* ---- body ---- */
+.code-viewer__body {
+  display: flex;
+  background: #0a0a0e;
+  max-height: 420px;
+  overflow: auto;
+}
+
+.code-viewer__line-numbers {
+  display: flex;
+  flex-direction: column;
+  flex: none;
+  padding: 12px 0;
+  background: #0d0d12;
+  border-right: 1px solid var(--border-color);
+  text-align: right;
+  user-select: none;
+}
+
+.code-viewer__line-numbers span {
+  font-family: var(--font-mono);
+  font-size: 10px;
+  line-height: 1.8;
+  color: var(--text-muted);
+  padding: 0 10px;
+}
+
+.code-viewer__pre {
+  flex: 1;
+  margin: 0;
+  padding: 12px 14px;
+  overflow: visible;
+}
+
+.code-viewer__pre code {
+  font-family: var(--font-mono);
+  font-size: 10.5px;
+  line-height: 1.8;
+  color: #e4e4ea;
+  white-space: pre;
+  background: none;
+  text-shadow: none;
+}
+
+/* ---- Prism token theme (Figma purple/cyan/amber) ---- */
+.code-viewer__pre .token.comment,
+.code-viewer__pre .token.prolog,
+.code-viewer__pre .token.doctype,
+.code-viewer__pre .token.cdata { color: #63636e; font-style: italic; }
+
+.code-viewer__pre .token.punctuation { color: #9b9ba6; }
+
+.code-viewer__pre .token.keyword,
+.code-viewer__pre .token.operator,
+.code-viewer__pre .token.boolean { color: #c084fc; }
+
+.code-viewer__pre .token.function,
+.code-viewer__pre .token.class-name,
+.code-viewer__pre .token.tag { color: #22d3ee; }
+
+.code-viewer__pre .token.string,
+.code-viewer__pre .token.char,
+.code-viewer__pre .token.attr-value { color: #fbbf24; }
+
+.code-viewer__pre .token.number,
+.code-viewer__pre .token.constant { color: #fb7185; }
+
+.code-viewer__pre .token.attr-name,
+.code-viewer__pre .token.property,
+.code-viewer__pre .token.parameter { color: #a78bfa; }

@@ -1,0 +1,86 @@
+// bff/dashboard/validate.ts — the pre-render policy layer. It checks a DashboardSpec
+// against the real data profile BEFORE anything renders, and repairs what it safely
+// can (drop a missing column, coerce a numeric agg on a text column to count, strip a
+// timeGrain from a non-temporal axis, keep one series for pie). Whatever can't be
+// repaired is dropped with a warning, so a single bad node can never blank the board.
+import type { Dataset } from "../../shared/types";
+import type { DashboardSpec, Section, Widget, Metric, Agg } from "../../shared/dashboard-spec";
+
+type ColMap = Map<string, string>; // colName -> profile type (integer|number|boolean|date|string)
+const NUMERIC = new Set(["integer", "number"]);
+const TEMPORAL = new Set(["date"]);
+const NUMERIC_AGGS: Agg[] = ["sum", "avg", "min", "max", "median"];
+
+function tableIndex(profiles: Dataset[]): Map<string, ColMap> {
+  const idx = new Map<string, ColMap>();
+  for (const d of profiles) {
+    const m: ColMap = new Map();
+    for (const c of d.profile.columns) m.set(c.name, c.type);
+    idx.set(d.tableName, m);
+  }
+  return idx;
+}
+
+export interface ValidationResult { spec: DashboardSpec; warnings: string[] }
+
+export function validateSpec(spec: DashboardSpec, profiles: Dataset[]): ValidationResult {
+  const idx = tableIndex(profiles);
+  const warnings: string[] = [];
+  const warn = (m: string) => warnings.push(m);
+
+  // Coerce a metric to something the data supports; returns null if unfixable.
+  const fixMetric = (cols: ColMap, table: string, m: Metric, where: string): Metric | null => {
+    if (m.agg === "count") return m; // count(*) needs no column
+    if (!cols.has(m.col)) { warn(`${where}: column "${m.col}" not in ${table} — dropped`); return null; }
+    const t = cols.get(m.col)!;
+    if (NUMERIC_AGGS.includes(m.agg) && !NUMERIC.has(t)) {
+      warn(`${where}: ${m.agg}("${m.col}") needs a numeric column (it is ${t}) — using count instead`);
+      return { ...m, agg: "count" };
+    }
+    return m;
+  };
+
+  const fixWidget = (w: Widget): Widget | null => {
+    const cols = idx.get(w.table);
+    if (!cols) { warn(`widget "${w.id}": table "${w.table}" not found — dropped`); return null; }
+
+    if (w.kind === "kpi") {
+      const m = fixMetric(cols, w.table, w.metric, `kpi "${w.id}"`);
+      return m ? { ...w, metric: m } : null;
+    }
+
+    if (w.kind === "table") {
+      const columns = w.columns.filter((c) => c.col && (c.agg === "count" || cols.has(c.col)));
+      if (columns.length !== w.columns.length) warn(`table "${w.id}": dropped column(s) not in ${w.table}`);
+      const groupBy = (w.groupBy ?? []).filter((g) => cols.has(g.col));
+      if (!columns.length) { warn(`table "${w.id}": no valid columns — dropped`); return null; }
+      return { ...w, columns, groupBy };
+    }
+
+    // chart kinds: line|bar|area|pie|donut
+    if (!cols.has(w.x.col)) { warn(`chart "${w.id}": x column "${w.x.col}" not in ${w.table} — dropped`); return null; }
+    let x = w.x;
+    if (x.timeGrain && !TEMPORAL.has(cols.get(x.col)!)) {
+      warn(`chart "${w.id}": timeGrain on non-temporal "${x.col}" — removed`);
+      x = { ...x, timeGrain: undefined };
+    }
+    let series = w.series
+      .map((m) => fixMetric(cols, w.table, m, `chart "${w.id}"`))
+      .filter((m): m is Metric => !!m);
+    if (!series.length) { warn(`chart "${w.id}": no valid series — dropped`); return null; }
+    if ((w.kind === "pie" || w.kind === "donut") && series.length > 1) {
+      warn(`chart "${w.id}": pie/donut shows one measure — kept the first`);
+      series = series.slice(0, 1);
+    }
+    return { ...w, x, series };
+  };
+
+  const sections: Section[] = [];
+  for (const s of spec.sections) {
+    const widgets = s.widgets.map(fixWidget).filter((w): w is Widget => !!w);
+    if (widgets.length) sections.push({ ...s, widgets });
+    else warn(`section "${s.id}": empty after validation — dropped`);
+  }
+
+  return { spec: { ...spec, sections }, warnings };
+}

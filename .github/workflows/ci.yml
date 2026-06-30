@@ -1,0 +1,53 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_USER: text2ui
+          POSTGRES_PASSWORD: text2ui
+          POSTGRES_DB: text2ui
+        ports:
+          - "5432:5432"
+        options: >-
+          --health-cmd "pg_isready -U text2ui"
+          --health-interval 5s
+          --health-timeout 3s
+          --health-retries 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: npm
+      - run: npm ci
+      - run: npm run typecheck
+      - run: npm run test                 # 18-suite offline gate (includes the offline eval scorers/runner)
+      - name: Real tenant-isolation E2E (DuckDB + Postgres)
+        run: npm run test:storage:live
+        env:
+          PG_URL: postgres://text2ui:text2ui@localhost:5432/text2ui
+
+  # Optional: live LLM eval. Needs a GEMINI_API_KEY repo secret and a running BFF.
+  # Gate quality regressions here before merging knowledge-scaling changes (exemplars,
+  # domains, and — later — the Design Retrieval corpus).
+  #
+  # eval-live:
+  #   runs-on: ubuntu-latest
+  #   steps:
+  #     - uses: actions/checkout@v4
+  #     - uses: actions/setup-node@v4
+  #       with: { node-version: "22", cache: npm }
+  #     - run: npm ci
+  #     - run: npm run start:bff &        # start BFF in the background
+  #     - run: npx wait-on http://localhost:8787/health
+  #     - run: npm run test:eval:live
+  #       env:
+  #         GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}

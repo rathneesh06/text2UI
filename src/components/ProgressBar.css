@@ -1,0 +1,162 @@
+/* =============================================
+   ProgressBar — Figma stepper (images 5 & 6)
+   Data Ready › Generating › App Live · Export App.tsx
+   ============================================= */
+
+.progress-bar {
+  background: var(--bg-card);
+  border: 1px solid var(--border-color);
+  border-radius: var(--border-radius-lg);
+  padding: 11px 16px;
+  margin: 14px 16px 0;
+}
+
+.progress-bar__row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  flex-wrap: wrap;
+}
+
+.progress-bar__steps {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  flex-wrap: wrap;
+}
+
+.progress-bar__step {
+  display: flex;
+  align-items: center;
+  gap: 7px;
+}
+
+.progress-bar__dot {
+  display: grid;
+  place-items: center;
+  width: 14px;
+  height: 14px;
+  flex: none;
+}
+
+/* completed — purple */
+.progress-bar__check {
+  font-size: 11px;
+  color: var(--accent-purple-light);
+}
+
+/* active — amber pulse */
+.progress-bar__pulse {
+  width: 7px;
+  height: 7px;
+  border-radius: 50%;
+  background: var(--accent-amber);
+  box-shadow: 0 0 8px rgba(251, 191, 36, 0.7);
+  animation: pulse 1.6s ease-in-out infinite;
+}
+
+/* pending — dim */
+.progress-bar__empty {
+  width: 7px;
+  height: 7px;
+  border-radius: 50%;
+  background: #4b4b55;
+}
+
+.progress-bar__label {
+  font-size: 11px;
+  font-weight: 600;
+  color: var(--text-muted);
+  white-space: nowrap;
+}
+
+.progress-bar__step--completed .progress-bar__label {
+  color: #c4b5fd;
+}
+
+.progress-bar__step--active .progress-bar__label {
+  color: var(--accent-amber);
+}
+
+/* the chevron between steps */
+.progress-bar__connector {
+  width: 8px;
+  height: 8px;
+  margin-left: 10px;
+  border-top: 1.5px solid var(--text-muted);
+  border-right: 1.5px solid var(--text-muted);
+  transform: rotate(45deg);
+  opacity: 0.6;
+}
+
+.progress-bar__connector--filled {
+  border-color: var(--accent-purple-light);
+}
+
+/* Export App.tsx */
+.progress-bar__deploy {
+  display: inline-flex;
+  align-items: center;
+  gap: 7px;
+  padding: 6px 12px;
+  border-radius: var(--border-radius-full);
+  font-size: 11px;
+  font-weight: 500;
+  color: var(--text-tertiary);
+  transition: color var(--transition-fast), background var(--transition-fast);
+}
+
+.progress-bar__deploy:disabled {
+  opacity: 0.45;
+  cursor: not-allowed;
+}
+
+.progress-bar__deploy--ready:hover {
+  color: var(--text-primary);
+  background: rgba(255, 255, 255, 0.05);
+}
+
+/* live status stream while generating (compact log) */
+.progress-bar__stream {
+  margin-top: 11px;
+  padding-top: 11px;
+  border-top: 1px solid var(--border-color);
+  display: flex;
+  gap: 12px;
+}
+
+.progress-bar__stream-label {
+  font-family: var(--font-mono);
+  font-size: 8.5px;
+  font-weight: 600;
+  letter-spacing: 0.2em;
+  text-transform: uppercase;
+  color: var(--text-muted);
+  padding-top: 2px;
+  flex: none;
+}
+
+.progress-bar__stream-logs {
+  flex: 1;
+  min-width: 0;
+  max-height: 84px;
+  overflow-y: auto;
+  font-family: var(--font-mono);
+  font-size: 10px;
+  line-height: 1.9;
+}
+
+.progress-bar__stream-line {
+  display: flex;
+  gap: 7px;
+  color: var(--text-tertiary);
+}
+
+.progress-bar__stream-line--success { color: var(--accent-green); }
+.progress-bar__stream-line--error { color: var(--accent-red); }
+
+.progress-bar__stream-prefix {
+  color: var(--text-muted);
+  flex: none;
+}

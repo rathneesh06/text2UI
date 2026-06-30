@@ -1,0 +1,22 @@
+# dependencies & build output
+node_modules/
+dist/
+build/
+*.log
+
+# secrets / environment (NEVER commit — contains MySQL + Gemini credentials)
+.env
+.env.*
+!.env.example
+
+# local data snapshots (large + regenerable via `npm run db:snapshot`)
+.t2ui/
+*.duckdb
+*.duckdb.wal
+
+# archives / backups
+*.zip
+
+# generated / scratch
+bff/data/
+.DS_Store

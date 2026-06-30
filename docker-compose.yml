@@ -1,0 +1,65 @@
+# docker-compose.yml — Wave 5 / P8 Step 5.
+# Brings up Postgres + the BFF + the built frontend. Secrets (GEMINI_API_KEY,
+# AUTH_TOKENS, rate-limit/quota vars) come from .env (never committed).
+#
+#   docker compose up --build
+#   open http://localhost:4173   (frontend)   /   BFF on http://localhost:8787
+
+services:
+  db:
+    image: pgvector/pgvector:pg16   # Postgres 16 + pgvector preinstalled (Design Retrieval)
+    environment:
+      POSTGRES_USER: text2ui
+      POSTGRES_PASSWORD: text2ui
+      POSTGRES_DB: text2ui
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    ports:
+      - "5433:5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U text2ui"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  bff:
+    build:
+      context: .
+      args:
+        VITE_BFF_URL: http://localhost:8787
+    command: npm run start:bff
+    env_file:
+      - .env                     # GEMINI_API_KEY, AUTH_TOKENS, RATE_LIMIT_*, QUOTA_* ...
+    environment:
+      NODE_ENV: production       # fail-fast config validation + loose-config warnings
+      PORT: "8787"
+      STORAGE: postgres
+      PG_URL: postgres://text2ui:text2ui@db:5432/text2ui
+      ALLOWED_ORIGINS: http://localhost:4173
+      MARKITDOWN_URL: http://markitdown:8001
+    ports:
+      - "8787:8787"
+    depends_on:
+      db:
+        condition: service_healthy
+
+  web:
+    build:
+      context: .
+      args:
+        VITE_BFF_URL: http://localhost:8787
+    command: npm run preview -- --host --port 4173
+    ports:
+      - "4173:4173"
+    depends_on:
+      - bff
+
+  # Optional N2a document-conversion sidecar (PDF/Word/PPT -> Markdown input).
+  # Point MARKITDOWN_URL (above) at it once you have an image/service.
+  # markitdown:
+  #   image: <your-markitdown-service-image>
+  #   ports:
+  #     - "8001:8001"
+
+volumes:
+  pgdata:

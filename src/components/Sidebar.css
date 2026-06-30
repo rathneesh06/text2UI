@@ -1,0 +1,204 @@
+/* =============================================
+   Sidebar — Figma image 4 left rail
+   ============================================= */
+
+.sidebar {
+  width: var(--sidebar-width);
+  flex: none;
+  height: 100vh;
+  background: var(--bg-secondary);
+  border-right: 1px solid var(--border-color);
+  display: flex;
+  flex-direction: column;
+  justify-content: space-between;
+  padding: 16px 14px;
+  overflow-y: auto;
+}
+
+.sidebar__top {
+  display: flex;
+  flex-direction: column;
+  min-height: 0;
+}
+
+.sidebar__logo {
+  display: flex;
+  align-items: center;
+  gap: 9px;
+  margin-bottom: 26px;
+}
+
+.sidebar__logo-icon {
+  display: grid;
+  place-items: center;
+  width: 30px;
+  height: 30px;
+  border-radius: 10px;
+  background: var(--gradient-logo);
+  color: #fff;
+  font-size: 0.8rem;
+  box-shadow: 0 4px 14px rgba(139, 92, 246, 0.35);
+}
+
+.sidebar__logo-text {
+  font-size: 13.5px;
+  font-weight: 700;
+  color: var(--text-primary);
+  letter-spacing: -0.01em;
+}
+
+.sidebar__section-label {
+  font-family: var(--font-mono);
+  font-size: 8.5px;
+  font-weight: 600;
+  letter-spacing: 0.24em;
+  text-transform: uppercase;
+  color: var(--text-muted);
+  margin: 0 0 9px 4px;
+}
+
+.sidebar__nav {
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+  margin-bottom: 22px;
+}
+
+.sidebar__link {
+  display: flex;
+  align-items: center;
+  gap: 9px;
+  padding: 9px 11px;
+  border-radius: 9px;
+  font-size: 12px;
+  font-weight: 600;
+  color: var(--text-tertiary);
+  transition: background var(--transition-fast), color var(--transition-fast);
+}
+
+.sidebar__link:hover {
+  background: rgba(255, 255, 255, 0.04);
+  color: var(--text-primary);
+}
+
+.sidebar__link--active {
+  background: rgba(139, 92, 246, 0.16);
+  color: #ede9fe;
+}
+
+.sidebar__link-icon {
+  font-size: 13px;
+  flex: none;
+}
+
+/* ---- Tables panel ---- */
+.sidebar__data-panel {
+  min-height: 0;
+  display: flex;
+  flex-direction: column;
+}
+
+.sidebar__data-header {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 8px;
+  font-family: var(--font-mono);
+  font-size: 8.5px;
+  font-weight: 600;
+  letter-spacing: 0.24em;
+  text-transform: uppercase;
+  color: var(--text-muted);
+  margin: 0 4px 9px;
+}
+
+.sidebar__data-count {
+  letter-spacing: 0.02em;
+  text-transform: none;
+  font-size: 9px;
+  color: var(--text-muted);
+}
+
+.sidebar__data-list {
+  display: flex;
+  flex-direction: column;
+  gap: 1px;
+  overflow-y: auto;
+}
+
+.sidebar__data-item {
+  width: 100%;
+  text-align: left;
+  padding: 7.5px 11px;
+  border-radius: 8px;
+  transition: background var(--transition-fast);
+}
+
+.sidebar__data-item:hover {
+  background: rgba(255, 255, 255, 0.04);
+}
+
+.sidebar__data-item--active {
+  background: rgba(139, 92, 246, 0.13);
+}
+
+.sidebar__data-name {
+  font-family: var(--font-mono);
+  font-size: 11px;
+  color: var(--text-tertiary);
+  line-height: 1.4;
+}
+
+.sidebar__data-item:hover .sidebar__data-name,
+.sidebar__data-item--active .sidebar__data-name {
+  color: var(--text-primary);
+}
+
+.sidebar__data-meta {
+  font-size: 9px;
+  color: var(--text-muted);
+  line-height: 1.4;
+  margin-top: 1px;
+}
+
+.sidebar__data-empty {
+  font-size: 10.5px;
+  color: var(--text-muted);
+  line-height: 1.55;
+  padding: 4px 11px;
+}
+
+/* ---- bottom ---- */
+.sidebar__bottom {
+  padding-top: 14px;
+}
+
+.sidebar__new-project {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  padding: 6px 4px;
+  font-size: 11.5px;
+  font-weight: 600;
+  color: var(--accent-purple-light);
+  transition: color var(--transition-fast);
+}
+
+.sidebar__new-project:hover {
+  color: #c4b5fd;
+}
+
+.sidebar__new-icon {
+  font-size: 13px;
+  line-height: 1;
+}
+
+/* Compact rail mode — used as the slim right-hand rail in the chat workspace. */
+.sidebar--compact { width: 150px; padding: 14px 9px; }
+.sidebar--compact .sidebar__logo { display: none; }
+.sidebar--compact .sidebar__section-label { font-size: 10px; margin-top: 4px; }
+.sidebar--compact .sidebar__link { padding: 6px 8px; font-size: 12px; }
+.sidebar--compact .sidebar__data-item { padding: 7px 8px; }
+.sidebar--compact .sidebar__data-name { font-size: 12px; }
+.sidebar--compact .sidebar__data-meta { font-size: 10px; }
+.sidebar--compact .sidebar__new-project { padding: 8px; font-size: 12px; }

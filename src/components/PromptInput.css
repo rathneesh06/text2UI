@@ -1,0 +1,192 @@
+/* =============================================
+   PromptInput — Figma composer (image 2 hero,
+   image 6 dashboard prompt card)
+   ============================================= */
+
+.prompt-input {
+  width: 100%;
+}
+
+.prompt-input--hero {
+  max-width: 640px;
+}
+
+.prompt-input__wrapper {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  background: #121217;
+  border: 1px solid var(--border-color-strong);
+  border-radius: 22px;
+  padding: 12px;
+  transition: border-color var(--transition-fast), box-shadow var(--transition-fast);
+}
+
+.prompt-input--hero .prompt-input__wrapper {
+  box-shadow: 0 18px 50px rgba(0, 0, 0, 0.45);
+}
+
+.prompt-input--dashboard .prompt-input__wrapper {
+  align-items: flex-end;
+  background: var(--bg-card-hover);
+  border: 1px solid var(--border-color);
+  border-radius: 14px;
+  padding: 10px;
+}
+
+.prompt-input__wrapper:focus-within {
+  border-color: rgba(139, 92, 246, 0.55);
+  box-shadow: 0 0 0 3px rgba(139, 92, 246, 0.12);
+}
+
+.prompt-input--drag .prompt-input__wrapper {
+  border-color: var(--accent-purple);
+  box-shadow: 0 0 0 3px rgba(139, 92, 246, 0.18);
+}
+
+/* paperclip square */
+.prompt-input__attachment {
+  width: 42px;
+  height: 42px;
+  flex: none;
+  display: grid;
+  place-items: center;
+  border-radius: 13px;
+  background: #1c1c24;
+  border: 1px solid var(--border-color);
+  color: var(--text-tertiary);
+  font-size: 15px;
+  transition: color var(--transition-fast), border-color var(--transition-fast);
+}
+
+.prompt-input--dashboard .prompt-input__attachment {
+  width: 34px;
+  height: 34px;
+  border-radius: 10px;
+  font-size: 13px;
+}
+
+.prompt-input__attachment:hover {
+  color: var(--text-primary);
+  border-color: var(--border-color-hover);
+}
+
+.prompt-input__field {
+  flex: 1;
+  min-width: 0;
+  font-size: 12.5px;
+  color: var(--text-primary);
+  padding: 6px 2px;
+}
+
+.prompt-input__field::placeholder {
+  color: var(--text-muted);
+}
+
+.prompt-input__field--textarea {
+  resize: none;
+  line-height: 1.55;
+  font-size: 12px;
+}
+
+.prompt-input__field:disabled {
+  opacity: 0.55;
+}
+
+/* Build Now */
+.prompt-input__submit {
+  display: inline-flex;
+  align-items: center;
+  gap: 7px;
+  flex: none;
+  padding: 10px 18px;
+  border-radius: 12px;
+  font-size: 12.5px;
+  font-weight: 600;
+  color: #fff;
+  background: var(--gradient-cta);
+  box-shadow: var(--shadow-glow-purple);
+  transition: filter var(--transition-fast), transform 100ms ease;
+  white-space: nowrap;
+}
+
+.prompt-input--dashboard .prompt-input__submit {
+  border-radius: var(--border-radius-full);
+  padding: 8px 15px;
+  font-size: 12px;
+}
+
+.prompt-input__submit:hover:not(:disabled) {
+  filter: brightness(1.1);
+}
+
+.prompt-input__submit:active:not(:disabled) {
+  transform: translateY(1px);
+}
+
+.prompt-input__submit:disabled {
+  opacity: 0.45;
+  cursor: not-allowed;
+  box-shadow: none;
+}
+
+.prompt-input__submit-icon {
+  font-size: 11px;
+  line-height: 1;
+}
+
+/* ---- data file chips (Figma file chips) ---- */
+.prompt-input__chips {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  margin-top: 10px;
+}
+
+.prompt-input--hero .prompt-input__chips {
+  justify-content: center;
+}
+
+.data-chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 7px;
+  background: #1c1c24;
+  border: 1px solid var(--border-color-strong);
+  border-radius: 10px;
+  padding: 6px 9px;
+  font-size: 9.5px;
+  color: var(--text-muted);
+}
+
+.data-chip__tbl {
+  font-family: var(--font-mono);
+  font-size: 10.5px;
+  font-weight: 700;
+  color: #e9e9ef;
+}
+
+.data-chip__meta {
+  white-space: nowrap;
+}
+
+.data-chip__x {
+  color: var(--text-muted);
+  font-size: 13px;
+  line-height: 1;
+  padding: 1px 3px;
+  border-radius: 4px;
+  transition: color var(--transition-fast), background var(--transition-fast);
+}
+
+.data-chip__x:hover {
+  color: var(--text-primary);
+  background: rgba(255, 255, 255, 0.08);
+}
+
+.prompt-input__error {
+  margin-top: 10px;
+  font-size: 11px;
+  color: var(--accent-red);
+  text-align: center;
+}

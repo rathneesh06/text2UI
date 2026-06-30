@@ -1,0 +1,138 @@
+/* DocumentPage.css — Wave 4 / N2b: PDF/PPT generation surface. */
+.docpage {
+  min-height: 100vh;
+  background: #f8fafc;
+  color: #0f172a;
+}
+.docpage__header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 0.9rem 1.4rem;
+  border-bottom: 1px solid #e2e8f0;
+  background: #fff;
+}
+.docpage__title {
+  font-weight: 700;
+  font-size: 1.05rem;
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+}
+.docpage__title-icon { font-size: 1.2rem; }
+.docpage__btn {
+  border: 1px solid #e2e8f0;
+  background: #fff;
+  color: #334155;
+  border-radius: 8px;
+  padding: 0.4rem 0.8rem;
+  font-size: 0.85rem;
+  cursor: pointer;
+}
+.docpage__btn:hover { background: #f1f5f9; }
+
+.docpage__main {
+  max-width: 820px;
+  margin: 0 auto;
+  padding: 2rem 1.4rem 4rem;
+}
+.docpage__prompt { margin-bottom: 1.5rem; }
+.docpage__hint {
+  margin-top: 0.6rem;
+  font-size: 0.82rem;
+  color: #64748b;
+  text-align: center;
+}
+.docpage__status {
+  padding: 1rem 1.2rem;
+  background: #eef2ff;
+  color: #4338ca;
+  border-radius: 10px;
+  font-size: 0.92rem;
+}
+.docpage__error {
+  padding: 1rem 1.2rem;
+  background: #fef2f2;
+  color: #b91c1c;
+  border: 1px solid #fecaca;
+  border-radius: 10px;
+  font-size: 0.9rem;
+}
+
+.docpage__result {
+  margin-top: 1.5rem;
+  background: #fff;
+  border: 1px solid #e2e8f0;
+  border-radius: 14px;
+  padding: 1.5rem;
+}
+.docpage__result-head {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 1rem;
+  margin-bottom: 1.2rem;
+}
+.docpage__result-title { font-size: 1.3rem; font-weight: 700; }
+.docpage__result-sub { color: #64748b; margin-top: 0.2rem; }
+.docpage__download {
+  flex-shrink: 0;
+  border: none;
+  background: #4f46e5;
+  color: #fff;
+  border-radius: 9px;
+  padding: 0.55rem 0.95rem;
+  font-size: 0.85rem;
+  font-weight: 600;
+  cursor: pointer;
+  white-space: nowrap;
+}
+.docpage__download:hover { background: #4338ca; }
+
+.docpage__kpis { display: flex; flex-wrap: wrap; gap: 0.8rem; margin-bottom: 1.2rem; }
+.docpage__kpi {
+  flex: 1 1 120px;
+  background: #f8fafc;
+  border: 1px solid #e2e8f0;
+  border-radius: 10px;
+  padding: 0.8rem 1rem;
+}
+.docpage__kpi-value { font-size: 1.25rem; font-weight: 700; }
+.docpage__kpi-label { font-size: 0.72rem; text-transform: uppercase; letter-spacing: 0.03em; color: #64748b; margin-top: 0.2rem; }
+
+.docpage__section { margin-bottom: 1.2rem; }
+.docpage__section h3 { font-size: 1.02rem; color: #4f46e5; margin: 0 0 0.4rem; }
+.docpage__section p { margin: 0 0 0.5rem; line-height: 1.55; }
+.docpage__section ul, .docpage__slide-body ul { margin: 0.3rem 0 0.5rem 1.1rem; line-height: 1.5; }
+
+.docpage__slides { display: flex; flex-direction: column; gap: 0.8rem; }
+.docpage__slide {
+  display: flex;
+  gap: 0.9rem;
+  border: 1px solid #e2e8f0;
+  border-radius: 10px;
+  padding: 0.9rem 1rem;
+  background: #fff;
+}
+.docpage__slide-num {
+  flex-shrink: 0;
+  width: 26px; height: 26px;
+  border-radius: 6px;
+  background: #4f46e5; color: #fff;
+  display: flex; align-items: center; justify-content: center;
+  font-size: 0.8rem; font-weight: 700;
+}
+.docpage__slide-body h3 { margin: 0 0 0.3rem; font-size: 1rem; }
+
+.docpage__table { width: 100%; border-collapse: collapse; margin-top: 0.5rem; font-size: 0.85rem; }
+.docpage__table th { background: #f1f5f9; text-align: left; padding: 0.4rem 0.6rem; font-weight: 600; }
+.docpage__table td { padding: 0.4rem 0.6rem; border-top: 1px solid #eef2f6; }
+
+.docpage__metrics {
+  margin-top: 1.2rem;
+  padding-top: 0.9rem;
+  border-top: 1px solid #eef2f6;
+  font-size: 0.78rem;
+  color: #64748b;
+  font-variant-numeric: tabular-nums;
+}

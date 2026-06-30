@@ -1,0 +1,88 @@
+/* FinalDesign.css — full-screen finished-app display (Wave 1 / N5, Step 3). */
+.final-design {
+  position: fixed;
+  inset: 0;
+  z-index: 1000;
+  display: flex;
+  flex-direction: column;
+  background: #ffffff;
+}
+
+.final-design__bar {
+  height: 56px;
+  flex: 0 0 56px;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 0 16px;
+  border-bottom: 1px solid var(--border-color-strong, #e5e7eb);
+  background: #ffffff;
+}
+
+.final-design__title {
+  font-size: 13px;
+  font-weight: 600;
+  color: var(--text-primary, #0f172a);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  margin-right: 12px;
+}
+
+.final-design__actions {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.final-design__btn {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  padding: 7px 14px;
+  border-radius: 9999px;
+  border: 1px solid var(--border-color-strong, #e5e7eb);
+  font-size: 12px;
+  font-weight: 600;
+  color: var(--text-secondary, #475569);
+  background: #ffffff;
+  cursor: pointer;
+  transition: color 0.15s, border-color 0.15s, background 0.15s;
+}
+
+.final-design__btn:hover {
+  color: var(--text-primary, #0f172a);
+  border-color: var(--border-color-hover, #cbd5e1);
+}
+
+.final-design__btn--icon {
+  padding: 7px;
+}
+
+.final-design__btn--primary {
+  background: #4f46e5;
+  border-color: #4f46e5;
+  color: #ffffff;
+}
+
+.final-design__btn--primary:hover {
+  background: #4338ca;
+  border-color: #4338ca;
+  color: #ffffff;
+}
+
+.final-design__btn:disabled {
+  opacity: 0.6;
+  cursor: default;
+}
+
+.final-design__stage {
+  flex: 1 1 auto;
+  overflow: auto;
+  background: #ffffff;
+}
+
+/* Let the Sandpack mount fill the stage height. */
+.final-design__stage > * {
+  height: 100%;
+}
