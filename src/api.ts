@@ -93,6 +93,26 @@ export function buildDashboard(body: BuildDashboardRequest): Promise<BuildDashbo
   });
 }
 
+/** Spec-driven PPT build/edit. Returns the editable DeckSpec + the compiled .pptx
+ *  (base64). Persist `spec` and pass it back as `currentSpec` to edit the same deck. */
+export interface BuildDeckRequest {
+  datasets: { tableName: string; profile: DataProfile }[];
+  userPrompt: string;
+  currentSpec?: import("../shared/deck-spec").DeckSpec;
+}
+export interface BuildDeckResult {
+  spec: import("../shared/deck-spec").DeckSpec;
+  filename: string;
+  pptxBase64: string;
+  warnings: string[];
+}
+export function buildDeck(body: BuildDeckRequest): Promise<BuildDeckResult> {
+  return request<BuildDeckResult>("/api/deck/build", {
+    method: "POST",
+    body: JSON.stringify(body),
+  });
+}
+
 /** Orchestrator front door (Phase 1-3). One conversational turn: the planner
  *  chooses the output mode, enhances the prompt, and the chosen pipeline builds.
  *  Carries `conversationId` so the thread has memory across turns. */

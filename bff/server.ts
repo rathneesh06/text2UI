@@ -20,6 +20,7 @@ import { buildExportZip, buildConnectedZip } from "./export";
 import { generateReport } from "./report";
 import { COLO_PROJECT_ID, COLO_LABEL, coloAvailable, coloProfiles, coloQuery } from "./sources/colo";
 import { handleDashboardBuild } from "./dashboard/handler";
+import { handleDeckBuild } from "./deck/handler";
 import { retrieveForBuild } from "./design-rag/build-context";
 import { enrollGeneration } from "./design-rag/enroll";
 import { generateDeck } from "./slides";
@@ -792,6 +793,16 @@ export function createServer() {
   // currentSpec next turn so each prompt edits the same dashboard.
   app.post("/api/dashboard/build", async (req, res) => {
     const { status, body } = await handleDashboardBuild(req.body);
+    res.status(status).json(body);
+  });
+
+  // Spec-driven PPT build (facts → outline → narrative → slides → content → compile →
+  // pptx). Colo builds get a server-side query fn so slide charts use real data.
+  app.post("/api/deck/build", async (req, res) => {
+    const ds = (req.body?.datasets ?? []) as any[];
+    const isColo = ds.length > 0 && ds.every((d) => String(d?.profile?.source?.filename ?? "").startsWith("view:"));
+    const query = isColo ? (sql: string) => coloQuery(sql, { rowCap: 5000, timeoutMs: QUERY_TIMEOUT_MS }).then((r) => r.rows) : undefined;
+    const { status, body } = await handleDeckBuild(req.body, { query });
     res.status(status).json(body);
   });
 
