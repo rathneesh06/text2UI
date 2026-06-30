@@ -93,15 +93,19 @@ export function buildDashboard(body: BuildDashboardRequest): Promise<BuildDashbo
   });
 }
 
-/** Spec-driven PPT build/edit. Returns the editable DeckSpec + the compiled .pptx
- *  (base64). Persist `spec` and pass it back as `currentSpec` to edit the same deck. */
+/** Spec-driven PPT build/edit. Returns the editable DeckSpec, the COMPILED deck (data
+ *  resolved — for an in-app slide preview), and the .pptx (base64). For uploaded data,
+ *  pass `rows` so the server can resolve slide charts; colo needs no rows. Pass the prior
+ *  `spec` back as `currentSpec` to edit the same deck. */
 export interface BuildDeckRequest {
   datasets: { tableName: string; profile: DataProfile }[];
   userPrompt: string;
+  rows?: { tableName: string; rows: Record<string, unknown>[] }[];
   currentSpec?: import("../shared/deck-spec").DeckSpec;
 }
 export interface BuildDeckResult {
   spec: import("../shared/deck-spec").DeckSpec;
+  compiled: import("../shared/deck-spec").CompiledDeck;
   filename: string;
   pptxBase64: string;
   warnings: string[];

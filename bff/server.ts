@@ -21,6 +21,7 @@ import { generateReport } from "./report";
 import { COLO_PROJECT_ID, COLO_LABEL, coloAvailable, coloProfiles, coloQuery } from "./sources/colo";
 import { handleDashboardBuild } from "./dashboard/handler";
 import { handleDeckBuild } from "./deck/handler";
+import { loadRows } from "./deck/local-data";
 import { retrieveForBuild } from "./design-rag/build-context";
 import { enrollGeneration } from "./design-rag/enroll";
 import { generateDeck } from "./slides";
@@ -796,14 +797,33 @@ export function createServer() {
     res.status(status).json(body);
   });
 
-  // Spec-driven PPT build (facts → outline → narrative → slides → content → compile →
-  // pptx). Colo builds get a server-side query fn so slide charts use real data.
+  // Spec-driven PPT build. Data source for slide charts:
+  //   • uploaded rows  → ephemeral in-memory DuckDB (loadRows)
+  //   • colo views     → coloQuery
+  //   • neither        → text-only deck
   app.post("/api/deck/build", async (req, res) => {
-    const ds = (req.body?.datasets ?? []) as any[];
+    const body = (req.body ?? {}) as any;
+    const ds = (body.datasets ?? []) as any[];
+    const rows = body.rows as { tableName: string; rows: Record<string, unknown>[] }[] | undefined;
     const isColo = ds.length > 0 && ds.every((d) => String(d?.profile?.source?.filename ?? "").startsWith("view:"));
-    const query = isColo ? (sql: string) => coloQuery(sql, { rowCap: 5000, timeoutMs: QUERY_TIMEOUT_MS }).then((r) => r.rows) : undefined;
-    const { status, body } = await handleDeckBuild(req.body, { query });
-    res.status(status).json(body);
+    let local: Awaited<ReturnType<typeof loadRows>> | undefined;
+    try {
+      let datasets = ds;
+      let query: ((sql: string) => Promise<Record<string, unknown>[]>) | undefined;
+      if (Array.isArray(rows) && rows.length) {
+        local = await loadRows(rows);                 // server-side profiles + query, consistent
+        datasets = local.datasets;
+        query = local.query;
+      } else if (isColo) {
+        query = (sql: string) => coloQuery(sql, { rowCap: 5000, timeoutMs: QUERY_TIMEOUT_MS }).then((r) => r.rows);
+      }
+      const { status, body: out } = await handleDeckBuild({ ...body, datasets }, { query });
+      res.status(status).json(out);
+    } catch (err: any) {
+      res.status(500).json({ error: err?.message ?? "deck build failed" });
+    } finally {
+      local?.close();
+    }
   });
 
   // Named backend data sources (currently just the colo snapshot). The frontend

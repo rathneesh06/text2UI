@@ -1,0 +1,81 @@
+/* DeckPreview.css — scrollable slide deck preview (light slides on the dark canvas). */
+.dp-root {
+  height: 100%;
+  overflow-y: auto;
+  padding: 8px 4px 24px;
+  display: flex;
+  flex-direction: column;
+  gap: 20px;
+  align-items: center;
+}
+.dp-slide {
+  position: relative;
+  width: 100%;
+  max-width: 900px;
+  aspect-ratio: 16 / 9;
+  background: #ffffff;
+  color: #0f172a;
+  border: 1px solid #1f2937;
+  border-radius: 12px;
+  box-shadow: 0 10px 30px rgba(0, 0, 0, 0.35);
+  padding: 36px 44px;
+  overflow: hidden;
+  display: flex;
+  flex-direction: column;
+}
+.dp-slide::before {
+  content: "";
+  position: absolute; left: 0; top: 0; bottom: 0; width: 8px;
+  background: #4f46e5;
+}
+.dp-slide--section { background: #0f172a; color: #ffffff; }
+.dp-slide-num {
+  position: absolute; right: 16px; top: 12px;
+  font-size: 11px; color: #94a3b8; font-variant-numeric: tabular-nums;
+}
+
+/* hero (title / section) */
+.dp-hero { margin: auto 0; }
+.dp-hero-rule { width: 64px; height: 5px; background: #4f46e5; border-radius: 3px; margin-bottom: 22px; }
+.dp-hero-title { font-size: 40px; font-weight: 800; letter-spacing: -0.02em; margin: 0; }
+.dp-hero-sub { font-size: 18px; color: #64748b; margin-top: 12px; }
+.dp-slide--section .dp-hero-sub { color: #cbd5e1; }
+
+/* content slide */
+.dp-title { font-size: 26px; font-weight: 700; margin: 0; }
+.dp-message { font-size: 14px; color: #64748b; font-style: italic; margin-top: 4px; }
+.dp-subhead { font-size: 15px; font-weight: 600; color: #334155; margin-top: 8px; }
+.dp-body { margin-top: 16px; flex: 1; min-height: 0; display: flex; flex-direction: column; gap: 14px; }
+
+.dp-kpis { display: flex; gap: 14px; }
+.dp-kpi { flex: 1; background: #f8fafc; border: 1px solid #e2e8f0; border-radius: 10px; padding: 14px 16px; }
+.dp-kpi-label { font-size: 10px; font-weight: 700; letter-spacing: 0.04em; text-transform: uppercase; color: #64748b; }
+.dp-kpi-value { font-size: 26px; font-weight: 700; color: #0f172a; margin-top: 4px; font-variant-numeric: tabular-nums; }
+
+.dp-chart { flex: 1; min-height: 0; display: flex; }
+.dp-svg { width: 100%; height: 100%; max-height: 300px; }
+.dp-axis { font-size: 10px; fill: #64748b; }
+.dp-legend { font-size: 11px; fill: #334155; }
+
+/* multi-visual grid + captioned cells */
+.dp-grid { flex: 1; min-height: 0; display: grid; gap: 14px; }
+.dp-grid--1 { grid-template-columns: 1fr; }
+.dp-grid--2 { grid-template-columns: 1fr 1fr; }
+.dp-grid--3 { grid-template-columns: 1fr 1fr; grid-auto-rows: 1fr; }
+.dp-grid--4 { grid-template-columns: 1fr 1fr; grid-auto-rows: 1fr; }
+.dp-split { flex: 1; min-height: 0; display: grid; grid-template-columns: 1.7fr 1fr; gap: 16px; }
+.dp-cell { display: flex; flex-direction: column; min-height: 0; border: 1px solid #eef2f7; border-radius: 8px; padding: 10px 12px; }
+.dp-cell-cap { font-size: 12px; font-weight: 600; color: #0f172a; margin-bottom: 6px; }
+
+.dp-bullets { margin: 0; padding-left: 22px; color: #0f172a; font-size: 16px; line-height: 1.7; }
+.dp-bullets li { margin-bottom: 4px; }
+
+.dp-table-wrap { overflow: auto; }
+.dp-table { width: 100%; border-collapse: collapse; font-size: 13px; }
+.dp-table th { text-align: left; padding: 7px 10px; color: #fff; background: #4f46e5; font-weight: 600; }
+.dp-table td { padding: 6px 10px; border-bottom: 1px solid #eef2f7; color: #0f172a; }
+
+.dp-callout { margin-top: auto; border: 1px solid #e2e8f0; border-radius: 8px; padding: 12px 16px; font-weight: 600; font-size: 14px; }
+.dp-callout--info { background: #eef2ff; color: #3730a3; }
+.dp-callout--good { background: #ecfdf5; color: #065f46; }
+.dp-callout--warn { background: #fef2f2; color: #991b1b; }

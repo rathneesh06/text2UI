@@ -23,6 +23,7 @@ export interface KpiItem { label: string; metric: Metric; table: string; filters
 export interface KpisBlock { type: "kpis"; items: KpiItem[]; }
 export interface TableBlock {
   type: "table"; table: string;
+  title?: string;
   columns: { col: string; label?: string; agg?: Agg }[];
   groupBy?: Dimension[]; filters?: Filter[]; limit?: number;
 }
@@ -30,6 +31,7 @@ export interface TableBlock {
  *  builds the SQL and resolves real values before rendering — no invented numbers. */
 export interface ChartBlock {
   type: "chart";
+  title?: string;             // caption shown above the chart (needed for multi-chart slides)
   chartType: "line" | "bar" | "area" | "pie";
   table: string;
   x: Dimension;

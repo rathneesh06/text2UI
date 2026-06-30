@@ -209,3 +209,12 @@
 .cp-overlay-title { font-size: 14px; font-weight: 600; }
 .cp-overlay-stage { flex: 1; min-height: 0; padding: 16px; }
 .cp-overlay-stage > * { width: 100%; height: 100%; border-radius: 12px; overflow: hidden; }
+
+/* ============ deck (ppt) preview in the canvas ============ */
+.cp-deck { width: 100%; height: 100%; display: flex; flex-direction: column; background: #0b0f17; }
+.cp-deck-bar {
+  display: flex; align-items: center; justify-content: space-between;
+  padding: 8px 12px; border-bottom: 1px solid #1f2937; flex: 0 0 auto;
+}
+.cp-deck-title { font-size: 13px; font-weight: 600; color: #e5e7eb; }
+.cp-deck-scroll { flex: 1; min-height: 0; }

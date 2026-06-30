@@ -10,6 +10,7 @@ import { planOutline } from "./outline-planner";
 import { planSlides } from "./slide-planner";
 import { validateNarrative } from "./narrative-validate";
 import { validateContent } from "./content-validate";
+import { ensureVisuals } from "./visual-fallback";
 import { compileDeck } from "./compile";
 import { renderCompiledDeck } from "./pptx";
 
@@ -48,8 +49,12 @@ export async function handleDeckBuild(body: unknown, deps: DeckBuildDeps = {}): 
     maxBulletWords: currentSpec?.constraints?.maxBulletWords,
   });
 
+  // 5b) deterministic Visual Planner — guarantee charts on visual-role slides that lack one.
+  const { slides: finalSlides, added } = ensureVisuals(slides, datasets);
+  if (added) console.log(`[deck] visual planner synthesized ${added} chart/table block(s)`);
+
   // 6) canonical spec
-  const spec: DeckSpec = { version: 1, meta: outlineRes.meta, outline, slides, constraints: currentSpec?.constraints };
+  const spec: DeckSpec = { version: 1, meta: outlineRes.meta, outline, slides: finalSlides, constraints: currentSpec?.constraints };
 
   // 7) compile (resolve real data) + 8) render
   const compiled = await compileDeck(spec, datasets, deps.query);
@@ -60,6 +65,7 @@ export async function handleDeckBuild(body: unknown, deps: DeckBuildDeps = {}): 
     status: 200,
     body: {
       spec,
+      compiled,
       filename: slug(spec.meta.title) + ".pptx",
       pptxBase64: pptx.toString("base64"),
       warnings: [...nWarn, ...cWarn, ...compiled.warnings],

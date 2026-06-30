@@ -18,6 +18,7 @@ const BLOCK = {
   type: "object",
   properties: {
     type: { type: "string", enum: ["heading", "bullets", "callout", "note", "kpis", "table", "chart"] },
+    title: { type: "string" },
     text: { type: "string" },
     items: { type: "array", items: { type: "string" } },
     emphasis: { type: "string", enum: ["info", "good", "warn"] },
@@ -57,11 +58,17 @@ Each slide: keep the outline node's id and role; write a clear title and a one-l
 
 Block types:
 - heading { text }, bullets { items[] }, callout { text, emphasis? }, note { text }
-- kpis { kpis: [{ label, table, metric:{col,agg,format?} }] }   ← for kpi slides
-- chart { chartType: line|bar|area|pie, table, x:{col,timeGrain?}, series:[{col,agg,label?,format?}] }
-- table { table, columns:[{col,label?,agg?}], groupBy?[] }
+- kpis { kpis: [{ label, table, metric:{col,agg,format?} }] }   ← 3-6 cards
+- chart { title, chartType: line|bar|area|pie, table, x:{col,timeGrain?}, series:[{col,agg,label?,format?}] }
+- table { title, table, columns:[{col,label?,agg?}], groupBy?[] }
 
-Rules: ONE chart OR one table per slide; at most 5 short bullets; use ONLY columns from the evidence; choose aggregations that fit (sum/avg need numeric columns; count works on anything); for trends set x.timeGrain on a date column; pie = one series over a low-cardinality category. Ground claims in the evidence numbers.
+Rules — build DENSE, executive-quality slides (a single lonely chart looks empty):
+- Start with an OVERVIEW/scorecard slide: a 4-KPI strip PLUS 2 charts on the same slide.
+- Most analysis slides should carry 2-4 visuals in a grid, or one chart + 3-5 supporting bullets. Put several blocks on a slide; the renderer lays them out in a grid.
+- Use variety across the deck: KPI strip, trend (line/area), category breakdowns (bar), share (pie/donut), a side-by-side comparison, and at least one data table.
+- Aim for 10-14 slides. One clear MESSAGE per slide, but back it with multiple visuals.
+- EVERY chart and table block must have a short \`title\` (it captions the cell). Use ONLY columns from the evidence; sum/avg need numeric columns; pie = one series over a low-cardinality category; set x.timeGrain on a date column for trends.
+- Ground claims in the evidence numbers; add brief speaker notes.
 
 On an EDIT turn you receive the CURRENT slides — return the full updated set, changing as little as possible and keeping untouched slide ids intact.`;
 
@@ -80,6 +87,19 @@ function buildUser(datasets: Dataset[], evidence: EvidenceCatalog, outline: Outl
 
 const strip = (t: string) => t.replace(/^```(?:json)?\s*/i, "").replace(/```\s*$/i, "").trim();
 
+function asDim(x: any): { col: string; timeGrain?: any; label?: string } | null {
+  if (!x) return null;
+  if (typeof x === "string") return { col: x };
+  if (x.col) return { col: String(x.col), timeGrain: x.timeGrain, label: x.label };
+  return null;
+}
+function asMetrics(arr: any): any[] {
+  if (!Array.isArray(arr)) return [];
+  return arr
+    .map((m: any) => (typeof m === "string" ? { col: m, agg: "sum" } : m && m.col ? { col: String(m.col), agg: m.agg || "sum", label: m.label, format: m.format } : null))
+    .filter(Boolean);
+}
+
 function coerceBlock(b: any): Block | null {
   if (!b || typeof b.type !== "string") return null;
   switch (b.type) {
@@ -87,15 +107,25 @@ function coerceBlock(b: any): Block | null {
     case "bullets": return Array.isArray(b.items) && b.items.length ? { type: "bullets", items: b.items.map(String) } : null;
     case "callout": return b.text ? { type: "callout", text: String(b.text), emphasis: b.emphasis } : null;
     case "note": return b.text ? { type: "note", text: String(b.text) } : null;
-    case "kpis": return Array.isArray(b.kpis) && b.kpis.length
-      ? { type: "kpis", items: b.kpis.filter((k: any) => k?.label && k?.table && k?.metric?.col).map((k: any) => ({ label: String(k.label), table: String(k.table), metric: k.metric, filters: k.filters, format: k.metric?.format })) }
-      : null;
-    case "chart": return b.chartType && b.table && b.x?.col && Array.isArray(b.series) && b.series.length
-      ? { type: "chart", chartType: b.chartType, table: String(b.table), x: b.x, series: b.series, filters: b.filters, sort: b.sort, limit: b.limit }
-      : null;
-    case "table": return b.table && Array.isArray(b.columns) && b.columns.length
-      ? { type: "table", table: String(b.table), columns: b.columns, groupBy: b.groupBy, filters: b.filters, limit: b.limit }
-      : null;
+    case "kpis": {
+      const items = (Array.isArray(b.kpis) ? b.kpis : Array.isArray(b.items) ? b.items : [])
+        .filter((k: any) => k?.label && k?.table && (k?.metric?.col || k?.col))
+        .map((k: any) => ({ label: String(k.label), table: String(k.table), metric: k.metric ?? { col: k.col, agg: k.agg || "sum" }, filters: k.filters, format: k.metric?.format ?? k.format }));
+      return items.length ? { type: "kpis", items } : null;
+    }
+    case "chart": {
+      const x = asDim(b.x);
+      const series = asMetrics(b.series && b.series.length ? b.series : b.y ? [{ col: b.y, agg: b.agg || "sum" }] : []);
+      return b.chartType && b.table && x && series.length
+        ? { type: "chart", title: b.title ? String(b.title) : undefined, chartType: b.chartType, table: String(b.table), x, series, filters: b.filters, sort: b.sort, limit: b.limit }
+        : null;
+    }
+    case "table": {
+      const columns = Array.isArray(b.columns) ? b.columns.map((c: any) => (typeof c === "string" ? { col: c } : c)).filter((c: any) => c?.col) : [];
+      return b.table && columns.length
+        ? { type: "table", title: b.title ? String(b.title) : undefined, table: String(b.table), columns, groupBy: b.groupBy, filters: b.filters, limit: b.limit }
+        : null;
+    }
     default: return null;
   }
 }
@@ -116,7 +146,8 @@ export async function planSlides(input: SlideInput, run: Run = callGemini, timeo
           notes: s.notes ? String(s.notes) : undefined,
           blocks: (Array.isArray(s.blocks) ? s.blocks : []).map(coerceBlock).filter((b: Block | null): b is Block => !!b),
         }));
-      console.log(`[deck-slides] planned ${slides.length} slide(s)`);
+      const visuals = slides.reduce((n, s) => n + s.blocks.filter((b) => b.type === "chart" || b.type === "table").length, 0);
+      console.log(`[deck-slides] planned ${slides.length} slide(s), ${visuals} chart/table block(s)`);
       return slides.length ? slides : null;
     } catch (e) { console.warn(`[deck-slides] failed: ${(e as Error).message}`); return null; }
   })();

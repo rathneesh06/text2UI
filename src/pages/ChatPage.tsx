@@ -19,11 +19,13 @@ import PromptInput from "../components/PromptInput";
 import Sandbox from "../components/Sandbox";
 import {
   orchestratePlan, generate, generateStream, generateReport, generatePpt, downloadBase64,
-  exportProject, buildDashboard, COLO_PROJECT_ID, REMOTE_DATA, BFF_URL,
+  exportProject, buildDashboard, buildDeck, COLO_PROJECT_ID, REMOTE_DATA, BFF_URL,
   type StreamEvent, type ReportResult, type PptResult,
 } from "../api";
+import DeckPreview from "../components/DeckPreview";
 import type { Table } from "../lib/datasets";
 import type { DashboardSpec } from "../../shared/dashboard-spec";
+import type { DeckSpec, CompiledDeck } from "../../shared/deck-spec";
 import type { GeneratedApp, OrchestratorBrief } from "../../shared/types";
 import "./ChatPage.css";
 
@@ -43,6 +45,7 @@ type Phase = "planning" | "building" | "done" | "clarify" | "error";
 type Turn = { id: number; prompt: string; phase: Phase; stages: string[]; tail?: string | null; brief?: OrchestratorBrief; assistantText?: string };
 type Result =
   | { kind: "dashboard"; app: GeneratedApp; brief?: OrchestratorBrief }
+  | { kind: "deck"; compiled: CompiledDeck; pptxBase64: string; filename: string }
   | { kind: "doc"; mode: "pdf" | "ppt"; filename: string; base64: string; brief?: OrchestratorBrief };
 
 function mainCode(app: GeneratedApp): string {
@@ -70,6 +73,7 @@ export default function ChatPage({
   const [fullscreen, setFullscreen] = useState(false);
   const [dashVersion, setDashVersion] = useState(0);  // bumps each build → remounts the Sandbox
   const [spec, setSpec] = useState<DashboardSpec | null>(null);  // persistent spec; edits mutate it
+  const [deckSpec, setDeckSpec] = useState<DeckSpec | null>(null);  // persistent deck spec for ppt edits
   const [tablesOpen, setTablesOpen] = useState(false);
   const [expandedTable, setExpandedTable] = useState<string | null>(null);
   const [exporting, setExporting] = useState(false);
@@ -94,7 +98,11 @@ export default function ChatPage({
     [tables],
   );
   const dashApp = result?.kind === "dashboard" ? result.app : null;
-  const title = result?.brief?.title ?? (dashApp?.summary || "Untitled project");
+  const brief = result && (result.kind === "dashboard" || result.kind === "doc") ? result.brief : undefined;
+  const title =
+    brief?.title ??
+    (result?.kind === "deck" ? result.compiled.meta.title : dashApp?.summary) ??
+    "Untitled project";
 
   // keep the thread pinned to the latest turn
   useEffect(() => {
@@ -130,26 +138,9 @@ export default function ChatPage({
       const datasets = tables.map((t) => ({ tableName: t.tableName, profile: t.ingest.profile }));
       const editing = result?.kind === "dashboard" ? mainCode(result.app) : undefined;
       const access = REMOTE_DATA ? { dataAccess: "remote" as const } : {};
-
-      // ---- Spec-driven path (pilot: colo data) ----------------------------------
-      // The planner emits a typed DashboardSpec; the server compiles it to SQL + a
-      // deterministic renderer. We persist the spec and pass it back next turn, so the
-      // conversation EDITS one dashboard instead of regenerating JSX each time.
-      if (projectId === COLO_PROJECT_ID) {
-        append(spec ? "Updating the dashboard spec…" : "Planning the dashboard spec…");
-        patch({ phase: "building" });
-        const { app, spec: nextSpec, warnings } = await buildDashboard({
-          datasets, userPrompt: prompt, ...(spec ? { currentSpec: spec } : {}),
-        });
-        setSpec(nextSpec);
-        setResult({ kind: "dashboard", app });
-        setDashVersion((v) => v + 1);
-        const note = warnings.length ? ` · ${warnings.length} note${warnings.length === 1 ? "" : "s"}` : "";
-        patch({ phase: "done", tail: null, assistantText: (nextSpec.meta.title || "Dashboard ready") + note });
-        builds.current += 1;
-        onBuildMeta?.({ versionCount: builds.current });
-        return;
-      }
+      const isColo = projectId === COLO_PROJECT_ID;
+      // For uploaded data, send the rows so the deck pipeline can resolve charts server-side.
+      const rows = isColo ? undefined : tables.map((t) => ({ tableName: t.tableName, rows: t.ingest.rows }));
 
       // Step 1 — plan. If the orchestrator is down, default to a dashboard build
       // with the raw prompt so we always produce output.
@@ -165,6 +156,42 @@ export default function ChatPage({
       if ("needsClarification" in plan) { patch({ phase: "clarify", assistantText: plan.question }); return; }
 
       const mode = plan.outputMode;
+
+      // ---- PPT → spec-driven deck pipeline (scrollable preview + editable spec) ----
+      if (mode === "ppt") {
+        append(deckSpec ? "Updating the deck…" : "Planning the deck…");
+        patch({ phase: "building" });
+        const { spec: ns, compiled, pptxBase64, filename, warnings } = await buildDeck({
+          datasets, userPrompt: prompt, ...(rows ? { rows } : {}), ...(deckSpec ? { currentSpec: deckSpec } : {}),
+        });
+        setDeckSpec(ns);
+        setResult({ kind: "deck", compiled, pptxBase64, filename });
+        setDashVersion((v) => v + 1);
+        const note = warnings.length ? ` · ${warnings.length} note${warnings.length === 1 ? "" : "s"}` : "";
+        patch({ phase: "done", tail: null, assistantText: (ns.meta.title || "Deck ready") + note });
+        builds.current += 1;
+        onBuildMeta?.({ versionCount: builds.current });
+        return;
+      }
+
+      // ---- Dashboard on colo → spec-driven dashboard (pilot) ----
+      if (mode === "dashboard" && isColo) {
+        append(spec ? "Updating the dashboard spec…" : "Planning the dashboard spec…");
+        patch({ phase: "building" });
+        const { app, spec: nextSpec, warnings } = await buildDashboard({
+          datasets, userPrompt: prompt, ...(spec ? { currentSpec: spec } : {}),
+        });
+        setSpec(nextSpec);
+        setResult({ kind: "dashboard", app });
+        setDashVersion((v) => v + 1);
+        const note = warnings.length ? ` · ${warnings.length} note${warnings.length === 1 ? "" : "s"}` : "";
+        patch({ phase: "done", tail: null, assistantText: (nextSpec.meta.title || "Dashboard ready") + note });
+        builds.current += 1;
+        onBuildMeta?.({ versionCount: builds.current });
+        return;
+      }
+
+      // ---- Legacy path: non-colo dashboards (codegen) + PDF reports ----
       append(`Planned a ${mode}${plan.brief ? ` — ${plan.brief.title}` : ""}.`);
       patch({ phase: "building", brief: plan.brief });
 
@@ -211,7 +238,7 @@ export default function ChatPage({
     } finally {
       setBusy(false);
     }
-  }, [tables, conversationId, result, onBuildMeta, spec, projectId]);
+  }, [tables, conversationId, result, onBuildMeta, spec, deckSpec, projectId]);
 
   // Kick off the first turn from the Landing prompt — in an effect (after
   // render), guarded on data being present.
@@ -269,6 +296,21 @@ export default function ChatPage({
           remote={REMOTE_DATA ? { bffUrl: BFF_URL, projectId } : undefined}
           onRuntimeError={(msg: string) => setError(msg)}
         />
+      ) : result?.kind === "deck" ? (
+        <div className="cp-deck">
+          <div className="cp-deck-bar">
+            <span className="cp-deck-title">{result.compiled.meta.title}</span>
+            <button
+              className="cp-tool-btn"
+              onClick={() => downloadBase64(result.pptxBase64, result.filename, "application/vnd.openxmlformats-officedocument.presentationml.presentation")}
+            >
+              <HiOutlineDownload /> <span>Download .pptx</span>
+            </button>
+          </div>
+          <div className="cp-deck-scroll">
+            <DeckPreview key={dashVersion} compiled={result.compiled} />
+          </div>
+        </div>
       ) : result?.kind === "doc" ? (
         <div className="cp-doc">
           <div className="cp-doc-icon">{result.mode === "pdf" ? "📄" : "📽️"}</div>
