@@ -2,8 +2,9 @@
 // in the app (no PPTX-in-browser, no sandbox). Because the deck is already compiled
 // (chart/KPI/table data resolved server-side), this is pure rendering and matches the
 // downloaded .pptx. Charts are drawn as lightweight inline SVG (no chart dependency).
-import { useMemo } from "react";
+import { useMemo, useEffect, useState } from "react";
 import type { CompiledDeck, CompiledSlide, CompiledBlock, ResolvedChart } from "../../shared/deck-spec";
+import { renderDeckPreview } from "../api";
 import "./DeckPreview.css";
 
 const COLORS = ["#4F46E5", "#06B6D4", "#818CF8", "#94A3B8", "#A5B4FC", "#C7D2FE"];
@@ -89,6 +90,7 @@ function VisualCell({ cb }: { cb: CompiledBlock }) {
     <div className="dp-cell">
       {cap && <div className="dp-cell-cap">{cap}</div>}
       {cb.chart ? <div className="dp-chart"><Chart chart={cb.chart} /></div>
+        : cb.image ? <div className="dp-image"><img src={cb.image.dataUrl} alt={cb.image.caption ?? ""} /></div>
         : cb.table ? (
           <div className="dp-table-wrap">
             <table className="dp-table">
@@ -101,16 +103,16 @@ function VisualCell({ cb }: { cb: CompiledBlock }) {
   );
 }
 
-function SlideCard({ slide, index, total }: { slide: CompiledSlide; index: number; total: number }) {
+function SlideCard({ slide, index, total, dark }: { slide: CompiledSlide; index: number; total: number; dark: boolean }) {
   const hero = slide.role === "title" || slide.role === "section";
   const kpis = slide.blocks.filter((b) => b.kpis).flatMap((b) => b.kpis!).slice(0, 6);
-  const visuals = slide.blocks.filter((b) => b.chart || b.table).slice(0, 4);
+  const visuals = slide.blocks.filter((b) => b.chart || b.table || b.image).slice(0, 4);
   const bullets = slide.blocks.find((b) => b.block.type === "bullets");
   const callout = slide.blocks.find((b) => b.block.type === "callout");
   const gridClass = `dp-grid dp-grid--${Math.min(visuals.length, 4)}`;
 
   return (
-    <div className={`dp-slide ${hero ? "dp-slide--hero" : ""} ${slide.role === "section" ? "dp-slide--section" : ""}`}>
+    <div className={`dp-slide ${dark ? "dp-slide--dark" : ""} ${hero ? "dp-slide--hero" : ""} ${slide.role === "section" ? "dp-slide--section" : ""}`}>
       <div className="dp-slide-num">{index + 1} / {total}</div>
       {hero ? (
         <div className="dp-hero">
@@ -122,6 +124,7 @@ function SlideCard({ slide, index, total }: { slide: CompiledSlide; index: numbe
         <>
           <h2 className="dp-title">{slide.title}</h2>
           {slide.message && <div className="dp-message">{slide.message}</div>}
+          <div className="dp-divider" />
           <div className="dp-body">
             {kpis.length > 0 && (
               <div className="dp-kpis">
@@ -137,6 +140,8 @@ function SlideCard({ slide, index, total }: { slide: CompiledSlide; index: numbe
               <div className={gridClass}>{visuals.map((cb, i) => <VisualCell key={i} cb={cb} />)}</div>
             ) : bullets && bullets.block.type === "bullets" ? (
               <ul className="dp-bullets">{bullets.block.items.map((t, i) => <li key={i}>{t}</li>)}</ul>
+            ) : kpis.length === 0 && !callout ? (
+              <div className="dp-empty">No visuals on this slide</div>
             ) : null}
             {callout && callout.block.type === "callout" && (
               <div className={`dp-callout dp-callout--${callout.block.emphasis ?? "info"}`}>{callout.block.text}</div>
@@ -148,11 +153,44 @@ function SlideCard({ slide, index, total }: { slide: CompiledSlide; index: numbe
   );
 }
 
-export default function DeckPreview({ compiled }: { compiled: CompiledDeck }) {
+export default function DeckPreview({ compiled, pptxBase64 }: { compiled: CompiledDeck; pptxBase64?: string }) {
   const slides = useMemo(() => compiled.slides ?? [], [compiled]);
+  const dark = compiled.meta.theme === "dark";
+  const [images, setImages] = useState<string[] | null>(null);
+  const [status, setStatus] = useState<"idle" | "loading" | "exact" | "fallback">("idle");
+
+  // Fetch the exact rendered slides (real .pptx → images). Fall back to the SVG cards while
+  // loading or if the server can't render (LibreOffice missing). Re-runs whenever the deck
+  // changes (new pptxBase64), so edits refresh the exact preview.
+  useEffect(() => {
+    if (!pptxBase64) { setStatus("fallback"); return; }
+    let cancelled = false;
+    setStatus("loading");
+    renderDeckPreview(pptxBase64).then((r) => {
+      if (cancelled) return;
+      if (r.images.length) { setImages(r.images); setStatus("exact"); }
+      else { setImages(null); setStatus("fallback"); }
+    }).catch(() => { if (!cancelled) setStatus("fallback"); });
+    return () => { cancelled = true; };
+  }, [pptxBase64]);
+
+  if (status === "exact" && images) {
+    return (
+      <div className={"dp-root" + (dark ? " dp-root--dark" : "")}>
+        {images.map((src, i) => (
+          <div key={i} className="dp-exact">
+            <img src={src} alt={`Slide ${i + 1}`} loading="lazy" />
+            <div className="dp-slide-num">{i + 1} / {images.length}</div>
+          </div>
+        ))}
+      </div>
+    );
+  }
+
   return (
-    <div className="dp-root">
-      {slides.map((s, i) => <SlideCard key={s.id} slide={s} index={i} total={slides.length} />)}
+    <div className={"dp-root" + (dark ? " dp-root--dark" : "")}>
+      {status === "loading" && <div className="dp-rendering">Rendering exact preview…</div>}
+      {slides.map((s, i) => <SlideCard key={s.id} slide={s} index={i} total={slides.length} dark={dark} />)}
     </div>
   );
 }

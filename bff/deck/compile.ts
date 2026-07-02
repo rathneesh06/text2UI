@@ -13,6 +13,31 @@ import type { QueryFn } from "./facts";
 
 const numv = (v: unknown) => (typeof v === "bigint" ? Number(v) : typeof v === "number" ? v : Number(v ?? 0));
 
+const MON = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"];
+/** Coerce a value to a UTC Date if it looks like one (Date object or ISO/date string). */
+function toDate(v: unknown): Date | null {
+  if (v instanceof Date) return isNaN(v.getTime()) ? null : v;
+  if (typeof v === "string" && /^\d{4}-\d{2}-\d{2}/.test(v)) { const d = new Date(v); return isNaN(d.getTime()) ? null : d; }
+  return null;
+}
+/** Human axis/cell label for a temporal value, by grain. Non-dates pass through unchanged. */
+function dateLabel(v: unknown, grain?: string): unknown {
+  const d = toDate(v);
+  if (!d) return v;
+  const y = d.getUTCFullYear();
+  switch (grain) {
+    case "year": return String(y);
+    case "quarter": return `Q${Math.floor(d.getUTCMonth() / 3) + 1} ${y}`;
+    case "day": case "week": return `${MON[d.getUTCMonth()]} ${d.getUTCDate()}, ${y}`;
+    case "month": default: return `${MON[d.getUTCMonth()]} ${y}`;
+  }
+}
+/** Plain YYYY-MM-DD for dates in table cells (no grain context there). */
+function cellValue(v: unknown): unknown {
+  const d = toDate(v);
+  return d ? d.toISOString().slice(0, 10) : v;
+}
+
 function fmt(v: number, f?: ValueFormat): string {
   if (!isFinite(v)) return String(v);
   switch (f) {
@@ -34,7 +59,7 @@ async function resolveChart(b: ChartBlock, query: QueryFn): Promise<ResolvedChar
   const rows = await query(sql);
   return {
     chartType: b.chartType,
-    labels: rows.map((r) => (typeof r.x === "string" && /^\d{4}-\d{2}-\d{2}T/.test(r.x) ? r.x.slice(0, 10) : (r.x as any))),
+    labels: rows.map((r) => { const l = dateLabel(r.x, b.x?.timeGrain); return typeof l === "number" ? l : String(l ?? ""); }),
     series: seriesKeys.map((k) => ({ name: k.label, values: rows.map((r) => numv(r[k.key])) })),
   };
 }
@@ -47,7 +72,7 @@ async function resolveTable(b: TableBlock, query: QueryFn) {
   const { sql } = buildTableSql(widget);
   const rows = await query(sql);
   const columns = rows.length ? Object.keys(rows[0]) : b.columns.map((c) => c.label || c.col);
-  return { columns, rows: rows.map((r) => columns.map((c) => (r[c] as any) ?? "")) };
+  return { columns, rows: rows.map((r) => columns.map((c) => { const v = cellValue(r[c] as unknown); return typeof v === "number" ? v : v == null ? "" : String(v); })) };
 }
 
 async function resolveKpis(b: KpisBlock, query: QueryFn) {
@@ -62,7 +87,9 @@ async function resolveKpis(b: KpisBlock, query: QueryFn) {
   return out;
 }
 
-export async function compileDeck(spec: DeckSpec, _profiles: Dataset[], query?: QueryFn): Promise<CompiledDeck> {
+export type AssetResolver = (assetId: string) => { dataUrl: string; width?: number; height?: number } | undefined;
+
+export async function compileDeck(spec: DeckSpec, _profiles: Dataset[], query?: QueryFn, resolveAsset?: AssetResolver): Promise<CompiledDeck> {
   const warnings: string[] = [];
   const slides: CompiledSlide[] = [];
 
@@ -79,6 +106,10 @@ export async function compileDeck(spec: DeckSpec, _profiles: Dataset[], query?: 
         } else if (b.type === "kpis") {
           if (!query) { warnings.push(`slide "${slide.id}": KPIs need a data connection — skipped`); continue; }
           blocks.push({ block: b, kpis: await resolveKpis(b, query) });
+        } else if (b.type === "image") {
+          const a = resolveAsset?.(b.assetId);
+          if (!a) { warnings.push(`slide "${slide.id}": image asset "${b.assetId}" not found — skipped`); continue; }
+          blocks.push({ block: b, image: { dataUrl: a.dataUrl, width: a.width, height: a.height, caption: b.caption } });
         } else {
           blocks.push({ block: b }); // heading/bullets/callout/note: text passthrough
         }

@@ -102,19 +102,34 @@ export interface BuildDeckRequest {
   userPrompt: string;
   rows?: { tableName: string; rows: Record<string, unknown>[] }[];
   currentSpec?: import("../shared/deck-spec").DeckSpec;
+  deckId?: string;   // present → server edits the stored deck (targeted ops) instead of rebuilding
+  documents?: { name: string; base64: string }[];   // uploaded docs → parsed into tables + narrative context
+  images?: { name: string; base64: string }[];       // uploaded images → Asset Store (logo/embeds)
+  conversationId?: string;   // asset scope, stable across build + edit turns
+  projectId?: string;
 }
 export interface BuildDeckResult {
+  deckId: string;
+  version: number;
   spec: import("../shared/deck-spec").DeckSpec;
   compiled: import("../shared/deck-spec").CompiledDeck;
   filename: string;
   pptxBase64: string;
   warnings: string[];
+  summary?: string[];   // human-readable list of what an edit changed
 }
 export function buildDeck(body: BuildDeckRequest): Promise<BuildDeckResult> {
   return request<BuildDeckResult>("/api/deck/build", {
     method: "POST",
     body: JSON.stringify(body),
   });
+}
+
+/** Exact preview: render the real .pptx to one PNG data URL per slide (LibreOffice). Returns
+ *  empty images if the server can't render (e.g. LibreOffice missing) so the UI can fall back. */
+export async function renderDeckPreview(pptxBase64: string): Promise<{ images: string[] }> {
+  try { return await request<{ images: string[] }>("/api/deck/preview", { method: "POST", body: JSON.stringify({ pptxBase64 }) }); }
+  catch { return { images: [] }; }
 }
 
 /** Orchestrator front door (Phase 1-3). One conversational turn: the planner

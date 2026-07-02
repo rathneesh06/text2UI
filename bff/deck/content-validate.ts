@@ -86,7 +86,7 @@ export function validateContent(
     let blocks = s.blocks.map((b) => fixBlock(s.id, b)).filter((b): b is Block => !!b);
     let visuals = 0;
     blocks = blocks.filter((b) => {
-      if (b.type === "chart" || b.type === "table") { visuals++; if (visuals > 4) { warnings.push(`slide "${s.id}": more than 4 visuals — kept the first 4`); return false; } }
+      if (b.type === "chart" || b.type === "table" || b.type === "image") { visuals++; if (visuals > 4) { warnings.push(`slide "${s.id}": more than 4 visuals — kept the first 4`); return false; } }
       return true;
     });
     return { ...s, title, blocks };

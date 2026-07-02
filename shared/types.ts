@@ -11,6 +11,9 @@ export interface ColumnProfile {
   sampleValues: unknown[];
   min?: number | string;
   max?: number | string;
+  avg?: number;                                   // mean, numeric columns
+  nullCount?: number;                             // count of NULLs
+  topValues?: { value: unknown; count: number }[]; // most frequent values, categoricals
 }
 
 export interface DataProfile {

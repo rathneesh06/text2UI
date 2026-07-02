@@ -6,6 +6,8 @@ import type { Dataset } from "../../shared/types";
 import type { DeckSpec, OutlineNode, Slide, Block, DeckMeta } from "../../shared/deck-spec";
 import { callGemini, ORCHESTRATE_OPTS, type GenResult, type GenOptions } from "../aiflow";
 import { evidenceText, type EvidenceCatalog } from "./facts";
+import { catalogText } from "./catalog";
+import type { MetricCatalog } from "../../shared/catalog";
 
 export type Run = (system: string, user: string, opts?: GenOptions) => Promise<GenResult>;
 const TIMEOUT = Number(process.env.DECK_PLANNER_TIMEOUT_MS ?? 25000);
@@ -72,14 +74,13 @@ Rules — build DENSE, executive-quality slides (a single lonely chart looks emp
 
 On an EDIT turn you receive the CURRENT slides — return the full updated set, changing as little as possible and keeping untouched slide ids intact.`;
 
-function buildUser(datasets: Dataset[], evidence: EvidenceCatalog, outline: OutlineNode[], meta: DeckMeta, userPrompt: string, current?: DeckSpec): string {
+function buildUser(datasets: Dataset[], evidence: EvidenceCatalog, outline: OutlineNode[], meta: DeckMeta, userPrompt: string, current?: DeckSpec, catalog?: MetricCatalog, context?: string): string {
   const schema = datasets.map((d) => `"${d.tableName}": ${d.profile.columns.map((c) => `${c.name}(${c.type})`).join(", ")}`).join("\n");
-  const parts = [
-    `AUDIENCE: ${meta.audience}${meta.goal ? ` — goal: ${meta.goal}` : ""}`,
-    "", "COLUMNS:", schema,
-    "", "EVIDENCE:", evidenceText(evidence),
-    "", "APPROVED OUTLINE:", JSON.stringify(outline),
-  ];
+  const parts = context ? [context, ""] : [];
+  parts.push(`AUDIENCE: ${meta.audience}${meta.goal ? ` — goal: ${meta.goal}` : ""}`);
+  if (catalog) parts.push("", "CATALOG (prefer these governed measures + breakdowns; they carry the right aggregation & format):", catalogText(catalog));
+  parts.push("", "COLUMNS (raw):", schema);
+  parts.push("", "EVIDENCE:", evidenceText(evidence), "", "APPROVED OUTLINE:", JSON.stringify(outline));
   if (current) { parts.push("", "CURRENT SLIDES (edit — keep untouched ids):", JSON.stringify(current.slides)); }
   parts.push("", "USER REQUEST:", userPrompt);
   return parts.join("\n");
@@ -130,13 +131,13 @@ function coerceBlock(b: any): Block | null {
   }
 }
 
-export interface SlideInput { datasets: Dataset[]; evidence: EvidenceCatalog; outline: OutlineNode[]; meta: DeckMeta; userPrompt: string; currentSpec?: DeckSpec; }
+export interface SlideInput { datasets: Dataset[]; evidence: EvidenceCatalog; outline: OutlineNode[]; meta: DeckMeta; userPrompt: string; currentSpec?: DeckSpec; catalog?: MetricCatalog; context?: string; }
 
 export async function planSlides(input: SlideInput, run: Run = callGemini, timeoutMs = TIMEOUT): Promise<Slide[] | null> {
   const timeout = new Promise<null>((r) => setTimeout(() => r(null), timeoutMs));
   const call = (async () => {
     try {
-      const { text } = await run(SYSTEM, buildUser(input.datasets, input.evidence, input.outline, input.meta, input.userPrompt, input.currentSpec), { ...ORCHESTRATE_OPTS, responseSchema: SLIDES_SCHEMA });
+      const { text } = await run(SYSTEM, buildUser(input.datasets, input.evidence, input.outline, input.meta, input.userPrompt, input.currentSpec, input.catalog, input.context), { ...ORCHESTRATE_OPTS, responseSchema: SLIDES_SCHEMA });
       const o = JSON.parse(strip(text));
       if (!Array.isArray(o?.slides) || !o.slides.length) return null;
       const slides: Slide[] = o.slides

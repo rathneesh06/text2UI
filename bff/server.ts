@@ -20,8 +20,15 @@ import { buildExportZip, buildConnectedZip } from "./export";
 import { generateReport } from "./report";
 import { COLO_PROJECT_ID, COLO_LABEL, coloAvailable, coloProfiles, coloQuery } from "./sources/colo";
 import { handleDashboardBuild } from "./dashboard/handler";
-import { handleDeckBuild } from "./deck/handler";
+import { handleDeckBuild, handleDeckEdit } from "./deck/handler";
 import { loadRows } from "./deck/local-data";
+import { parseDocument } from "./deck/doc-parse";
+import { docToInputs } from "./deck/doc-bridge";
+import { parseImage } from "./deck/image-parse";
+import { putAsset, getAsset } from "./deck/asset-store";
+import { touchSession, getSession, sessionDeckId } from "./deck/session-router";
+import { pptxToSlideImages, sofficeAvailable } from "./deck/render-preview";
+import type { Asset } from "../shared/ingest";
 import { retrieveForBuild } from "./design-rag/build-context";
 import { enrollGeneration } from "./design-rag/enroll";
 import { generateDeck } from "./slides";
@@ -801,23 +808,73 @@ export function createServer() {
   //   • uploaded rows  → ephemeral in-memory DuckDB (loadRows)
   //   • colo views     → coloQuery
   //   • neither        → text-only deck
+  // Exact preview: render the real .pptx to per-slide PNGs (LibreOffice → pdf → pdfjs).
+  app.post("/api/deck/preview", async (req, res) => {
+    const b = (req.body ?? {}) as any;
+    if (!b.pptxBase64) { res.status(400).json({ error: "pptxBase64 required", images: [] }); return; }
+    try {
+      if (!(await sofficeAvailable())) { res.status(503).json({ error: "LibreOffice not available on server", images: [] }); return; }
+      const images = await pptxToSlideImages(Buffer.from(String(b.pptxBase64), "base64"));
+      res.json({ images });
+    } catch (err: any) {
+      res.status(500).json({ error: err?.message ?? "preview render failed", images: [] });
+    }
+  });
+
+  // Session resume: rehydrate the active artifact for a conversation after a reload.
+  app.get("/api/session/:conversationId", (req, res) => {
+    const rec = getSession(String(req.params.conversationId));
+    if (!rec) { res.status(404).json({ error: "no session" }); return; }
+    res.json(rec);
+  });
+
   app.post("/api/deck/build", async (req, res) => {
     const body = (req.body ?? {}) as any;
     const ds = (body.datasets ?? []) as any[];
-    const rows = body.rows as { tableName: string; rows: Record<string, unknown>[] }[] | undefined;
     const isColo = ds.length > 0 && ds.every((d) => String(d?.profile?.source?.filename ?? "").startsWith("view:"));
     let local: Awaited<ReturnType<typeof loadRows>> | undefined;
     try {
+      // ---- Phase C ingestion: parse uploaded documents + images server-side ----
+      // Assets are scoped to the conversation so they persist across build + edit turns.
+      const scope = String(body.conversationId || body.projectId || body.deckId || "default");
+      const docTables: { tableName: string; rows: Record<string, unknown>[] }[] = [];
+      let docNarrative = "";
+      const docs = (body.documents ?? []) as { name: string; base64: string }[];
+      for (let i = 0; i < docs.length; i++) {
+        const parsed = await parseDocument(new Uint8Array(Buffer.from(docs[i].base64, "base64")), docs[i].name);
+        if (parsed) { const inp = docToInputs(parsed, i); docTables.push(...inp.tables); if (inp.narrative) docNarrative += inp.narrative + "\n\n"; }
+      }
+      const uploadedImages: Asset[] = [];
+      for (const im of (body.images ?? []) as { name: string; base64: string }[]) {
+        const a = parseImage(new Uint8Array(Buffer.from(im.base64, "base64")), im.name);
+        if (a) { putAsset(scope, a); uploadedImages.push(a); }
+      }
+
+      // Merge document tables into the rows that get loaded into DuckDB.
+      const allRows = [...((body.rows ?? []) as { tableName: string; rows: Record<string, unknown>[] }[]), ...docTables];
       let datasets = ds;
       let query: ((sql: string) => Promise<Record<string, unknown>[]>) | undefined;
-      if (Array.isArray(rows) && rows.length) {
-        local = await loadRows(rows);                 // server-side profiles + query, consistent
+      if (allRows.length) {
+        local = await loadRows(allRows);              // server-side profiles + query, consistent
         datasets = local.datasets;
         query = local.query;
       } else if (isColo) {
         query = (sql: string) => coloQuery(sql, { rowCap: 5000, timeoutMs: QUERY_TIMEOUT_MS }).then((r) => r.rows);
       }
-      const { status, body: out } = await handleDeckBuild({ ...body, datasets }, { query });
+
+      // Prepend document prose as grounded context for the planners.
+      const userPrompt = docNarrative
+        ? `DOCUMENT CONTEXT (ground the deck in these facts + tables):\n${docNarrative}\nUSER REQUEST:\n${body.userPrompt}`
+        : body.userPrompt;
+
+      const deps = { query, resolveAsset: (id: string) => getAsset(scope, id), assets: uploadedImages };
+      // Session Router: resume the conversation's active deck when the client didn't send one.
+      const convId = String(body.conversationId || "");
+      const deckId = body.deckId || sessionDeckId(convId);
+      const { status, body: out } = deckId
+        ? await handleDeckEdit({ ...body, datasets, userPrompt, deckId }, deps)
+        : await handleDeckBuild({ ...body, datasets, userPrompt }, deps);
+      if (status === 200 && out?.deckId && convId) touchSession(convId, { deckId: out.deckId, artifact: "deck" });
       res.status(status).json(out);
     } catch (err: any) {
       res.status(500).json({ error: err?.message ?? "deck build failed" });

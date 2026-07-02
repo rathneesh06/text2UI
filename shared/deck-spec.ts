@@ -15,14 +15,14 @@ export type SlideRole =
   | "table" | "callout" | "recommendation" | "section" | "appendix";
 
 // ---- content blocks --------------------------------------------------------
-export interface HeadingBlock { type: "heading"; text: string; }
-export interface BulletsBlock { type: "bullets"; items: string[]; }
-export interface CalloutBlock { type: "callout"; text: string; emphasis?: "info" | "good" | "warn"; }
-export interface NoteBlock { type: "note"; text: string; }
+export interface HeadingBlock { type: "heading"; id?: string; text: string; }
+export interface BulletsBlock { type: "bullets"; id?: string; items: string[]; }
+export interface CalloutBlock { type: "callout"; id?: string; text: string; emphasis?: "info" | "good" | "warn"; }
+export interface NoteBlock { type: "note"; id?: string; text: string; }
 export interface KpiItem { label: string; metric: Metric; table: string; filters?: Filter[]; format?: Metric["format"]; }
-export interface KpisBlock { type: "kpis"; items: KpiItem[]; }
+export interface KpisBlock { type: "kpis"; id?: string; items: KpiItem[]; }
 export interface TableBlock {
-  type: "table"; table: string;
+  type: "table"; id?: string; table: string;
   title?: string;
   columns: { col: string; label?: string; agg?: Agg }[];
   groupBy?: Dimension[]; filters?: Filter[]; limit?: number;
@@ -31,6 +31,7 @@ export interface TableBlock {
  *  builds the SQL and resolves real values before rendering — no invented numbers. */
 export interface ChartBlock {
   type: "chart";
+  id?: string;
   title?: string;             // caption shown above the chart (needed for multi-chart slides)
   chartType: "line" | "bar" | "area" | "pie";
   table: string;
@@ -40,7 +41,8 @@ export interface ChartBlock {
   sort?: { by: "x" | "y"; dir: "asc" | "desc" };
   limit?: number;
 }
-export type Block = HeadingBlock | BulletsBlock | CalloutBlock | NoteBlock | KpisBlock | TableBlock | ChartBlock;
+export interface ImageBlock { type: "image"; id?: string; assetId: string; caption?: string; align?: "left" | "center" | "right"; }
+export type Block = HeadingBlock | BulletsBlock | CalloutBlock | NoteBlock | KpisBlock | TableBlock | ChartBlock | ImageBlock;
 
 // ---- slides & outline ------------------------------------------------------
 export interface Slide {
@@ -66,6 +68,7 @@ export interface DeckMeta {
   goal?: string;
   tone?: Tone;
   slideBudget?: number;       // target slide count
+  theme?: "light" | "dark";   // visual token honored by the pptx compiler + preview
 }
 
 export interface DeckConstraints {
@@ -93,11 +96,13 @@ export interface ResolvedChart {
 export interface ResolvedTable { columns: string[]; rows: (string | number)[][]; }
 export interface ResolvedKpi { label: string; value: string; }
 
+export interface ResolvedImage { dataUrl: string; width?: number; height?: number; caption?: string; }
 export interface CompiledBlock {
   block: Block;
   chart?: ResolvedChart;
   table?: ResolvedTable;
   kpis?: ResolvedKpi[];
+  image?: ResolvedImage;
 }
 export interface CompiledSlide {
   id: string;

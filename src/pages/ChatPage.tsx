@@ -58,6 +58,17 @@ function briefLine(b?: OrchestratorBrief): string {
   return `${b.title}${b.narrative ? ` — ${b.narrative}` : ""}${charts}`;
 }
 
+/** Detect an EXPLICIT request to switch artifact type (not a normal refinement). Requires a
+ *  switch verb + a target noun, so "make the bars bigger" never trips it. */
+function detectArtifactSwitch(prompt: string): "ppt" | "pdf" | "dashboard" | null {
+  const s = prompt.toLowerCase();
+  if (!/\b(turn|make|convert|switch|change|export|rebuild|recreate|render)\b/.test(s)) return null;
+  if (/\b(pdf|report)\b/.test(s)) return "pdf";
+  if (/\b(deck|slides?|powerpoint|presentation|ppt)\b/.test(s)) return "ppt";
+  if (/\b(dashboard|interactive app|web app)\b/.test(s)) return "dashboard";
+  return null;
+}
+
 export default function ChatPage({
   projectId, tables, initialPrompt, onConsumeInitialPrompt,
   onFiles, onRemoveSource, fileError, onNewProject, onBuildMeta,
@@ -74,6 +85,11 @@ export default function ChatPage({
   const [dashVersion, setDashVersion] = useState(0);  // bumps each build → remounts the Sandbox
   const [spec, setSpec] = useState<DashboardSpec | null>(null);  // persistent spec; edits mutate it
   const [deckSpec, setDeckSpec] = useState<DeckSpec | null>(null);  // persistent deck spec for ppt edits
+  const [deckId, setDeckId] = useState<string | null>(null);        // server-side Spec Store id
+  // Uploaded reports/logos for the deck. Kept for the life of the deck and re-sent each turn
+  // (the server rebuilds datasets per request; asset ids are content-hashed so they resolve).
+  const [deckDocs, setDeckDocs] = useState<{ name: string; base64: string }[]>([]);
+  const [deckImages, setDeckImages] = useState<{ name: string; base64: string }[]>([]);
   const [tablesOpen, setTablesOpen] = useState(false);
   const [expandedTable, setExpandedTable] = useState<string | null>(null);
   const [exporting, setExporting] = useState(false);
@@ -142,33 +158,69 @@ export default function ChatPage({
       // For uploaded data, send the rows so the deck pipeline can resolve charts server-side.
       const rows = isColo ? undefined : tables.map((t) => ({ tableName: t.tableName, rows: t.ingest.rows }));
 
-      // Step 1 — plan. If the orchestrator is down, default to a dashboard build
-      // with the raw prompt so we always produce output.
-      let plan: Awaited<ReturnType<typeof orchestratePlan>>;
-      try {
-        plan = await orchestratePlan({ datasets, userPrompt: prompt, ...(conversationId ? { conversationId } : {}), ...access });
-        if ((plan as any).conversationId) setConversationId((plan as any).conversationId);
-      } catch {
-        append("Planner unavailable — building a dashboard directly…");
-        plan = { conversationId: conversationId ?? "", outputMode: "dashboard", enhancedPrompt: prompt } as any;
+      // Step 1 — decide the turn's mode.
+      // CRITICAL: if an artifact already exists, this turn is an EDIT of it. We keep the
+      // same pipeline and pass the persisted spec, instead of re-classifying the mode from
+      // a refinement prompt (which rarely restates "deck"/"dashboard" and was silently
+      // misrouting edits to the wrong pipeline). The orchestrator only chooses the artifact
+      // type on the FIRST turn. To switch artifact types, start a new project (＋).
+      const existingKind = result?.kind;
+      let mode: "dashboard" | "pdf" | "ppt";
+      let brief: OrchestratorBrief | undefined;
+      let enhancedPrompt = prompt;
+
+      // Safe artifact-switching: a refinement stays locked to the current artifact, but an
+      // EXPLICIT request ("turn this into a PDF", "make a dashboard") switches pipelines and
+      // builds fresh in the new mode. Ordinary edits never switch.
+      const currentMode: typeof mode | null = existingKind === "deck" ? "ppt" : existingKind === "dashboard" ? "dashboard" : existingKind === "doc" ? result!.mode : null;
+      const requested = existingKind ? detectArtifactSwitch(prompt) : null;
+      const doSwitch = !!requested && requested !== currentMode;
+
+      if (doSwitch) {
+        setDeckId(null); setDeckSpec(null); setSpec(null);   // leave the old artifact behind
+        mode = requested!;
+        append(`Switching to ${requested === "pdf" ? "a PDF report" : requested === "ppt" ? "slides" : "a dashboard"}…`);
+      } else if (existingKind === "deck") {
+        mode = "ppt";
+      } else if (existingKind === "dashboard") {
+        mode = "dashboard";
+      } else if (existingKind === "doc") {
+        mode = result!.mode;
+      } else {
+        let plan: Awaited<ReturnType<typeof orchestratePlan>>;
+        try {
+          plan = await orchestratePlan({ datasets, userPrompt: prompt, ...(conversationId ? { conversationId } : {}), ...access });
+          if ((plan as any).conversationId) setConversationId((plan as any).conversationId);
+        } catch {
+          append("Planner unavailable — building a dashboard directly…");
+          plan = { conversationId: conversationId ?? "", outputMode: "dashboard", enhancedPrompt: prompt } as any;
+        }
+        if ("needsClarification" in plan) { patch({ phase: "clarify", assistantText: plan.question }); return; }
+        mode = plan.outputMode;
+        brief = plan.brief;
+        enhancedPrompt = plan.enhancedPrompt ?? prompt;
       }
-
-      if ("needsClarification" in plan) { patch({ phase: "clarify", assistantText: plan.question }); return; }
-
-      const mode = plan.outputMode;
 
       // ---- PPT → spec-driven deck pipeline (scrollable preview + editable spec) ----
       if (mode === "ppt") {
-        append(deckSpec ? "Updating the deck…" : "Planning the deck…");
+        append(deckId ? "Applying your edit…" : "Planning the deck…");
         patch({ phase: "building" });
-        const { spec: ns, compiled, pptxBase64, filename, warnings } = await buildDeck({
-          datasets, userPrompt: prompt, ...(rows ? { rows } : {}), ...(deckSpec ? { currentSpec: deckSpec } : {}),
+        const res = await buildDeck({
+          datasets, userPrompt: prompt, ...(rows ? { rows } : {}),
+          ...(deckId ? { deckId } : {}), ...(deckSpec ? { currentSpec: deckSpec } : {}),
+          ...(conversationId ? { conversationId } : {}), projectId,
+          // To feed uploaded reports/logos into the deck, also pass:
+          //   documents: docFiles, images: imageFiles   (see readUpload() below)
+          ...(deckDocs.length ? { documents: deckDocs } : {}),
+          ...(deckImages.length ? { images: deckImages } : {}),
         });
-        setDeckSpec(ns);
-        setResult({ kind: "deck", compiled, pptxBase64, filename });
+        setDeckId(res.deckId);
+        setDeckSpec(res.spec);
+        setResult({ kind: "deck", compiled: res.compiled, pptxBase64: res.pptxBase64, filename: res.filename });
         setDashVersion((v) => v + 1);
-        const note = warnings.length ? ` · ${warnings.length} note${warnings.length === 1 ? "" : "s"}` : "";
-        patch({ phase: "done", tail: null, assistantText: (ns.meta.title || "Deck ready") + note });
+        const changed = res.summary?.length ? res.summary.join("; ") : (res.spec.meta.title || "Deck ready");
+        const note = res.warnings.length ? ` · ${res.warnings.length} note${res.warnings.length === 1 ? "" : "s"}` : "";
+        patch({ phase: "done", tail: null, assistantText: changed + note });
         builds.current += 1;
         onBuildMeta?.({ versionCount: builds.current });
         return;
@@ -192,8 +244,8 @@ export default function ChatPage({
       }
 
       // ---- Legacy path: non-colo dashboards (codegen) + PDF reports ----
-      append(`Planned a ${mode}${plan.brief ? ` — ${plan.brief.title}` : ""}.`);
-      patch({ phase: "building", brief: plan.brief });
+      append(`Planned a ${mode}${brief ? ` — ${brief.title}` : ""}.`);
+      patch({ phase: "building", brief });
 
       // Step 2 — build (streamed).
       if (mode === "dashboard") {
@@ -201,7 +253,7 @@ export default function ChatPage({
         // On EDIT turns, send the user's RAW instruction (not the full planner brief)
         // together with the current code, so the model edits in place surgically
         // instead of regenerating the whole app from a fresh brief.
-        const buildPrompt = editing ? prompt : plan.enhancedPrompt;
+        const buildPrompt = editing ? prompt : enhancedPrompt;
         const reqBody = { datasets, userPrompt: buildPrompt, ...access, ...(editing ? { currentCode: editing } : {}) };
         let app: GeneratedApp;
         try {
@@ -213,15 +265,15 @@ export default function ChatPage({
           append("Live stream unavailable — using standard generation…");
           app = await generate(reqBody);
         }
-        setResult({ kind: "dashboard", app, brief: plan.brief });
+        setResult({ kind: "dashboard", app, brief });
         setDashVersion((v) => v + 1);   // force the preview to remount with the new app
-        patch({ phase: "done", tail: null, assistantText: briefLine(plan.brief) || "Dashboard ready." });
+        patch({ phase: "done", tail: null, assistantText: briefLine(brief) || "Dashboard ready." });
       } else {
         append(`Generating the ${mode.toUpperCase()}…`);
-        const docReq = { datasets, userPrompt: plan.enhancedPrompt };
+        const docReq = { datasets, userPrompt: enhancedPrompt };
         const r = mode === "pdf" ? await generateReport(docReq) : await generatePpt(docReq);
         const base64 = mode === "pdf" ? (r as ReportResult).pdfBase64 : (r as PptResult).pptxBase64;
-        setResult({ kind: "doc", mode, filename: r.filename, base64, brief: plan.brief });
+        setResult({ kind: "doc", mode, filename: r.filename, base64, brief });
         patch({ phase: "done", assistantText: `Your ${mode.toUpperCase()} is ready.` });
       }
       builds.current += 1;
@@ -238,7 +290,26 @@ export default function ChatPage({
     } finally {
       setBusy(false);
     }
-  }, [tables, conversationId, result, onBuildMeta, spec, deckSpec, projectId]);
+  }, [tables, conversationId, result, onBuildMeta, spec, deckSpec, deckId, deckDocs, deckImages, projectId]);
+
+  // Capture uploaded reports/logos for the deck (base64), then defer to the parent's
+  // data-file handling. Docx/html/md/txt become grounding + tables; images become assets.
+  const handleFiles = useCallback((files: FileList | File[]) => {
+    const arr = Array.from(files);
+    const isImg = (n: string) => /\.(png|jpe?g|gif|webp)$/i.test(n);
+    const isDoc = (n: string) => /\.(docx|html?|md|markdown|txt)$/i.test(n);
+    void (async () => {
+      for (const f of arr) {
+        if (!isImg(f.name) && !isDoc(f.name)) continue;
+        const buf = new Uint8Array(await f.arrayBuffer());
+        let bin = ""; for (let i = 0; i < buf.length; i++) bin += String.fromCharCode(buf[i]);
+        const base64 = btoa(bin);
+        if (isImg(f.name)) setDeckImages((p) => [...p.filter((x) => x.name !== f.name), { name: f.name, base64 }]);
+        else setDeckDocs((p) => [...p.filter((x) => x.name !== f.name), { name: f.name, base64 }]);
+      }
+    })();
+    onFiles(files);
+  }, [onFiles]);
 
   // Kick off the first turn from the Landing prompt — in an effect (after
   // render), guarded on data being present.
@@ -308,7 +379,7 @@ export default function ChatPage({
             </button>
           </div>
           <div className="cp-deck-scroll">
-            <DeckPreview key={dashVersion} compiled={result.compiled} />
+            <DeckPreview key={dashVersion} compiled={result.compiled} pptxBase64={result.pptxBase64} />
           </div>
         </div>
       ) : result?.kind === "doc" ? (
@@ -379,7 +450,7 @@ export default function ChatPage({
           )}
           <PromptInput
             onSubmit={runTurn}
-            onFiles={onFiles}
+            onFiles={handleFiles}
             variant="dashboard"
             placeholder={result ? "Type to edit or refine — e.g. add a funnel, make it darker, switch to PDF" : "Describe what you want to build"}
             canSubmit={hasData}
