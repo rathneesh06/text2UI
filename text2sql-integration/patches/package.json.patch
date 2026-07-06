@@ -1,0 +1,32 @@
+--- pristine/text2UI/package.json	2026-07-02 16:45:30.000000000 +0000
++++ code/text2UI/package.json	2026-07-06 13:24:31.246705917 +0000
+@@ -29,7 +29,7 @@
+     "test:eval:live": "tsx bff/eval/run.ts",
+     "test:dbexport": "tsx bff/dbexport.test.ts",
+     "test:metrics": "tsx bff/metrics.test.ts",
+-    "test": "npm run test:errors && npm run test:sandbox && npm run test:domain && npm run test:design && npm run test:heal && npm run test:markitdown && npm run test:export && npm run test:eval && npm run test:dbexport && npm run test:exemplars && npm run test:metrics && npm run test:report && npm run test:slides && npm run test:security && npm run test:auth && npm run test:tenancy && npm run test:ratelimit && npm run test:designrag && npm run test:deck-edit",
++    "test": "npm run test:errors && npm run test:sandbox && npm run test:domain && npm run test:design && npm run test:heal && npm run test:markitdown && npm run test:export && npm run test:eval && npm run test:dbexport && npm run test:exemplars && npm run test:metrics && npm run test:report && npm run test:slides && npm run test:security && npm run test:auth && npm run test:tenancy && npm run test:ratelimit && npm run test:designrag && npm run test:deck-edit && npm run test:t2sql-guard && npm run test:t2sql-planner && npm run test:db-conn && npm run test:conversational && npm run test:source-chat",
+     "test:heal": "tsx bff/heal.test.ts",
+     "test:errors": "tsx shared/errors.test.ts",
+     "test:report": "tsx bff/report.test.ts",
+@@ -50,7 +50,12 @@
+     "db:introspect": "tsx bff/sources/mysql-cli.ts",
+     "test:sources": "tsx bff/sources/mysql.test.ts",
+     "db:snapshot": "tsx bff/sources/mysql-snapshot-cli.ts",
+-    "db:model": "tsx bff/sources/model-cli.ts"
++    "db:model": "tsx bff/sources/model-cli.ts",
++    "test:t2sql-guard": "tsx bff/text2sql/guard.test.ts",
++    "test:t2sql-planner": "tsx bff/text2sql/planner.test.ts",
++    "test:db-conn": "tsx bff/sources/db-conn.test.ts",
++    "test:conversational": "tsx bff/dashboard/conversational.test.ts",
++    "test:source-chat": "tsx bff/text2sql/source-chat.test.ts"
+   },
+   "dependencies": {
+     "@codesandbox/sandpack-react": "^2.20.0",
+@@ -94,4 +99,4 @@
+     "typescript": "^5.5.0",
+     "vite": "^8.0.16"
+   }
+-}
+\ No newline at end of file
++}

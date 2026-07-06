@@ -1,0 +1,35 @@
+--- pristine/text2UI/src/api.ts	2026-07-01 17:50:04.000000000 +0000
++++ code/text2UI/src/api.ts	2026-07-06 13:21:11.878388052 +0000
+@@ -80,11 +80,15 @@
+   datasets: { tableName: string; profile: DataProfile }[];
+   userPrompt: string;
+   currentSpec?: DashboardSpec;
++  /** Orchestrator brief (palette + design direction) — becomes the spec planner's visual directive. */
++  brief?: unknown;
+ }
+ export interface BuildDashboardResult {
+   app: GeneratedApp;
+   spec: DashboardSpec;
+   warnings: string[];
++  /** Human-readable description of what this turn changed. */
++  summary?: string[];
+ }
+ export function buildDashboard(body: BuildDashboardRequest): Promise<BuildDashboardResult> {
+   return request<BuildDashboardResult>("/api/dashboard/build", {
+@@ -161,6 +165,16 @@
+ export type OrchestratePlan =
+   | { conversationId: string; needsClarification: true; question: string }
+   | { conversationId: string; outputMode: OutputMode; enhancedPrompt: string; brief?: OrchestratorBrief };
++export interface GateTurnResult { conversationId: string; action: "edit" | "question" | "chat"; reply?: string; dataQuestion?: boolean }
++
++/** Follow-up gate: classify a turn against an existing artifact (edit vs answer). */
++export function gateTurn(body: {
++  userPrompt: string; conversationId?: string; artifactKind: string; artifactSummary?: string;
++  datasets?: { tableName: string; profile: DataProfile }[];
++}): Promise<GateTurnResult> {
++  return request<GateTurnResult>("/api/gate", { method: "POST", body: JSON.stringify(body) });
++}
++
+ export function orchestratePlan(body: ChatRequest): Promise<OrchestratePlan> {
+   return request<OrchestratePlan>("/api/orchestrate", { method: "POST", body: JSON.stringify(body) });
+ }

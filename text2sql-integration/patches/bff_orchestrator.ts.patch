@@ -1,0 +1,88 @@
+--- pristine/text2UI/bff/orchestrator.ts	2026-06-25 10:49:48.000000000 +0000
++++ code/text2UI/bff/orchestrator.ts	2026-07-06 13:14:56.401808727 +0000
+@@ -20,6 +20,9 @@
+   properties: {
+     outputMode: { type: "string", enum: ["dashboard", "pdf", "ppt"], description: "Artifact to build. Honor the user's explicit ask; default dashboard." },
+     needsClarification: { type: "boolean", description: "True only if the request is too ambiguous to proceed." },
++    respond: { type: "boolean", description: "True when the message wants an ANSWER (a question, greeting, thanks, feedback), not a build." },
++    reply: { type: "string", description: "If respond: the answer, grounded ONLY in the schema, samples, and conversation." },
++    dataQuestion: { type: "boolean", description: "If respond: true when a correct answer requires computing over the full data, not the samples." },
+     question: { type: "string", description: "If needsClarification, the single question to ask the user." },
+     title: { type: "string" },
+     narrative: { type: "string", description: "The story the data tells, 1-2 sentences." },
+@@ -56,7 +59,8 @@
+ - Specify a concrete, attractive color palette (hex) and a vivid design direction — favor tasteful vibrance over dull defaults.
+ - Write enhancedPrompt as a complete, detailed brief the generator can follow without guessing.
+ - DEFAULT TO BUILDING. Commit to a confident best plan in essentially every case; make reasonable assumptions instead of asking. NEVER ask the user to clarify styling, colors, chart choice, or which metrics to show — decide yourself.
+-- Set needsClarification=true ONLY when the request is empty or entirely unrelated to the data. If the conversation already contains a clarifying question, never ask again — proceed with a best-effort plan.`;
++- Set needsClarification=true ONLY when the request is empty or entirely unrelated to the data. If the conversation already contains a clarifying question, never ask again — proceed with a best-effort plan.
++- RESPOND, DON'T BUILD, when the message is a QUESTION about the data ("which region sold most?"), a greeting, thanks, or feedback wanting an answer: set respond=true and write a warm, direct reply grounded ONLY in the schema/samples/conversation. Set dataQuestion=true when the honest answer needs the full data (aggregations, extremes, counts) rather than the 3 sample rows — never present sample-derived numbers as facts about the whole dataset. Still fill the required brief fields with a best plan; they are ignored when respond=true.`;
+ 
+ function describeDatasets(datasets: Dataset[]): string {
+   return datasets.map((d) => {
+@@ -84,6 +88,12 @@
+     try {
+       const { text } = await run(SYSTEM, buildUserPrompt(input.datasets, input.userPrompt, input.history), { ...ORCHESTRATE_OPTS, responseSchema: BRIEF_SCHEMA });
+       const parsed = JSON.parse(stripFences(text));
++      // A respond turn beats a build: the user asked a question, so building
++      // would feel unresponsive — exactly the failure mode this intent removes.
++      if (parsed?.respond === true && typeof parsed.reply === "string" && parsed.reply.trim()) {
++        console.log(`[orchestrator] respond turn (dataQuestion=${!!parsed.dataQuestion})`);
++        return { respond: true, reply: parsed.reply.trim(), dataQuestion: !!parsed.dataQuestion };
++      }
+       // Prefer a usable plan. The schema requires the brief fields, so the model
+       // almost always supplies them — even when it also flags clarification.
+       // Checking the brief FIRST stops spurious "needs clarification" stalls.
+@@ -103,6 +113,52 @@
+       return null;
+     }
+   })();
++  return Promise.race([call, timeout]);
++}
++
++// ---- follow-up gate ---------------------------------------------------------------
++// Once an artifact exists, the mode is locked and (previously) every prompt went
++// STRAIGHT to the builder — questions triggered rebuilds and felt robotic. This
++// gate is the missing orchestration layer for turns 2..n: a small, fast call that
++// decides edit vs answer. It defaults to "edit" on any failure, so it can never
++// block a build.
++export interface GateResult { action: "edit" | "question" | "chat"; reply?: string; dataQuestion?: boolean }
++
++export const GATE_SCHEMA = {
++  type: "object",
++  properties: {
++    action: { type: "string", enum: ["edit", "question", "chat"], description: "edit: change/restyle/extend the artifact. question: asks ABOUT the data or artifact. chat: greeting/thanks/meta." },
++    reply: { type: "string", description: "For question/chat: the answer, grounded ONLY in the provided context." },
++    dataQuestion: { type: "boolean", description: "For question: true when answering needs computing over the full data." },
++  },
++  required: ["action"],
++};
++
++const GATE_SYSTEM = `A data artifact already exists and the user sent a follow-up. Classify it:
++- edit: ANY request to change the artifact — colors, theme, layout, add/remove/resize charts or KPIs, filters, titles, different metrics. When ambiguous, choose edit.
++- question: the user asks ABOUT the data or the artifact ("which month peaked?", "what does this chart show?"). Write reply grounded ONLY in the context below; set dataQuestion=true when a correct answer needs full-data computation (totals, extremes, group-bys) — NEVER invent numbers.
++- chat: greetings, thanks, meta ("nice!", "what can you do?"). Write a short, warm reply.`;
++
++export interface GateInput { userPrompt: string; history?: ChatMessage[]; artifactKind: string; artifactSummary?: string; datasets?: Dataset[] }
++
++export async function gateTurn(input: GateInput, run: OrchestrateRun = callGemini, timeoutMs = 8000): Promise<GateResult | null> {
++  const timeout = new Promise<null>((resolve) => setTimeout(() => resolve(null), timeoutMs));
++  const call = (async (): Promise<GateResult | null> => {
++    try {
++      const hist = input.history?.length ? "Conversation so far:\n" + input.history.slice(-10).map((m) => `${m.role}: ${m.content}`).join("\n") + "\n\n" : "";
++      const data = input.datasets?.length ? `Data:\n${describeDatasets(input.datasets)}\n\n` : "";
++      const art = `Current artifact: a ${input.artifactKind}${input.artifactSummary ? ` — ${input.artifactSummary}` : ""}.\n\n`;
++      const { text } = await run(GATE_SYSTEM, `${hist}${data}${art}User message: ${input.userPrompt}`, { ...ORCHESTRATE_OPTS, responseSchema: GATE_SCHEMA });
++      const parsed = JSON.parse(stripFences(text));
++      if (!parsed || !["edit", "question", "chat"].includes(parsed.action)) return null;
++      if (parsed.action !== "edit" && !(typeof parsed.reply === "string" && parsed.reply.trim())) return { action: "edit" };
++      console.log(`[gate] action=${parsed.action}${parsed.dataQuestion ? " dataQuestion" : ""}`);
++      return { action: parsed.action, reply: parsed.reply?.trim(), dataQuestion: !!parsed.dataQuestion };
++    } catch (err) {
++      console.warn(`[gate] failed -> edit: ${(err as Error).message}`);
++      return null;
++    }
++  })();
+   return Promise.race([call, timeout]);
+ }
+ 

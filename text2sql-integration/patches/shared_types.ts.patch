@@ -1,0 +1,15 @@
+--- pristine/text2UI/shared/types.ts	2026-07-01 16:31:44.000000000 +0000
++++ code/text2UI/shared/types.ts	2026-07-06 13:14:56.401425063 +0000
+@@ -52,7 +52,11 @@
+   enhancedPrompt: string;
+ }
+ export interface ClarificationNeeded { needsClarification: true; question: string }
+-export type OrchestratorResult = OrchestratorBrief | ClarificationNeeded;
++/** The turn wants an ANSWER, not an artifact: questions about the data/artifact,
++ *  greetings, feedback. dataQuestion=true means a correct answer needs computing
++ *  over the full data (route to the snapshot text2SQL path for server sources). */
++export interface RespondTurn { respond: true; reply: string; dataQuestion?: boolean }
++export type OrchestratorResult = OrchestratorBrief | ClarificationNeeded | RespondTurn;
+ export interface ChatMessage { role: "user" | "assistant"; content: string }
+ 
+ /** Structured report the model returns for the PDF pipeline; rendered deterministically. */

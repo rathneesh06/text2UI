@@ -1,0 +1,171 @@
+--- pristine/text2UI/bff/server.ts	2026-07-01 17:49:34.000000000 +0000
++++ code/text2UI/bff/server.ts	2026-07-06 13:17:25.054968110 +0000
+@@ -19,6 +19,8 @@
+ import { buildExportZip, buildConnectedZip } from "./export";
+ import { generateReport } from "./report";
+ import { COLO_PROJECT_ID, COLO_LABEL, coloAvailable, coloProfiles, coloQuery } from "./sources/colo";
++import { isWorkbenchProject, listWorkbenchSources, wbQuery, removeWorkbenchSource } from "./sources/workbench-store";
++import { handleSqlConnect, handleSqlSchema, handleSqlChat, handleSqlExtract, handleSqlExtractDb, handleSqlStageGet, handleSourceChat } from "./text2sql/handler";
+ import { handleDashboardBuild } from "./dashboard/handler";
+ import { handleDeckBuild, handleDeckEdit } from "./deck/handler";
+ import { loadRows } from "./deck/local-data";
+@@ -32,7 +34,7 @@
+ import { retrieveForBuild } from "./design-rag/build-context";
+ import { enrollGeneration } from "./design-rag/enroll";
+ import { generateDeck } from "./slides";
+-import { orchestrate, composePrompt, ORCHESTRATOR_ENABLED } from "./orchestrator";
++import { orchestrate, composePrompt, gateTurn, ORCHESTRATOR_ENABLED } from "./orchestrator";
+ import { getChatStore, type ChatStore } from "./chat-store";
+ import type { OrchestratorResult, ChatMessage } from "../shared/types";
+ import { parseAllowedOrigins, corsOptions, securityHeaders, validateConfig, applyConfigCheck } from "./security";
+@@ -309,6 +311,10 @@
+     await persistAssistant(result.question);
+     return { status: 200, body: { conversationId, needsClarification: true, question: result.question } };
+   }
++  if (result && "respond" in result) {
++    await persistAssistant(result.reply);
++    return { status: 200, body: { conversationId, respond: true, reply: result.reply, dataQuestion: !!result.dataQuestion } };
++  }
+   if (!result) { const r = await generate(b); await persistAssistant("Built dashboard"); return withConv(r); }
+ 
+   const rewritten = { ...b, userPrompt: composePrompt(result) };
+@@ -364,6 +370,11 @@
+     await persist(result.question);
+     return { status: 200, body: { conversationId, needsClarification: true, question: result.question } };
+   }
++  if (result && "respond" in result) {
++    console.log(`[orchestrate] -> respond (dataQuestion=${!!result.dataQuestion})`);
++    await persist(result.reply);
++    return { status: 200, body: { conversationId, respond: true, reply: result.reply, dataQuestion: !!result.dataQuestion } };
++  }
+   if (!result) { console.log("[orchestrate] planner returned null -> raw dashboard plan"); return rawPlan; }
+ 
+   console.log(`[orchestrate] -> mode=${result.outputMode} title="${result.title}"`);
+@@ -490,6 +501,16 @@
+       return { status: 400, body: { error: err?.message ?? "query failed" } };
+     }
+   }
++  // Workbench extracts ("wb_…"): query the per-source snapshot, exactly like colo.
++  if (isWorkbenchProject(projectId)) {
++    try {
++      const result = await wbQuery(projectId, sql, { rowCap: cap, timeoutMs: QUERY_TIMEOUT_MS });
++      return { status: 200, body: result };
++    } catch (err: any) {
++      console.warn(`[workbench] query failed: ${err?.message ?? err}\n  SQL: ${sql}`);
++      return { status: 400, body: { error: err?.message ?? "query failed" } };
++    }
++  }
+   try {
+     const result = await storage.query(tenantId, projectId, sql, { rowCap: cap, timeoutMs: QUERY_TIMEOUT_MS });
+     return { status: 200, body: result };
+@@ -860,6 +881,9 @@
+         query = local.query;
+       } else if (isColo) {
+         query = (sql: string) => coloQuery(sql, { rowCap: 5000, timeoutMs: QUERY_TIMEOUT_MS }).then((r) => r.rows);
++      } else if (isWorkbenchProject(String(body.projectId ?? ""))) {
++        const wbId = String(body.projectId);
++        query = (sql: string) => wbQuery(wbId, sql, { rowCap: 5000, timeoutMs: QUERY_TIMEOUT_MS }).then((r) => r.rows);
+       }
+ 
+       // Prepend document prose as grounded context for the planners.
+@@ -883,20 +907,91 @@
+     }
+   });
+ 
+-  // Named backend data sources (currently just the colo snapshot). The frontend
+-  // calls this to offer "colo data" and to load its view profiles for the planner.
+-  app.get("/api/sources", async (_req, res) => {
+-    try {
+-      if (!coloAvailable()) return res.json({ sources: [] });
+-      const tables = await coloProfiles();
+-      res.json({
+-        sources: [{ id: "colo", label: COLO_LABEL, projectId: COLO_PROJECT_ID, tables }],
+-      });
++  // Named backend data sources: the colo snapshot + every workbench extract.
++  // The frontend calls this to offer them on the build page and to load their
++  // profiles for the planner.
++  app.get("/api/sources", async (req, res) => {
++    try {
++      const sources: { id: string; label: string; projectId: string; tables: unknown[] }[] = [];
++      if (coloAvailable()) {
++        const tables = await coloProfiles();
++        sources.push({ id: "colo", label: COLO_LABEL, projectId: COLO_PROJECT_ID, tables });
++      }
++      for (const wb of listWorkbenchSources(req.tenantId ?? DEV_TENANT)) {
++        sources.push({ id: wb.projectId, label: wb.label, projectId: wb.projectId, tables: wb.tables });
++      }
++      res.json({ sources });
+     } catch (err: any) {
+       res.status(500).json({ error: err?.message ?? "failed to load sources" });
+     }
+   });
+ 
++  // ---- SQL Workbench (text2SQL): connect → chat → extract → build handoff ----
++  app.post("/api/sql/connect", async (req, res) => {
++    const { status, body } = await handleSqlConnect(req.body, req.tenantId ?? DEV_TENANT);
++    res.status(status).json(body);
++  });
++  app.get("/api/sql/:connectionId/schema", (req, res) => {
++    const { status, body } = handleSqlSchema(String(req.params.connectionId), req.tenantId ?? DEV_TENANT);
++    res.status(status).json(body);
++  });
++  app.post("/api/sql/chat", async (req, res) => {
++    const { status, body } = await handleSqlChat(req.body, req.tenantId ?? DEV_TENANT);
++    res.status(status).json(body);
++  });
++  app.post("/api/sql/extract", async (req, res) => {
++    const { status, body } = await handleSqlExtract(req.body, req.tenantId ?? DEV_TENANT);
++    res.status(status).json(body);
++  });
++  app.post("/api/sql/extract-db", async (req, res) => {
++    const { status, body } = await handleSqlExtractDb(req.body, req.tenantId ?? DEV_TENANT);
++    res.status(status).json(body);
++  });
++  // Follow-up gate: once an artifact exists, classify each turn (edit vs answer)
++  // so questions get conversational replies instead of forced rebuilds. Also the
++  // point where follow-up turns finally enter conversation memory.
++  app.post("/api/gate", async (req, res) => {
++    const b = req.body ?? {};
++    if (typeof b.userPrompt !== "string" || !b.userPrompt.trim()) return res.status(400).json({ error: "userPrompt is required" });
++    const store = getChatStore();
++    let conversationId: string = typeof b.conversationId === "string" ? b.conversationId : "";
++    let history: any[] = [];
++    try {
++      if (conversationId) history = await store.getHistory(conversationId, 20);
++      else conversationId = await store.createConversation(b.userPrompt.slice(0, 80));
++      await store.appendMessage(conversationId, { role: "user", content: b.userPrompt });
++    } catch { /* memory best-effort */ }
++    const gate = (await gateTurn({
++      userPrompt: b.userPrompt, history,
++      artifactKind: String(b.artifactKind ?? "dashboard"),
++      artifactSummary: typeof b.artifactSummary === "string" ? b.artifactSummary : undefined,
++      datasets: Array.isArray(b.datasets) ? b.datasets : undefined,
++    })) ?? { action: "edit" as const };
++    if (gate.action !== "edit" && gate.reply) {
++      try { await store.appendMessage(conversationId, { role: "assistant", content: gate.reply }); } catch { /* best-effort */ }
++    }
++    res.json({ conversationId, ...gate });
++  });
++
++  // Data questions inside the build chat, answered by the snapshot text2SQL loop.
++  app.post("/api/source/chat", async (req, res) => {
++    const { status, body } = await handleSourceChat(req.body, req.tenantId ?? DEV_TENANT);
++    res.status(status).json(body);
++  });
++
++  app.get("/api/sql/stage/:conversationId", (req, res) => {
++    const { status, body } = handleSqlStageGet(String(req.params.conversationId), req.tenantId ?? DEV_TENANT);
++    res.status(status).json(body);
++  });
++  // Source lifecycle (blueprint): delete a published workbench extract.
++  app.delete("/api/sources/:projectId", (req, res) => {
++    const projectId = String(req.params.projectId);
++    if (!isWorkbenchProject(projectId)) return res.status(400).json({ error: "only workbench (wb_*) sources can be deleted" });
++    const ok = removeWorkbenchSource(req.tenantId ?? DEV_TENANT, projectId);
++    if (!ok) return res.status(404).json({ error: "unknown source" });
++    res.json({ deleted: true, projectId });
++  });
++
+   app.post("/api/summary", async (req, res) => {
+     const { status, body } = await handleSummary(req.body);
+     res.status(status).json(body);

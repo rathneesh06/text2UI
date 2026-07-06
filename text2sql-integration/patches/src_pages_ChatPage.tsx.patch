@@ -1,0 +1,118 @@
+--- pristine/text2UI/src/pages/ChatPage.tsx	2026-07-03 11:15:46.000000000 +0000
++++ code/text2UI/src/pages/ChatPage.tsx	2026-07-06 13:51:28.607560968 +0000
+@@ -19,9 +19,10 @@
+ import Sandbox from "../components/Sandbox";
+ import {
+   orchestratePlan, generate, generateStream, generateReport, generatePpt, downloadBase64,
+-  exportProject, buildDashboard, buildDeck, COLO_PROJECT_ID, REMOTE_DATA, BFF_URL,
++  exportProject, buildDashboard, buildDeck, gateTurn, COLO_PROJECT_ID, REMOTE_DATA, BFF_URL,
+   type StreamEvent, type ReportResult, type PptResult,
+ } from "../api";
++import { sourceChat } from "../workbench-api";
+ import DeckPreview from "../components/DeckPreview";
+ import type { Table } from "../lib/datasets";
+ import type { DashboardSpec } from "../../shared/dashboard-spec";
+@@ -97,6 +98,9 @@
+ 
+   const turnSeq = useRef(0);
+   const tailBuf = useRef("");
++  // The first-turn orchestrator brief, carried into the spec-dashboard build so
++  // its palette/design direction reach the spec planner (the missing junction).
++  const lastBrief = useRef<unknown | null>(null);
+   const builds = useRef(0);
+   const startedRef = useRef(false);
+   const threadRef = useRef<HTMLDivElement>(null);
+@@ -210,7 +214,9 @@
+       const datasets = tables.map((t) => ({ tableName: t.tableName, profile: t.ingest.profile }));
+       const editing = result?.kind === "dashboard" ? mainCode(result.app) : undefined;
+       const access = REMOTE_DATA ? { dataAccess: "remote" as const } : {};
+-      const isColo = projectId === COLO_PROJECT_ID;
++      // Server-side sources (colo + workbench extracts) keep their data on the BFF —
++      // the client never ships rows; runtime queries route by projectId.
++      const isColo = projectId === COLO_PROJECT_ID || projectId.startsWith("wb_");
+       // For uploaded data, send the rows so the deck pipeline can resolve charts server-side.
+       const rows = isColo ? undefined : tables.map((t) => ({ tableName: t.tableName, rows: t.ingest.rows }));
+ 
+@@ -224,6 +230,21 @@
+       let mode: "dashboard" | "pdf" | "ppt";
+       let brief: OrchestratorBrief | undefined;
+       let enhancedPrompt = prompt;
++      // Server-side sources (colo + published extracts) can ANSWER data questions
++      // by querying their snapshot — the conversational join of the two pipelines.
++      const serverSource = projectId === COLO_PROJECT_ID || projectId.startsWith("wb_");
++      const answerInstead = async (reply: string, dataQuestion?: boolean) => {
++        if (dataQuestion && serverSource) {
++          append("Looking that up in the data…");
++          try {
++            const r = await sourceChat({ projectId, prompt, ...(conversationId ? { conversationId } : {}) });
++            if (r.conversationId) setConversationId(r.conversationId);
++            patch({ phase: "done", tail: null, assistantText: r.answer });
++            return;
++          } catch { /* fall back to the model's grounded reply */ }
++        }
++        patch({ phase: "done", tail: null, assistantText: reply });
++      };
+ 
+       // Safe artifact-switching: a refinement stays locked to the current artifact, but an
+       // EXPLICIT request ("turn this into a PDF", "make a dashboard") switches pipelines and
+@@ -236,12 +257,22 @@
+         setDeckId(null); setDeckSpec(null); setSpec(null);   // leave the old artifact behind
+         mode = requested!;
+         append(`Switching to ${requested === "pdf" ? "a PDF report" : requested === "ppt" ? "slides" : "a dashboard"}…`);
+-      } else if (existingKind === "deck") {
+-        mode = "ppt";
+-      } else if (existingKind === "dashboard") {
+-        mode = "dashboard";
+-      } else if (existingKind === "doc") {
+-        mode = result!.mode;
++      } else if (existingKind) {
++        // The missing orchestration layer for turns 2..n: previously every
++        // follow-up went straight to a rebuild — questions felt ignored and the
++        // chat felt robotic. Classify first; only real edits proceed to build.
++        mode = existingKind === "deck" ? "ppt" : existingKind === "dashboard" ? "dashboard" : result!.mode;
++        try {
++          const g = await gateTurn({
++            userPrompt: prompt,
++            ...(conversationId ? { conversationId } : {}),
++            artifactKind: mode === "ppt" ? "slide deck" : mode === "pdf" ? "PDF report" : "dashboard",
++            artifactSummary: spec?.meta?.title ?? deckSpec?.meta?.title ?? undefined,
++            datasets,
++          });
++          if (g.conversationId) setConversationId(g.conversationId);
++          if (g.action !== "edit" && g.reply) { await answerInstead(g.reply, g.dataQuestion); return; }
++        } catch { /* gate unavailable — behave exactly as before (edit) */ }
+       } else {
+         let plan: Awaited<ReturnType<typeof orchestratePlan>>;
+         try {
+@@ -252,8 +283,12 @@
+           plan = { conversationId: conversationId ?? "", outputMode: "dashboard", enhancedPrompt: prompt } as any;
+         }
+         if ("needsClarification" in plan) { patch({ phase: "clarify", assistantText: plan.question }); return; }
+-        mode = plan.outputMode;
++        if ((plan as any).respond && (plan as any).reply) { await answerInstead((plan as any).reply, (plan as any).dataQuestion); return; }
++        // Skew armor: if a newer/older BFF returns a shape without outputMode,
++        // build a dashboard instead of crashing on an undefined mode downstream.
++        mode = (["dashboard", "pdf", "ppt"].includes((plan as any).outputMode) ? plan.outputMode : "dashboard");
+         brief = plan.brief;
++        lastBrief.current = (plan as any).brief ?? null;
+         enhancedPrompt = plan.enhancedPrompt ?? prompt;
+       }
+ 
+@@ -286,14 +321,15 @@
+       if (mode === "dashboard" && isColo) {
+         append(spec ? "Updating the dashboard spec…" : "Planning the dashboard spec…");
+         patch({ phase: "building" });
+-        const { app, spec: nextSpec, warnings } = await buildDashboard({
++        const { app, spec: nextSpec, warnings, summary } = await buildDashboard({
+           datasets, userPrompt: prompt, ...(spec ? { currentSpec: spec } : {}),
++          ...(lastBrief.current && !spec ? { brief: lastBrief.current } : {}),
+         });
+         setSpec(nextSpec);
+         setResult({ kind: "dashboard", app });
+         setDashVersion((v) => v + 1);
+         const note = warnings.length ? ` · ${warnings.length} note${warnings.length === 1 ? "" : "s"}` : "";
+-        patch({ phase: "done", tail: null, assistantText: (nextSpec.meta.title || "Dashboard ready") + note });
++        patch({ phase: "done", tail: null, assistantText: (summary?.length ? summary.join(" ") : nextSpec.meta.title || "Dashboard ready") + note });
+         builds.current += 1;
+         onBuildMeta?.({ versionCount: builds.current });
+         return;

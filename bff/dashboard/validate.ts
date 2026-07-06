@@ -45,11 +45,13 @@ export function validateSpec(spec: DashboardSpec, profiles: Dataset[]): Validati
     if (!cols) { warn(`widget "${w.id}": table "${w.table}" not found — dropped`); return null; }
 
     if (w.kind === "kpi") {
+      if (!w.metric) { warn(`kpi "${w.id}": no metric — dropped`); return null; }
       const m = fixMetric(cols, w.table, w.metric, `kpi "${w.id}"`);
       return m ? { ...w, metric: m } : null;
     }
 
     if (w.kind === "table") {
+      if (!Array.isArray(w.columns) || !w.columns.length) { warn(`table "${w.id}": no columns — dropped`); return null; }
       const columns = w.columns.filter((c) => c.col && (c.agg === "count" || cols.has(c.col)));
       if (columns.length !== w.columns.length) warn(`table "${w.id}": dropped column(s) not in ${w.table}`);
       const groupBy = (w.groupBy ?? []).filter((g) => cols.has(g.col));
@@ -58,12 +60,14 @@ export function validateSpec(spec: DashboardSpec, profiles: Dataset[]): Validati
     }
 
     // chart kinds: line|bar|area|pie|donut
+    if (!w.x || !w.x.col) { warn(`chart "${w.id}": no x dimension — dropped`); return null; }
     if (!cols.has(w.x.col)) { warn(`chart "${w.id}": x column "${w.x.col}" not in ${w.table} — dropped`); return null; }
     let x = w.x;
     if (x.timeGrain && !TEMPORAL.has(cols.get(x.col)!)) {
       warn(`chart "${w.id}": timeGrain on non-temporal "${x.col}" — removed`);
       x = { ...x, timeGrain: undefined };
     }
+    if (!Array.isArray(w.series) || !w.series.length) { warn(`chart "${w.id}": no series — dropped`); return null; }
     let series = w.series
       .map((m) => fixMetric(cols, w.table, m, `chart "${w.id}"`))
       .filter((m): m is Metric => !!m);

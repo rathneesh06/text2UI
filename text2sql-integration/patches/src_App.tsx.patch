@@ -1,0 +1,143 @@
+--- pristine/text2UI/src/App.tsx	2026-07-02 18:14:00.000000000 +0000
++++ code/text2UI/src/App.tsx	2026-07-06 12:11:27.291259900 +0000
+@@ -13,8 +13,10 @@
+ import ChatPage from "./pages/ChatPage";
+ import ProjectsPage from "./pages/ProjectsPage";
+ import StyleGuidePage from "./pages/StyleGuidePage";
++import WorkbenchPage from "./pages/WorkbenchPage";
+ import { assignTableNames, ingestFile, newId, type Source, type Table } from "./lib/datasets";
+-import { COLO_PROJECT_ID, listSources, sourceTablesToTables } from "./api";
++import { COLO_PROJECT_ID, listSources, sourceTablesToTables, type SourceInfo } from "./api";
++import { isWorkbenchProject, wbDeleteSource, type WbExtracted } from "./workbench-api";
+ import "./index.css";
+ 
+ export type ProjectMeta = {
+@@ -76,16 +78,24 @@
+   const [coloTables, setColoTables] = useState<Table[]>([]);
+   const [coloAvailable, setColoAvailable] = useState(false);
+   const coloActive = projectId === COLO_PROJECT_ID;
++  // Workbench extracts (text2SQL) — served by the BFF just like colo, listed by
++  // the same /api/sources call, selectable as build sources.
++  const [wbSources, setWbSources] = useState<SourceInfo[]>([]);
++  const wbActive = isWorkbenchProject(projectId);
+   const pendingName = useRef<string | null>(null);
+ 
+-  const tables = useMemo(
+-    () => (coloActive ? coloTables : assignTableNames(sources)),
+-    [coloActive, coloTables, sources],
+-  );
++  const tables = useMemo(() => {
++    if (coloActive) return coloTables;
++    if (wbActive) {
++      const src = wbSources.find((s) => s.projectId === projectId);
++      return src ? sourceTablesToTables(src.tables) : [];
++    }
++    return assignTableNames(sources);
++  }, [coloActive, coloTables, wbActive, wbSources, projectId, sources]);
+ 
+   // Keep the per-project source snapshot + registered table names in sync.
+   useEffect(() => {
+-    if (projectId === COLO_PROJECT_ID) return; // colo's tables are backend views, not uploaded sources
++    if (projectId === COLO_PROJECT_ID || isWorkbenchProject(projectId)) return; // backend-served tables, not uploaded sources
+     sourcesByProject.current[projectId] = sources;
+     const names = assignTableNames(sources).map((t) => t.tableName);
+     setProjects((prev) => {
+@@ -108,7 +118,7 @@
+   useEffect(() => {
+     try {
+       sessionStorage.setItem("t2ui:proj", projectId);
+-      if (projectId !== COLO_PROJECT_ID) sessionStorage.setItem("t2ui:sources", JSON.stringify(sources));
++      if (projectId !== COLO_PROJECT_ID && !isWorkbenchProject(projectId)) sessionStorage.setItem("t2ui:sources", JSON.stringify(sources));
+     } catch { /* quota (very large uploads) — colo + small uploads still persist */ }
+   }, [projectId, sources]);
+ 
+@@ -125,6 +135,7 @@
+           setColoAvailable(true);
+           setColoTables(sourceTablesToTables(colo.tables));
+         }
++        setWbSources(sources.filter((s) => isWorkbenchProject(s.projectId)));
+       })
+       .catch(() => { /* sources are optional; ignore if the BFF has none */ });
+     return () => { cancelled = true; };
+@@ -152,6 +163,39 @@
+     pendingName.current = null;
+   }, []);
+ 
++  // Select a workbench extract as the active source (same posture as selectColo:
++  // stay on the landing page; the user types their prompt there).
++  const selectWbSource = useCallback((src: SourceInfo) => {
++    setSources([]);
++    setFileError(null);
++    setProjectId(src.projectId);
++    pendingName.current = src.label;
++    setProjects((prev) =>
++      prev.some((p) => p.id === src.projectId)
++        ? prev
++        : [{ id: src.projectId, name: src.label, createdAt: Date.now(), editedAt: Date.now(), versionCount: 0, tableNames: src.tables.map((t) => t.tableName) }, ...prev],
++    );
++  }, []);
++
++  // Delete a published extract (blueprint: source lifecycle). If it was the
++  // active project, fall back to a fresh session.
++  const deleteWbSource = useCallback(async (id: string) => {
++    try { await wbDeleteSource(id); } catch { /* already gone */ }
++    setWbSources((prev) => prev.filter((s) => s.projectId !== id));
++    setProjects((prev) => prev.filter((p) => p.id !== id));
++    if (projectId === id) clearColo();
++  }, [projectId, clearColo]);
++
++  // WorkbenchPage callback: a chat just extracted tables (or asked for a build).
++  // Register the fresh source immediately (no /api/sources round-trip) and select
++  // it; when a buildPrompt rides along, carry it into the build page.
++  const handleUseWorkbenchSource = useCallback((extracted: WbExtracted, buildPrompt?: string) => {
++    const src: SourceInfo = { id: extracted.projectId, label: extracted.label, projectId: extracted.projectId, tables: extracted.tables };
++    setWbSources((prev) => [src, ...prev.filter((s) => s.projectId !== src.projectId)]);
++    selectWbSource(src);
++    if (buildPrompt) setInitialPrompt(buildPrompt);
++  }, [selectWbSource]);
++
+   const loadFiles = useCallback(async (list: FileList | File[]) => {
+     for (const file of Array.from(list)) {
+       try {
+@@ -186,7 +230,7 @@
+     (prompt: string) => {
+       // Use colo if it's already selected, or it's available and the user has no
+       // uploaded files / explicitly mentions it.
+-      const useColo = coloActive || (coloAvailable && (sources.length === 0 || /\bcolo\b/i.test(prompt)));
++      const useColo = !wbActive && (coloActive || (coloAvailable && (sources.length === 0 || /\bcolo\b/i.test(prompt))));
+       pendingName.current = deriveProjectName(prompt);
+       if (useColo) {
+         if (!coloActive) selectColo();
+@@ -201,7 +245,7 @@
+       setInitialPrompt(prompt);
+       navigate("/build");
+     },
+-    [navigate, registerProject, coloActive, coloAvailable, sources.length, selectColo, coloTables],
++    [navigate, registerProject, coloActive, coloAvailable, wbActive, sources.length, selectColo, coloTables],
+   );
+ 
+   // Dashboard reports build progress -> registry stays fresh (and projects
+@@ -275,10 +319,23 @@
+             coloSelected={coloActive}
+             onUseColo={selectColo}
+             onClearColo={clearColo}
++            wbSources={wbSources}
++            wbSelected={wbActive ? wbSources.find((s) => s.projectId === projectId) ?? null : null}
++            onUseWbSource={selectWbSource}
++            onClearWbSource={clearColo}
++            onDeleteWbSource={deleteWbSource}
+           />
+         }
+       />
+       <Route
++        path="/workbench"
++        element={<WorkbenchPage onUseWorkbenchSource={handleUseWorkbenchSource} />}
++      />
++      <Route
++        path="/postgres"
++        element={<WorkbenchPage pgOnly onUseWorkbenchSource={handleUseWorkbenchSource} />}
++      />
++      <Route
+         path="/dashboard"
+         element={
+           <DashboardPage

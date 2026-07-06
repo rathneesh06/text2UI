@@ -1,0 +1,13 @@
+--- pristine/text2UI/shared/dashboard-spec.ts	2026-06-30 14:50:34.000000000 +0000
++++ code/text2UI/shared/dashboard-spec.ts	2026-07-06 13:12:00.514183539 +0000
+@@ -90,6 +90,10 @@
+   subtitle?: string;
+   audience?: string;
+   theme?: "light" | "dark";
++  /** Primary accent color (hex) — KPI values, emphasis. Style prompts land here. */
++  accent?: string;
++  /** Chart series palette (hex[]) — "make the charts teal" lands here. */
++  chartPalette?: string[];
+ }
+ 
+ export interface DashboardSpec {

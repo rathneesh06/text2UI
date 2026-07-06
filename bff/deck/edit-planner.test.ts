@@ -1,10 +1,10 @@
-// edit-planner.test.ts — targeted-edit planning + resilience to runaway/truncated
-// model output (the "Expected double-quoted property name in JSON" failure mode).
+// edit-planner.test.ts — targeted-edit planning with an injected runner (no network).
+// Covers the schema→schemaless retry path and coerce() sanitization.
 // Run: npm run test:deck-edit
 import assert from "node:assert/strict";
-import { planEdits, salvageOps, EDIT_SCHEMA, MAX_EDIT_OPS, type Run } from "./edit-planner";
+import { planEdits, EDIT_SCHEMA, type Run } from "./edit-planner";
 import type { DeckSpec } from "../../shared/deck-spec";
-import type { GenResult } from "../aiflow";
+import type { GenResult, GenOptions } from "../aiflow";
 
 // Minimal 2-slide deck to edit against.
 const spec: DeckSpec = {
@@ -17,81 +17,58 @@ const spec: DeckSpec = {
   ],
 };
 
-const ok = (text: string, finishReason = "STOP"): Run => async () => ({ text, finishReason } as GenResult);
+const usedSchema = (opts?: GenOptions) => !!(opts as any)?.responseSchema;
+const always = (text: string): Run => async () => ({ text, finishReason: "STOP" } as GenResult);
 
-// ---- salvageOps: recover complete ops from truncated JSON -------------------
+// ---- happy path: schema call returns valid ops -----------------------------
 {
-  // Cut off mid-object right after a comma — the exact shape that throws
-  // "Expected double-quoted property name". Two ops finished before the cut.
-  // Cut off right after an object-level comma — reproduces the exact production error.
-  const truncated =
-    '{"ops":[' +
-    '{"op":"setChartType","slideId":"s2","blockId":"s2-c1","chartType":"pie"},' +
-    '{"op":"setSlideText","slideId":"s2","title":"Revenue Growth"},' +
-    '{"op":"setBullets","slideId":"s2","blockId":"s2-c1","items":["a","b"],';
-  assert.throws(() => JSON.parse(truncated), /double-quoted property name/, "precondition: reproduces the reported error");
-
-  const salvaged = salvageOps(truncated);
-  assert.ok(salvaged, "salvage recovers something");
-  assert.equal(salvaged!.ops.length, 2, "keeps the two complete ops, drops the truncated third");
-  assert.equal((salvaged!.ops[0] as any).op, "setChartType");
-}
-{
-  // Nested braces (updateChart.patch) must not fool the brace tracker.
-  const t = '{"ops":[{"op":"updateChart","slideId":"s2","blockId":"s2-c1","patch":{"limit":5,"title":"x"}},{"op":"setThe';
-  const s = salvageOps(t);
-  assert.equal(s!.ops.length, 1, "one complete nested op survives, the partial next op is dropped");
-}
-{
-  // A quoted brace inside a string value must not be counted as structure.
-  const t = '{"ops":[{"op":"setMeta","title":"a } weird { title"},{"op":"broke';
-  const s = salvageOps(t);
-  assert.equal(s!.ops.length, 1, "braces inside strings are ignored");
-  assert.equal((s!.ops[0] as any).title, "a } weird { title");
-}
-{
-  // Nothing recoverable → null (caller then falls back to a full replan).
-  assert.equal(salvageOps('{"ops":[{"op":"setThe'), null, "no complete op → null");
-  assert.equal(salvageOps("not json at all"), null, "no ops key → null");
-}
-console.log("salvageOps: all assertions passed");
-
-// ---- planEdits: happy path parses ops --------------------------------------
-{
-  const text = '{"ops":[{"op":"setChartType","slideId":"s2","blockId":"s2-c1","chartType":"pie"}]}';
-  const ops = await planEdits(spec, "make the revenue chart a pie", "", ok(text));
+  const run = always('{"ops":[{"op":"setChartType","slideId":"s2","blockId":"s2-c1","chartType":"pie"}]}');
+  const ops = await planEdits(spec, "make the revenue chart a pie", "", run);
   assert.ok(ops && ops.length === 1, "one op planned");
   assert.equal(ops![0].op, "setChartType");
 }
 
-// ---- planEdits: truncated response is salvaged, not thrown away -------------
+// ---- schema rejected → schemaless retry recovers ---------------------------
 {
-  const truncated =
-    '{"ops":[' +
-    '{"op":"setChartType","slideId":"s2","blockId":"s2-c1","chartType":"pie"},' +
-    '{"op":"setSlideText","slideId":"s2","title":"Revenue Growth"},' +
-    '{"op":"setBullets","slideId":"s2","blockId":"s2-c1","items":["a",';
-  const ops = await planEdits(spec, "rewrite everything", "", ok(truncated, "MAX_TOKENS"));
-  assert.ok(ops, "truncated response does not return null when ops are salvageable");
-  assert.equal(ops!.length, 2, "salvaged ops flow through coerce()");
-  assert.equal(ops![0].op, "setChartType");
+  // The model returns junk under the structured-schema call but clean JSON without it.
+  const run: Run = async (_s, _u, opts) =>
+    ({ text: usedSchema(opts) ? "<<not json>>" : '{"ops":[{"op":"setTheme","theme":"dark"}]}', finishReason: "STOP" } as GenResult);
+  const ops = await planEdits(spec, "dark theme", "", run);
+  assert.ok(ops && ops.length === 1, "schemaless retry produced ops");
+  assert.equal(ops![0].op, "setTheme");
 }
 
-// ---- planEdits: unrecoverable truncation → null (caller does full replan) ---
+// ---- both attempts fail → null (caller falls back to full replan) ----------
 {
-  const ops = await planEdits(spec, "x", "", ok('{"ops":[{"op":"setChart', "MAX_TOKENS"));
-  assert.equal(ops, null, "nothing salvageable → null so the handler replans");
+  const ops = await planEdits(spec, "x", "", always("<<not json at all>>"));
+  assert.equal(ops, null, "unparseable in both modes → null");
 }
 
-// ---- planEdits: never throws, even on total garbage ------------------------
+// ---- coerce() drops malformed/incomplete ops, keeps valid ones -------------
 {
-  const ops = await planEdits(spec, "x", "", ok("<<<not json>>>"));
-  assert.equal(ops, null, "garbage → null, no throw");
+  const run = always(JSON.stringify({
+    ops: [
+      { op: "setChartType", slideId: "s2", chartType: "pie" },   // missing blockId → dropped
+      { op: "bogusOp", slideId: "s2" },                          // unknown op → dropped
+      { op: "setTheme", theme: "dark" },                          // valid → kept
+      { op: "setBullets", slideId: "s2", blockId: "s2-c1", items: ["a", "b"] }, // valid → kept
+    ],
+  }));
+  const ops = await planEdits(spec, "several edits", "", run);
+  assert.ok(ops, "returns ops");
+  assert.deepEqual(ops!.map((o) => o.op), ["setTheme", "setBullets"], "only well-formed ops survive coerce()");
 }
 
-// ---- schema is bounded so the model can't run away -------------------------
+// ---- never throws on a completely empty response ---------------------------
 {
-  assert.equal((EDIT_SCHEMA.properties.ops as any).maxItems, MAX_EDIT_OPS, "ops array is capped");
-  assert.ok(MAX_EDIT_OPS > 0 && MAX_EDIT_OPS <= 100, "cap is sane");
+  const ops = await planEdits(spec, "x", "", always(""));
+  assert.equal(ops, null, "empty text → null, no throw");
 }
-console.log("planEdits: all assertions passed");
+
+// ---- EDIT_SCHEMA shape ------------------------------------------------------
+{
+  assert.equal((EDIT_SCHEMA as any).type, "object");
+  assert.equal((EDIT_SCHEMA as any).properties.ops.type, "array", "schema constrains an ops array");
+}
+
+console.log("edit-planner: all assertions passed");
