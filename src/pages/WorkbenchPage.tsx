@@ -116,7 +116,6 @@ export default function WorkbenchPage({ onUseWorkbenchSource, pgOnly = false }: 
   const [connError, setConnError] = useState<string | null>(null);
 
   const [selected, setSelected] = useState<Set<string>>(new Set());
-  const [schemaFilter, setSchemaFilter] = useState("");
   const [extracting, setExtracting] = useState(false);
 
   const [turns, setTurns] = useState<WbTurn[]>([]);
@@ -359,14 +358,8 @@ export default function WorkbenchPage({ onUseWorkbenchSource, pgOnly = false }: 
           </div>
           {conn ? (
             <>
-              <input
-                className="wb-conninput wb-schema__filter"
-                placeholder="filter tables…"
-                value={schemaFilter}
-                onChange={(e) => setSchemaFilter(e.target.value)}
-              />
               <div className="wb-schema__list">
-                {conn.allTables.filter((t) => !schemaFilter.trim() || t.name.toLowerCase().includes(schemaFilter.trim().toLowerCase())).map((t) => {
+                {conn.allTables.map((t) => {
                   const profiled = conn.datasets.find((d) => d.tableName === t.name);
                   return (
                     <label key={t.name} className="wb-table">

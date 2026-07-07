@@ -3,7 +3,10 @@
 .wb {
   display: flex;
   flex-direction: column;
-  height: 100%;
+  /* Pin to the viewport (the ChatPage pattern): the thread scrolls INTERNALLY,
+     so the chat input stays on screen alongside the schema rail and the
+     staged/"Extract DB" panel instead of drifting below the fold. */
+  height: 100vh;
   min-height: 0;
   background: var(--bg-primary);
   color: var(--text-primary);
@@ -175,5 +178,4 @@
 .wb-staged__type { color: var(--text-muted); }
 .wb-staged__foot { padding: 10px; border-top: 1px solid #1f2937; display: flex; flex-direction: column; gap: 8px; }
 
-.wb-schema__filter { margin: 0 10px 8px; width: calc(100% - 20px); font-size: 12px; padding: 6px 10px; }
 .wb-meta { font-size: 11px; color: var(--text-muted); font-variant-numeric: tabular-nums; }
