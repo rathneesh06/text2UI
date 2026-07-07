@@ -16,7 +16,7 @@ import StyleGuidePage from "./pages/StyleGuidePage";
 import WorkbenchPage from "./pages/WorkbenchPage";
 import { assignTableNames, ingestFile, newId, type Source, type Table } from "./lib/datasets";
 import { COLO_PROJECT_ID, listSources, sourceTablesToTables, type SourceInfo } from "./api";
-import { isWorkbenchProject, wbDeleteSource, type WbExtracted } from "./workbench-api";
+import { isWorkbenchProject, wbDeleteSource, wbDiscardStage, type WbExtracted } from "./workbench-api";
 import "./index.css";
 
 export type ProjectMeta = {
@@ -175,6 +175,27 @@ function AppRoutes() {
         ? prev
         : [{ id: src.projectId, name: src.label, createdAt: Date.now(), editedAt: Date.now(), versionCount: 0, tableNames: src.tables.map((t) => t.tableName) }, ...prev],
     );
+  }, []);
+
+  // Stage memory is scoped to the page it belongs to: reloading ON /workbench or
+  // /postgres keeps the staged panel (durable staging), but booting the app on
+  // any OTHER page is a fresh start — forget the panel AND discard the
+  // unpublished server-side stage (published sources are never touched).
+  useEffect(() => {
+    const path = window.location.pathname;
+    for (const { key, route } of [
+      { key: "t2ui:wb:conv", route: "/workbench" },
+      { key: "t2ui:wb:pg:conv", route: "/postgres" },
+    ]) {
+      if (path.startsWith(route)) continue; // reloaded on that page -> keep its stage
+      try {
+        const id = sessionStorage.getItem(key);
+        if (id) {
+          sessionStorage.removeItem(key);
+          wbDiscardStage(id).catch(() => { /* best-effort */ });
+        }
+      } catch { /* private mode */ }
+    }
   }, []);
 
   // Delete a published extract (blueprint: source lifecycle). If it was the

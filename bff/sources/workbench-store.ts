@@ -212,6 +212,19 @@ export function getStaged(conversationId: string): StagedState | null {
   return staged.get(conversationId) ?? null;
 }
 
+/** Discard an UNPUBLISHED stage: remove the entry and delete its staging file.
+ *  A published source is untouched — finalize already removed the stage entry,
+ *  and the file now belongs to the source. Returns whether anything was removed. */
+export function discardStaged(conversationId: string, tenantId: string): boolean {
+  loadStages();
+  const st = staged.get(conversationId);
+  if (!st || st.tenantId !== tenantId) return false;
+  staged.delete(conversationId);
+  saveStages();
+  try { rmSync(st.dbPath, { force: true }); } catch { /* file may be locked; sweep later */ }
+  return true;
+}
+
 /** "Extract DB": publish the accumulated stage as ONE workbench source. The
  *  staging file simply becomes the source's dbPath — no copy, no rename. */
 export function finalizeStaged(conversationId: string, label?: string): WorkbenchSource {

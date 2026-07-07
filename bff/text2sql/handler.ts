@@ -24,7 +24,7 @@ import {
 import { connFromParts, type DbConnParts } from "../sources/db-conn";
 import {
   registerWorkbenchSource, getWorkbenchSource, wbSlug, wbDbPath,
-  stagingDbPath, addStaged, getStaged, finalizeStaged,
+  stagingDbPath, addStaged, getStaged, finalizeStaged, discardStaged,
   type WorkbenchSource, type StagedState,
 } from "../sources/workbench-store";
 import { snapshotTables } from "../sources/db-conn";
@@ -204,6 +204,14 @@ export function handleSqlStageGet(conversationId: string, tenantId: string): Out
   const st = getStaged(String(conversationId ?? ""));
   if (!st || st.tenantId !== tenantId) return { status: 200, body: { staged: { count: 0, tables: [] } } };
   return { status: 200, body: { conversationId: st.conversationId, staged: stagedView(st) } };
+}
+
+// ---- DELETE /api/sql/stage/:conversationId — discard an unpublished stage --------
+// Fresh-start semantics: booting the app anywhere other than the workbench pages
+// clears the remembered stage; this removes the server side of it too.
+export function handleSqlStageDiscard(conversationId: string, tenantId: string): Out {
+  const removed = discardStaged(String(conversationId ?? ""), tenantId);
+  return { status: 200, body: { discarded: removed } };
 }
 
 // ---- POST /api/sql/extract-db — the "Extract DB" button: publish the stage ------

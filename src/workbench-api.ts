@@ -104,6 +104,11 @@ export function wbStage(conversationId: string): Promise<{ conversationId?: stri
   return request(`/api/sql/stage/${encodeURIComponent(conversationId)}`);
 }
 
+/** Discard an unpublished stage (panel memory + server entry + staging file). */
+export function wbDiscardStage(conversationId: string): Promise<{ discarded: boolean }> {
+  return request(`/api/sql/stage/${encodeURIComponent(conversationId)}`, { method: "DELETE" });
+}
+
 /** Delete a published workbench source (removes it from the start page). */
 export function wbDeleteSource(projectId: string): Promise<{ deleted: boolean }> {
   return request(`/api/sources/${encodeURIComponent(projectId)}`, { method: "DELETE" });

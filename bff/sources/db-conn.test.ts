@@ -106,9 +106,7 @@ console.log("db-conn.test.ts: all assertions passed ✅");
   await sc.run(`CREATE SCHEMA sales`);
   await sc.run(`CREATE TABLE sales."Order-Lines" AS SELECT * FROM (VALUES (1, 'widget'), (2, 'gadget')) t(id, sku)`);
   sc.disconnectSync();
-  // Release the instance's handle on source.duckdb before re-opening it via ATTACH.
-  // Windows locks the file while the instance is live (POSIX tolerates the overlap).
-  s.closeSync();
+  s.closeSync(); // Windows: release source.duckdb's lock before the ATTACH below
 
   // Attach it read-only as `src` in a fresh snapshot instance — the production shape.
   const snapPath = join(dir, "wb_test.duckdb");
@@ -148,6 +146,7 @@ console.log("db-conn.test.ts: all assertions passed ✅");
   const rows = await readAll(`SELECT count(*) AS n FROM main.order_lines`, "verify");
   assert.equal(Number((rows[0] as any).n), 2, "snapshotted table lives in main");
   c.disconnectSync();
+  inst.closeSync(); // Windows: release the snapshot file too
   console.log("snapshotFromHandle: all assertions passed ✅");
 }
 
@@ -220,24 +219,22 @@ console.log("encoding + parts: all assertions passed ✅");
 // ---- v6: durable staging survives a process restart (two-process test) -------------
 {
   const { execSync } = await import("node:child_process");
-  const { writeFileSync: writeChild, rmSync } = await import("node:fs");
-  const { join: joinChild } = await import("node:path");
+  const { writeFileSync: wf, rmSync: rmf } = await import("node:fs");
   const conv = "conv_persist_" + Date.now();
-  // process 1: stage two tables (writes stages.json through). Run a temp script file
-  // via tsx instead of `tsx -e '<script>'`: POSIX single-quote wrapping doesn't
-  // survive Windows' cmd.exe, which corrupts the inline program (Unterminated string).
-  const childPath = joinChild(process.cwd(), `.t2sql-persist-child-${conv}.mts`);
-  writeChild(childPath, [
-    `import { addStaged, stagingDbPath } from "./bff/sources/workbench-store";`,
-    `import { writeFileSync } from "node:fs";`,
-    `const ds = (n) => ({ tableName: n, profile: { source: { filename: "t:" + n, format: "json" }, rowCount: 1, columns: [], sampleRows: [] } });`,
+  // process 1: stage two tables (writes stages.json through). A temp script file
+  // instead of `tsx -e '…'` — single-quoted inline code breaks under cmd.exe.
+  const childSrc = [
+    'import { addStaged, stagingDbPath } from "./bff/sources/workbench-store";',
+    'import { writeFileSync } from "node:fs";',
+    'const ds = (n: string) => ({ tableName: n, profile: { source: { filename: "t:" + n, format: "json" }, rowCount: 1, columns: [], sampleRows: [] } } as any);',
     `writeFileSync(stagingDbPath("${conv}"), "x");  // stand-in stage file so recovery keeps it`,
     `addStaged("${conv}", "public", stagingDbPath("${conv}"), [ds("a"), ds("b")]);`,
-  ].join("\n"));
+  ].join("\n");
+  wf("._stage_child.ts", childSrc);
   try {
-    execSync(`npx tsx "${childPath.split("\\").join("/")}"`, { stdio: "pipe" });
+    execSync("npx tsx ._stage_child.ts", { stdio: "pipe" });
   } finally {
-    rmSync(childPath, { force: true });
+    rmf("._stage_child.ts", { force: true });
   }
   // process 2 (a fresh module registry = a restarted BFF): the stage is recovered
   const { getStaged: getStaged2, finalizeStaged: fin2 } = await import("./workbench-store");
@@ -272,3 +269,27 @@ console.log("durable staging + idempotent publish: all assertions passed ✅");
   assert.equal(small.rest.length, 0);
 }
 console.log("relevance ranking: all assertions passed ✅");
+
+// ---- discard semantics: unpublished stage removed, published source untouched -------
+{
+  const { addStaged: aS, getStaged: gS, finalizeStaged: fS, discardStaged: dS, stagingDbPath: sp } = await import("./workbench-store");
+  const { writeFileSync, existsSync } = await import("node:fs");
+  const ds = (n: string) => ({ tableName: n, profile: { source: { filename: "t:" + n, format: "json" }, rowCount: 1, columns: [], sampleRows: [] } } as any);
+
+  const c1 = "conv_discard_" + Date.now();
+  writeFileSync(sp(c1), "x");
+  aS(c1, "public", sp(c1), [ds("a")]);
+  assert.equal(dS(c1, "other-tenant"), false, "tenant scoping enforced on discard");
+  assert.equal(dS(c1, "public"), true, "unpublished stage discarded");
+  assert.equal(gS(c1), null, "stage entry gone");
+  assert.equal(existsSync(sp(c1)), false, "staging file deleted");
+  assert.equal(dS(c1, "public"), false, "second discard is a no-op");
+
+  const c2 = "conv_keeppub_" + Date.now();
+  writeFileSync(sp(c2), "x");
+  aS(c2, "public", sp(c2), [ds("b")]);
+  const src = fS(c2, "published keeps file");
+  assert.equal(dS(c2, "public"), false, "discard after publish is a no-op");
+  assert.equal(existsSync(src.dbPath), true, "published source file untouched");
+}
+console.log("stage discard: all assertions passed ✅");
