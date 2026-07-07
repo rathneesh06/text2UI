@@ -2,6 +2,16 @@
 // Parse-layer tests only: attach/introspect need a live database + the DuckDB
 // extension download, which the manual QA script covers.
 import assert from "node:assert";
+// HERMETIC: all workbench-store state (manifest, stages, snapshot files) goes to
+// a throwaway temp dir — running tests must NEVER touch the production WB_DIR
+// (that bug published test fixtures as real sources on the start page).
+import { mkdtempSync, rmSync as rmTestDir } from "node:fs";
+import { tmpdir } from "node:os";
+import { join as joinTestPath } from "node:path";
+const TEST_WB_DIR = mkdtempSync(joinTestPath(tmpdir(), "t2ui-wbtest-"));
+process.env.WB_DIR = TEST_WB_DIR;
+process.on("exit", () => { try { rmTestDir(TEST_WB_DIR, { recursive: true, force: true }); } catch { /* best effort */ } });
+
 import { detectDialect, parseDbUrl, describeDbConn, refFor } from "./db-conn";
 
 // ---- dialect detection ---------------------------------------------------------

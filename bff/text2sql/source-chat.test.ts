@@ -2,6 +2,16 @@
 // Exercises the build-chat data-question loop against a REAL published snapshot,
 // with fake model runners (planner + composer) and the in-memory chat store.
 import assert from "node:assert";
+// HERMETIC: all workbench-store state (manifest, stages, snapshot files) goes to
+// a throwaway temp dir — running tests must NEVER touch the production WB_DIR
+// (that bug published test fixtures as real sources on the start page).
+import { mkdtempSync, rmSync as rmTestDir } from "node:fs";
+import { tmpdir } from "node:os";
+import { join as joinTestPath } from "node:path";
+const TEST_WB_DIR = mkdtempSync(joinTestPath(tmpdir(), "t2ui-wbtest-"));
+process.env.WB_DIR = TEST_WB_DIR;
+process.on("exit", () => { try { rmTestDir(TEST_WB_DIR, { recursive: true, force: true }); } catch { /* best effort */ } });
+
 import { DuckDBInstance } from "@duckdb/node-api";
 import { addStaged, stagingDbPath, finalizeStaged } from "../sources/workbench-store";
 import { handleSourceChat } from "./handler";
@@ -17,7 +27,7 @@ const dbPath = stagingDbPath(conv);
   const c = await i.connect();
   await c.run("CREATE OR REPLACE TABLE orders AS SELECT * FROM (VALUES ('EMEA', 120), ('APAC', 300)) t(region, revenue)");
   c.disconnectSync();
-  i.closeSync(); // release the staging file so the handler can open it to query (Windows file lock)
+  i.closeSync(); // Windows: release the file lock so the handler can open the snapshot
 }
 addStaged(conv, "public", dbPath, [{
   tableName: "orders",

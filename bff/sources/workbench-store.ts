@@ -23,8 +23,11 @@ import type { QueryResult } from "../storage/types";
 import type { Dataset } from "../../shared/types";
 
 export const WB_PREFIX = "wb_";
-export const WB_DIR = process.env.WB_DIR || "./.t2ui/workbench";
-const MANIFEST = () => join(WB_DIR, "manifest.json");
+/** Evaluated per call (not at import) so tests can redirect it to a temp dir
+ *  BEFORE touching the store — test runs must never write into the production
+ *  manifest (that bug published test fixtures onto the real start page). */
+export const WB_DIR = () => process.env.WB_DIR || "./.t2ui/workbench";
+const MANIFEST = () => join(WB_DIR(), "manifest.json");
 
 export interface WorkbenchSource {
   projectId: string;      // "wb_" + slug — doubles as the /api/query routing key
@@ -59,7 +62,7 @@ function loadManifest(): WorkbenchSource[] {
 /** Atomic JSON write: tmp file + rename, so a crash mid-write can never leave a
  *  truncated manifest/stages file (blueprint: "atomic publish semantics"). */
 function writeJsonAtomic(path: string, value: unknown): void {
-  mkdirSync(WB_DIR, { recursive: true });
+  mkdirSync(WB_DIR(), { recursive: true });
   const tmp = `${path}.tmp-${process.pid}`;
   writeFileSync(tmp, JSON.stringify(value, null, 2));
   renameSync(tmp, path);
@@ -81,8 +84,8 @@ export function wbSlug(label: string): string {
 
 /** Where a new snapshot's DuckDB file should be written (caller passes to snapshotMysql). */
 export function wbDbPath(projectId: string): string {
-  mkdirSync(WB_DIR, { recursive: true });
-  return join(WB_DIR, `${projectId}.duckdb`);
+  mkdirSync(WB_DIR(), { recursive: true });
+  return join(WB_DIR(), `${projectId}.duckdb`);
 }
 
 /** Register (or replace) an extracted source. Idempotent on projectId. */
@@ -165,7 +168,7 @@ export interface StagedState {
   tables: Dataset[];   // accumulated, deduped by tableName (last extract wins)
 }
 
-const STAGES = () => join(WB_DIR, "stages.json");
+const STAGES = () => join(WB_DIR(), "stages.json");
 const staged = new Map<string, StagedState>();
 let stagesLoaded = false;
 
@@ -192,8 +195,8 @@ const safeId = (s: string) => s.toLowerCase().replace(/[^a-z0-9_-]+/g, "_").slic
 
 /** The staging DuckDB file for a conversation (stable across extracts). */
 export function stagingDbPath(conversationId: string): string {
-  mkdirSync(WB_DIR, { recursive: true });
-  return join(WB_DIR, `stage_${safeId(conversationId)}.duckdb`);
+  mkdirSync(WB_DIR(), { recursive: true });
+  return join(WB_DIR(), `stage_${safeId(conversationId)}.duckdb`);
 }
 
 /** Merge freshly-snapshotted tables into the conversation's stage. */
