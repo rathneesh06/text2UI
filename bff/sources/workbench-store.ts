@@ -30,7 +30,9 @@ export const WB_DIR = () => process.env.WB_DIR || "./.t2ui/workbench";
 const MANIFEST = () => join(WB_DIR(), "manifest.json");
 
 export interface WorkbenchSource {
-  projectId: string;      // "wb_" + slug — doubles as the /api/query routing key
+  projectId: string;
+  /** For combined sources: the original projectIds merged in (lineage). */
+  components?: string[];      // "wb_" + slug — doubles as the /api/query routing key
   label: string;          // human-facing, e.g. "shop_db extract (orders, customers)"
   tenantId: string;
   dbPath: string;
@@ -115,6 +117,14 @@ export function removeWorkbenchSource(tenantId: string, projectId: string): bool
 
 // ---- query path (colo.ts pattern: one instance per file, connection per call) --
 const instances = new Map<string, Promise<DuckDBInstance>>();
+
+/** Close and evict the cached instance for a file (best-effort) — needed before
+ *  another instance ATTACHes the same file (a hard lock conflict on Windows). */
+async function releaseInstance(dbPath: string): Promise<void> {
+  const p = instances.get(dbPath);
+  instances.delete(dbPath);
+  if (p) { try { (await p).closeSync(); } catch { /* already closed */ } }
+}
 
 function getInstance(dbPath: string): Promise<DuckDBInstance> {
   let p = instances.get(dbPath);
@@ -213,6 +223,58 @@ export function addStaged(conversationId: string, tenantId: string, dbPath: stri
 export function getStaged(conversationId: string): StagedState | null {
   loadStages();
   return staged.get(conversationId) ?? null;
+}
+
+/** Merge multiple PUBLISHED workbench sources into ONE new source: a fresh
+ *  DuckDB file containing every table from every input (collisions suffixed
+ *  _2, _3, …). Downstream (spec planner, /api/query, deck) needs no changes —
+ *  a combined source is just another source. `components` records lineage so
+ *  the UI can avoid re-adding a source that's already inside. */
+export async function combineSources(tenantId: string, projectIds: string[], label?: string): Promise<{ source: WorkbenchSource; renames: string[] }> {
+  const ids = [...new Set(projectIds.map(String).filter(Boolean))];
+  if (ids.length < 2) throw new Error("need at least two sources to combine");
+  const srcs = ids.map((id) => {
+    const src = getWorkbenchSource(id);
+    if (!src || src.tenantId !== tenantId) throw new Error(`unknown source: ${id}`);
+    return src;
+  });
+
+  const srcLabel = label?.trim() || srcs.map((s) => s.label).join(" + ").slice(0, 80);
+  const projectId = wbSlug(srcLabel);
+  const dbPath = wbDbPath(projectId);
+
+  // The query cache may hold these files open — release them before ATTACH.
+  for (const src of srcs) await releaseInstance(src.dbPath);
+  await releaseInstance(dbPath);
+
+  const inst = await DuckDBInstance.create(dbPath);
+  const conn = await inst.connect();
+  const tables: Dataset[] = [];
+  const renames: string[] = [];
+  const taken = new Set<string>();
+  try {
+    for (let i = 0; i < srcs.length; i++) {
+      await conn.run(`ATTACH '${srcs[i].dbPath.replace(/'/g, "''")}' AS s${i} (READ_ONLY)`);
+      for (const t of srcs[i].tables) {
+        let local = t.tableName;
+        for (let n = 2; taken.has(local); n++) local = `${t.tableName}_${n}`;
+        taken.add(local);
+        if (local !== t.tableName) renames.push(`${srcs[i].label}: ${t.tableName} → ${local} (name collision)`);
+        await conn.run(`CREATE TABLE main."${local}" AS SELECT * FROM s${i}.main."${t.tableName}"`);
+        tables.push({ ...t, tableName: local });
+      }
+      await conn.run(`DETACH s${i}`);
+    }
+  } finally {
+    conn.disconnectSync();
+    inst.closeSync(); // release the new file for the lazy query cache (Windows)
+  }
+
+  const source = registerWorkbenchSource({
+    projectId, label: srcLabel, tenantId, dbPath, tables, createdAt: Date.now(),
+    components: srcs.flatMap((s) => s.components?.length ? s.components : [s.projectId]),
+  });
+  return { source, renames };
 }
 
 /** Discard an UNPUBLISHED stage: remove the entry and delete its staging file.

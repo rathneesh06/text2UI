@@ -303,3 +303,38 @@ console.log("relevance ranking: all assertions passed ✅");
   assert.equal(existsSync(src.dbPath), true, "published source file untouched");
 }
 console.log("stage discard: all assertions passed ✅");
+
+// ---- combineSources: multi-connection builds merge into ONE queryable source ---------
+{
+  const { addStaged: aS, finalizeStaged: fS, stagingDbPath: sp, combineSources: cS, wbQuery: wq } = await import("./workbench-store");
+  const { DuckDBInstance: DI } = await import("@duckdb/node-api");
+  const mk = async (conv: string, table: string, val: number) => {
+    const path = sp(conv);
+    const i = await DI.create(path); const c = await i.connect();
+    await c.run(`CREATE OR REPLACE TABLE "${table}" AS SELECT ${val} AS v`);
+    c.disconnectSync(); i.closeSync();
+    aS(conv, "public", path, [{ tableName: table, profile: { source: { filename: `pg:${table}`, format: "json" }, rowCount: 1, columns: [], sampleRows: [] } } as any]);
+    return fS(conv, `${table} src`);
+  };
+  const a = await mk("conv_comb_a_" + Date.now(), "orders", 1);
+  const b = await mk("conv_comb_b_" + Date.now(), "customers", 2);
+  const c3 = await mk("conv_comb_c_" + Date.now(), "orders", 3); // collision with a
+
+  const { source: ab, renames: r1 } = await cS("public", [a.projectId, b.projectId]);
+  assert.deepEqual(ab.tables.map((t: any) => t.tableName).sort(), ["customers", "orders"], "both tables merged");
+  assert.deepEqual(ab.components?.sort(), [a.projectId, b.projectId].sort(), "lineage recorded");
+  assert.equal(r1.length, 0, "no collisions between a and b");
+  const q1 = await wq(ab.projectId, 'SELECT (SELECT v FROM orders) + (SELECT v FROM customers) AS s');
+  assert.equal(Number((q1.rows[0] as any).s), 3, "combined source queryable across both tables");
+
+  const { source: abc, renames: r2 } = await cS("public", [ab.projectId, c3.projectId]);
+  assert.ok(abc.tables.some((t: any) => t.tableName === "orders_2"), "collision suffixed");
+  assert.ok(r2.length === 1 && r2[0].includes("orders_2"), r2.join(";"));
+  assert.deepEqual(abc.components?.sort(), [a.projectId, b.projectId, c3.projectId].sort(), "chained lineage flattens to originals");
+  const q2 = await wq(abc.projectId, 'SELECT (SELECT v FROM orders) + (SELECT v FROM orders_2) AS s');
+  assert.equal(Number((q2.rows[0] as any).s), 4, "chained combine queryable");
+
+  await assert.rejects(() => cS("other-tenant", [a.projectId, b.projectId]), /unknown source/, "tenant scoped");
+  await assert.rejects(() => cS("public", [a.projectId]), /at least two/, "needs two sources");
+}
+console.log("combineSources: all assertions passed ✅");

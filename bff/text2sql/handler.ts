@@ -29,7 +29,7 @@ import {
 } from "../sources/workbench-store";
 import { snapshotTables } from "../sources/db-conn";
 import { COLO_PROJECT_ID, coloAvailable, coloProfiles, coloQuery } from "../sources/colo";
-import { isWorkbenchProject, wbQuery } from "../sources/workbench-store";
+import { isWorkbenchProject, wbQuery, combineSources } from "../sources/workbench-store";
 import { qid } from "../sources/mysql";
 import { guardSelect } from "./guard";
 import { planSqlTurn, type PlanSqlRun, type SqlTurnPlan } from "./planner";
@@ -204,6 +204,25 @@ export function handleSqlStageGet(conversationId: string, tenantId: string): Out
   const st = getStaged(String(conversationId ?? ""));
   if (!st || st.tenantId !== tenantId) return { status: 200, body: { staged: { count: 0, tables: [] } } };
   return { status: 200, body: { conversationId: st.conversationId, staged: stagedView(st) } };
+}
+
+// ---- POST /api/sources/combine — merge published extracts into ONE source --------
+// Multi-connection builds: extract from string A, build; extract from string B,
+// "Build with B" while A's session is active → the app combines A+B here and the
+// build continues over the union. Chains: (A+B)+C works the same way.
+export async function handleCombineSources(body: unknown, tenantId: string): Promise<Out> {
+  const b = body as any;
+  if (!b || typeof b !== "object") return bad("body must be a JSON object");
+  if (!Array.isArray(b.projectIds) || b.projectIds.length < 2) return bad("projectIds[] with at least two entries is required");
+  if (!b.projectIds.every((id: unknown) => typeof id === "string" && isWorkbenchProject(String(id)))) {
+    return bad("only workbench (wb_*) sources can be combined");
+  }
+  try {
+    const { source, renames } = await combineSources(tenantId, b.projectIds, typeof b.label === "string" ? b.label : undefined);
+    return { status: 200, body: { projectId: source.projectId, label: source.label, tables: source.tables, components: source.components, warnings: renames } };
+  } catch (err: any) {
+    return bad(err?.message ?? "combine failed");
+  }
 }
 
 // ---- DELETE /api/sql/stage/:conversationId — discard an unpublished stage --------

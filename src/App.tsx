@@ -16,7 +16,7 @@ import StyleGuidePage from "./pages/StyleGuidePage";
 import WorkbenchPage from "./pages/WorkbenchPage";
 import { assignTableNames, ingestFile, newId, type Source, type Table } from "./lib/datasets";
 import { COLO_PROJECT_ID, listSources, sourceTablesToTables, type SourceInfo } from "./api";
-import { isWorkbenchProject, wbDeleteSource, wbDiscardStage, type WbExtracted } from "./workbench-api";
+import { isWorkbenchProject, wbDeleteSource, wbDiscardStage, wbCombineSources, type WbExtracted } from "./workbench-api";
 import "./index.css";
 
 export type ProjectMeta = {
@@ -210,12 +210,23 @@ function AppRoutes() {
   // WorkbenchPage callback: a chat just extracted tables (or asked for a build).
   // Register the fresh source immediately (no /api/sources round-trip) and select
   // it; when a buildPrompt rides along, carry it into the build page.
-  const handleUseWorkbenchSource = useCallback((extracted: WbExtracted, buildPrompt?: string) => {
-    const src: SourceInfo = { id: extracted.projectId, label: extracted.label, projectId: extracted.projectId, tables: extracted.tables };
+  const handleUseWorkbenchSource = useCallback(async (extracted: WbExtracted, buildPrompt?: string) => {
+    let src: SourceInfo = { id: extracted.projectId, label: extracted.label, projectId: extracted.projectId, tables: extracted.tables };
+    // Multi-connection builds: if another extract's session is already active,
+    // "Build with <new>" means ADD it — the BFF merges both into one combined
+    // source (old data + new data) and the build continues over the union.
+    const active = isWorkbenchProject(projectId) ? wbSources.find((w) => w.projectId === projectId) : null;
+    const alreadyIn = active && (active.projectId === src.projectId || active.components?.includes(src.projectId));
+    if (active && !alreadyIn) {
+      try {
+        const combined = await wbCombineSources({ projectIds: [active.projectId, src.projectId] });
+        src = { id: combined.projectId, label: combined.label, projectId: combined.projectId, tables: combined.tables, ...(combined.components ? { components: combined.components } : {}) };
+      } catch { /* combine failed — fall back to switching to the new source alone */ }
+    }
     setWbSources((prev) => [src, ...prev.filter((s) => s.projectId !== src.projectId)]);
     selectWbSource(src);
     if (buildPrompt) setInitialPrompt(buildPrompt);
-  }, [selectWbSource]);
+  }, [selectWbSource, projectId, wbSources]);
 
   const loadFiles = useCallback(async (list: FileList | File[]) => {
     for (const file of Array.from(list)) {

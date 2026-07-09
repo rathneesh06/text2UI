@@ -104,6 +104,11 @@ export function wbStage(conversationId: string): Promise<{ conversationId?: stri
   return request(`/api/sql/stage/${encodeURIComponent(conversationId)}`);
 }
 
+/** Merge published extracts into ONE combined source (multi-connection builds). */
+export function wbCombineSources(body: { projectIds: string[]; label?: string }): Promise<WbExtracted & { components?: string[]; warnings?: string[] }> {
+  return request("/api/sources/combine", { method: "POST", body: JSON.stringify(body) });
+}
+
 /** Discard an unpublished stage (panel memory + server entry + staging file). */
 export function wbDiscardStage(conversationId: string): Promise<{ discarded: boolean }> {
   return request(`/api/sql/stage/${encodeURIComponent(conversationId)}`, { method: "DELETE" });

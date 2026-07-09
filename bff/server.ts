@@ -20,7 +20,7 @@ import { buildExportZip, buildConnectedZip } from "./export";
 import { generateReport } from "./report";
 import { COLO_PROJECT_ID, COLO_LABEL, coloAvailable, coloProfiles, coloQuery } from "./sources/colo";
 import { isWorkbenchProject, listWorkbenchSources, wbQuery, removeWorkbenchSource } from "./sources/workbench-store";
-import { handleSqlConnect, handleSqlSchema, handleSqlChat, handleSqlExtract, handleSqlExtractDb, handleSqlStageGet, handleSqlStageDiscard, handleSourceChat } from "./text2sql/handler";
+import { handleSqlConnect, handleSqlSchema, handleSqlChat, handleSqlExtract, handleSqlExtractDb, handleSqlStageGet, handleSqlStageDiscard, handleSourceChat, handleCombineSources } from "./text2sql/handler";
 import { handleDashboardBuild } from "./dashboard/handler";
 import { handleDeckBuild, handleDeckEdit } from "./deck/handler";
 import { loadRows } from "./deck/local-data";
@@ -918,7 +918,7 @@ export function createServer() {
         sources.push({ id: "colo", label: COLO_LABEL, projectId: COLO_PROJECT_ID, tables });
       }
       for (const wb of listWorkbenchSources(req.tenantId ?? DEV_TENANT)) {
-        sources.push({ id: wb.projectId, label: wb.label, projectId: wb.projectId, tables: wb.tables });
+        sources.push({ id: wb.projectId, label: wb.label, projectId: wb.projectId, tables: wb.tables, ...(wb.components ? { components: wb.components } : {}) });
       }
       res.json({ sources });
     } catch (err: any) {
@@ -985,6 +985,10 @@ export function createServer() {
   });
   app.delete("/api/sql/stage/:conversationId", (req, res) => {
     const { status, body } = handleSqlStageDiscard(String(req.params.conversationId), req.tenantId ?? DEV_TENANT);
+    res.status(status).json(body);
+  });
+  app.post("/api/sources/combine", async (req, res) => {
+    const { status, body } = await handleCombineSources(req.body, req.tenantId ?? DEV_TENANT);
     res.status(status).json(body);
   });
   // Source lifecycle (blueprint): delete a published workbench extract.

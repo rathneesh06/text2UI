@@ -335,6 +335,8 @@ export const COLO_PROJECT_ID = "colosnapshot";
 
 export interface SourceInfo {
   id: string;
+  /** Combined sources: the original wb_* projectIds merged in. */
+  components?: string[];
   label: string;
   projectId: string;
   tables: { tableName: string; profile: DataProfile }[];
