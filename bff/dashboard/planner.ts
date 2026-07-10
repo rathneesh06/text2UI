@@ -78,10 +78,41 @@ export const DASHBOARD_SCHEMA = {
   required: ["meta", "sections"],
 };
 
+const REWRITE_SYSTEM = `You are the query-rewriting stage of a dashboard generator. Given a data profile and the user's (often brief) request, expand it into a DETAILED analytical directive for the dashboard planner: which measures to aggregate (exact column names, sum/avg/count), which dimensions to break them down by, which time grain for trends, which comparisons or rankings matter, and what the 3-6 headline KPIs should be. Be concrete and grounded ONLY in columns that exist. If an existing dashboard is described, scope the directive to the requested change. Output 3-8 plain sentences, no JSON, no markdown, no preamble.`;
+
+export interface RewriteInput { datasets: Dataset[]; userPrompt: string; currentSpec?: DashboardSpec }
+
+/** The query rewriter: turns a brief ask ("sales dashboard", "add customer stuff")
+ *  into concrete, schema-grounded modeling instructions. Null on any failure —
+ *  the raw prompt then proceeds alone; this stage may improve, never block. */
+export async function rewritePrompt(input: RewriteInput, run: PlannerRun = callGemini, timeoutMs = 9000): Promise<string | null> {
+  const timeout = new Promise<null>((resolve) => setTimeout(() => resolve(null), timeoutMs));
+  const call = (async (): Promise<string | null> => {
+    try {
+      const specCtx = input.currentSpec
+        ? `\nEXISTING DASHBOARD: "${input.currentSpec.meta.title}" — widgets: ${input.currentSpec.sections.flatMap((x) => x.widgets ?? []).map((w: any) => `${w.kind}:${w.title ?? ""}`).join(", ")}`
+        : "";
+      const { text } = await run(REWRITE_SYSTEM, `DATA PROFILE:\n${schemaText(input.datasets)}${specCtx}\n\nUSER REQUEST: ${input.userPrompt}`, { temperature: 0.4 });
+      const out = (text ?? "").trim();
+      if (!out || out.length < 40 || out.length > 2500) return null;
+      console.log(`[rewriter] ${out.slice(0, 90)}…`);
+      return out;
+    } catch (err) {
+      console.warn(`[rewriter] failed -> raw prompt: ${(err as Error).message}`);
+      return null;
+    }
+  })();
+  return Promise.race([call, timeout]);
+}
+
 export const HEX_RE = /^#[0-9a-fA-F]{3,8}$/;
 
 const SYSTEM = `You are the planning stage of a data-dashboard generator. You output a single JSON DashboardSpec and NOTHING else. You never write SQL, JSX, or prose.
 STYLING: visual requests (colors, "make it teal/dark/vibrant", branding, mood) map to meta.theme ("light"/"dark"), meta.accent (one hex), and meta.chartPalette (hex[]). Honor them enthusiastically — pick tasteful concrete hex values yourself when the user names a color family.
+HOUSE STYLE (always, unless the user explicitly asks otherwise):
+- VIBRANT: always set meta.accent and a 5-6 color meta.chartPalette of saturated, energetic hex values (violet/cyan/amber/emerald/rose families) — never leave a dashboard on defaults, never choose washed-out grays.
+- DENSE: this product favors compact, information-rich dashboards. Prefer "quarter" and "half" widths so rows pack tightly; use "full" only for tables. No filler widgets, no near-empty sections.
+- COVERAGE: a dashboard MUST have at least 4 charts using at least 3 DIFFERENT chart types (bar/line/area/pie), each answering a different analytical question (composition, trend, ranking, comparison), and 3-6 KPI cards for the headline aggregates. Only when the data genuinely cannot support 4 meaningful charts may you go lower — never pad with duplicates.
 EDIT TURNS (a currentSpec is provided): change ONLY what the user asked for and preserve every other field verbatim — a style request must not add, remove, or reshape widgets; a widget request must not reset the styling.
 
 Rules:
@@ -101,7 +132,7 @@ function schemaText(datasets: Dataset[]): string {
   }).join("\n");
 }
 
-function buildUserPrompt(datasets: Dataset[], userPrompt: string, currentSpec?: DashboardSpec, styleHints?: string): string {
+function buildUserPrompt(datasets: Dataset[], userPrompt: string, currentSpec?: DashboardSpec, styleHints?: string, directive?: string): string {
   const parts = [
     "DATA PROFILE:",
     schemaText(datasets),
@@ -110,6 +141,11 @@ function buildUserPrompt(datasets: Dataset[], userPrompt: string, currentSpec?: 
   if (styleHints) {
     parts.push("VISUAL DIRECTION (from the planning stage — realize it via meta.theme/accent/chartPalette):");
     parts.push(styleHints);
+    parts.push("");
+  }
+  if (directive) {
+    parts.push("ANALYTICAL DIRECTIVE (from the query-rewriting stage — realize these breakdowns as concrete widgets):");
+    parts.push(directive);
     parts.push("");
   }
   if (currentSpec) {
@@ -156,14 +192,14 @@ function coerce(parsed: any): DashboardSpec | null {
   };
 }
 
-export interface PlanSpecInput { datasets: Dataset[]; userPrompt: string; currentSpec?: DashboardSpec; styleHints?: string }
+export interface PlanSpecInput { datasets: Dataset[]; userPrompt: string; currentSpec?: DashboardSpec; styleHints?: string; directive?: string }
 
 /** Plan (or edit) a DashboardSpec. Never throws; returns null on failure/timeout. */
 export async function planSpec(input: PlanSpecInput, run: PlannerRun = callGemini, timeoutMs = PLAN_TIMEOUT_MS): Promise<DashboardSpec | null> {
   const timeout = new Promise<null>((resolve) => setTimeout(() => resolve(null), timeoutMs));
   const call = (async (): Promise<DashboardSpec | null> => {
     try {
-      const { text } = await run(SYSTEM, buildUserPrompt(input.datasets, input.userPrompt, input.currentSpec, input.styleHints), { ...ORCHESTRATE_OPTS, responseSchema: DASHBOARD_SCHEMA });
+      const { text } = await run(SYSTEM, buildUserPrompt(input.datasets, input.userPrompt, input.currentSpec, input.styleHints, input.directive), { ...ORCHESTRATE_OPTS, responseSchema: DASHBOARD_SCHEMA });
       const spec = coerce(JSON.parse(stripFences(text)));
       if (spec) console.log(`[dashboard-planner] spec: "${spec.meta.title}" with ${spec.sections.reduce((n, s) => n + s.widgets.length, 0)} widget(s)`);
       else console.warn("[dashboard-planner] model returned no usable spec");

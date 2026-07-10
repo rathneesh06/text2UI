@@ -115,3 +115,42 @@ console.log("orchestrator respond ✅");
 console.log("follow-up gate ✅");
 
 console.log("conversational.test.ts: all assertions passed ✅");
+
+// ---- v8/qe1: query rewriter + house-style enforcement --------------------------------
+{
+  const { rewritePrompt } = await import("./planner");
+  const { briefToAnalyticalDirective, coverageShortfalls } = await import("./handler");
+
+  // rewriter: grounded output passes through; garbage/failure -> null (never blocks)
+  const good = await rewritePrompt({ datasets, userPrompt: "sales dashboard" },
+    async () => ({ text: "Aggregate sum of revenue as the headline KPI. Break revenue down by region as a bar chart ranking regions. Trend revenue by month as a line chart. Show region composition as a pie. Compare average revenue per region as an area or bar.", finishReason: "STOP" } as any));
+  assert.ok(good && good.includes("revenue") && good.includes("region"), String(good));
+  assert.equal(await rewritePrompt({ datasets, userPrompt: "x" }, async () => ({ text: "ok", finishReason: "STOP" } as any)), null, "too-short rewrite rejected");
+  assert.equal(await rewritePrompt({ datasets, userPrompt: "x" }, async () => { throw new Error("down"); }), null, "failure -> null, never throws");
+
+  // brief -> analytical directive (first builds get content for free)
+  const d = briefToAnalyticalDirective({ kpis: ["total revenue", "orders count"], charts: [{ type: "bar", x: "region", y: "revenue", why: "ranking" }], enhancedPrompt: "Focus on regional performance." });
+  assert.ok(d && d.includes("total revenue") && d.includes("bar of revenue by region") && d.includes("regional performance"), String(d));
+  assert.equal(briefToAnalyticalDirective(null), null);
+
+  // coverage: rich data demands 4 charts / 3 types / 3 KPIs; thin data scales down
+  const rich = [{ tableName: "t", profile: { source: { filename: "x", format: "json" }, rowCount: 9, columns: Array.from({ length: 8 }, (_, i) => ({ name: "c" + i, type: "number" })), sampleRows: [] } } as any];
+  const spec1: any = { meta: { title: "T" }, sections: [{ title: "S", widgets: [
+    { id: "k1", kind: "kpi", title: "A" },
+    { id: "c1", kind: "chart", chart: "bar", title: "B" },
+    { id: "c2", kind: "chart", chart: "bar", title: "C" },
+  ] }] };
+  const s1 = coverageShortfalls(spec1, rich);
+  assert.ok(s1.some((x) => x.includes("chart(s), need at least 4")), s1.join(";"));
+  assert.ok(s1.some((x) => x.includes("KPI")), s1.join(";"));
+  const spec2: any = { meta: { title: "T" }, sections: [{ title: "S", widgets: [
+    { id: "k1", kind: "kpi", title: "A" }, { id: "k2", kind: "kpi", title: "B" }, { id: "k3", kind: "kpi", title: "C" },
+    { id: "c1", kind: "chart", chart: "bar", title: "1" }, { id: "c2", kind: "chart", chart: "line", title: "2" },
+    { id: "c3", kind: "chart", chart: "pie", title: "3" }, { id: "c4", kind: "chart", chart: "area", title: "4" },
+  ] }] };
+  assert.deepEqual(coverageShortfalls(spec2, rich), [], "compliant spec has no shortfalls");
+  const thin = [{ tableName: "t", profile: { source: { filename: "x", format: "json" }, rowCount: 3, columns: [{ name: "v", type: "number" }], sampleRows: [] } } as any];
+  const s3 = coverageShortfalls(spec1, thin);
+  assert.ok(!s3.some((x) => x.includes("need at least 4")), "thin data never demands padding: " + s3.join(";"));
+}
+console.log("query rewriter + house style ✅");

@@ -22,7 +22,7 @@ const DARK = !!(PLAN.meta && PLAN.meta.theme === "dark");
 const ACCENT = PLAN.meta && HEX.test(String(PLAN.meta.accent || "")) ? PLAN.meta.accent : "#4f46e5";
 const PAL = PLAN.meta && Array.isArray(PLAN.meta.chartPalette) ? PLAN.meta.chartPalette.filter(function (c) { return HEX.test(String(c)); }) : [];
 const COLORS = PAL.length ? PAL : [ACCENT, "#818cf8", "#a5b4fc", "#64748b", "#94a3b8", "#c7d2fe"];
-const CARD_CLS = DARK ? " bg-slate-900 rounded-xl border border-slate-800 shadow-sm p-5" : " bg-white rounded-xl border border-slate-200 shadow-sm p-5";
+const CARD_CLS = DARK ? " bg-slate-900 rounded-lg border border-slate-800 shadow-sm p-3" : " bg-white rounded-lg border border-slate-200 shadow-sm p-3";
 const TICK = DARK ? "#94a3b8" : "#64748b";
 const GRID = DARK ? "#334155" : "#e2e8f0";
 
@@ -65,7 +65,7 @@ function Card(props) {
   return (
     <div className={widthClass(props.width) + CARD_CLS}>
       {props.title ? <div className={"text-sm font-medium " + (DARK ? "text-slate-200" : "text-slate-700")}>{props.title}</div> : null}
-      {props.subtitle ? <div className="text-xs text-slate-400 mb-3">{props.subtitle}</div> : <div className="mb-2" />}
+      {props.subtitle ? <div className="text-xs text-slate-400 mb-1.5">{props.subtitle}</div> : <div className="mb-1" />}
       {props.children}
     </div>
   );
@@ -80,7 +80,7 @@ function Kpi(props) {
       <div className="text-xs font-medium uppercase tracking-wide text-slate-500">{w.title}</div>
       {s.loading ? <div className="mt-2 h-8 w-24 animate-pulse rounded bg-slate-100" />
         : s.error ? <ErrorBox msg={s.error} />
-        : <div className="mt-1 text-3xl font-semibold tabular-nums" style={{ color: ACCENT }}>{fmt(value, (w.metric && w.metric.format) || w.format)}</div>}
+        : <div className="mt-0.5 text-2xl font-semibold tabular-nums" style={{ color: ACCENT }}>{fmt(value, (w.metric && w.metric.format) || w.format)}</div>}
     </div>
   );
 }
@@ -101,7 +101,7 @@ function Chart(props) {
       const k = keys[0] ? keys[0].key : "value";
       const pdata = data.map(function (d) { return { name: d.x, value: d[k] }; });
       return (
-        <ResponsiveContainer width="100%" height={240}>
+        <ResponsiveContainer width="100%" height={210}>
           <PieChart>
             <Pie data={pdata} dataKey="value" nameKey="name" cx="50%" cy="50%" innerRadius={w.kind === "donut" ? 55 : 0} outerRadius={90}>
               {pdata.map(function (e, i) { return <Cell key={i} fill={COLORS[i % COLORS.length]} />; })}
@@ -114,7 +114,7 @@ function Chart(props) {
     }
     const Cmp = w.kind === "bar" ? BarChart : w.kind === "area" ? AreaChart : LineChart;
     return (
-      <ResponsiveContainer width="100%" height={240}>
+      <ResponsiveContainer width="100%" height={210}>
         <Cmp data={data}>
           <CartesianGrid stroke={GRID} vertical={false} />
           <XAxis dataKey="x" tick={{ fill: TICK, fontSize: 12 }} axisLine={false} tickLine={false} />
@@ -148,7 +148,7 @@ function DataTable(props) {
           <table className="w-full text-sm">
             <thead>
               <tr className={"text-xs uppercase tracking-wide text-slate-500 border-b " + (DARK ? "border-slate-700" : "border-slate-200")}>
-                {headers.map(function (h) { return <th key={h} className="text-left py-2 pr-4">{h}</th>; })}
+                {headers.map(function (h) { return <th key={h} className="text-left py-1.5 pr-3">{h}</th>; })}
               </tr>
             </thead>
             <tbody>
@@ -158,7 +158,7 @@ function DataTable(props) {
                     {headers.map(function (h) {
                       const v = r[h];
                       const num = typeof v === "number";
-                      return <td key={h} className={"py-2 pr-4 " + (num ? "text-right tabular-nums" : "")}>{num ? Number(v).toLocaleString() : fmtX(v)}</td>;
+                      return <td key={h} className={"py-1.5 pr-3 " + (num ? "text-right tabular-nums" : "")}>{num ? Number(v).toLocaleString() : fmtX(v)}</td>;
                     })}
                   </tr>
                 );
@@ -179,14 +179,14 @@ function Widget(props) {
 export default function App() {
   return (
     <div className={"min-h-screen font-sans " + (DARK ? "bg-slate-950 text-slate-100" : "bg-slate-50 text-slate-900")}>
-      <div className="max-w-7xl mx-auto p-6 md:p-8">
+      <div className="mx-auto p-3 md:p-4" style={{ maxWidth: "1600px" }}>
         <h1 className="text-2xl font-semibold tracking-tight">{PLAN.meta.title}</h1>
         {PLAN.meta.subtitle ? <p className="text-sm text-slate-500 mt-1">{PLAN.meta.subtitle}</p> : null}
         {PLAN.sections.map(function (sec) {
           return (
-            <div key={sec.id} className="mt-8">
-              {sec.title ? <div className="text-sm font-semibold text-slate-700 mb-3">{sec.title}</div> : null}
-              <div className="grid grid-cols-12 gap-4">
+            <div key={sec.id} className="mt-4">
+              {sec.title ? <div className={"text-sm font-semibold mb-1.5 " + (DARK ? "text-slate-300" : "text-slate-700")}>{sec.title}</div> : null}
+              <div className="grid grid-cols-12 gap-2.5">
                 {sec.widgets.map(function (cw) { return <Widget key={cw.widget.id} cw={cw} />; })}
               </div>
             </div>
