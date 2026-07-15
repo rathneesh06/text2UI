@@ -59,6 +59,9 @@ function AppRoutes() {
   });
   const [fileError, setFileError] = useState<string | null>(null);
   const [initialPrompt, setInitialPrompt] = useState<string | null>(null);
+  // al1: analyst-loop evidence riding a workbench build handoff — follows the
+  // initialPrompt lifecycle exactly and feeds the FIRST dashboard build only.
+  const [initialDirective, setInitialDirective] = useState<string | null>(null);
   const [resetKey, setResetKey] = useState(0);
   // Restore the active project ONLY when the chat page (/build) is reloaded directly, so a
   // refresh keeps the same session while a fresh landing starts a new one.
@@ -225,7 +228,7 @@ function AppRoutes() {
     }
     setWbSources((prev) => [src, ...prev.filter((s) => s.projectId !== src.projectId)]);
     selectWbSource(src);
-    if (buildPrompt) setInitialPrompt(buildPrompt);
+    if (buildPrompt) { setInitialPrompt(buildPrompt); setInitialDirective(extracted.evidence ?? null); }
   }, [selectWbSource, projectId, wbSources]);
 
   const loadFiles = useCallback(async (list: FileList | File[]) => {
@@ -275,6 +278,7 @@ function AppRoutes() {
         registerProject(pendingName.current);
       }
       setInitialPrompt(prompt);
+      setInitialDirective(null);
       navigate("/build");
     },
     [navigate, registerProject, coloActive, coloAvailable, wbActive, sources.length, selectColo, coloTables],
@@ -315,6 +319,7 @@ function AppRoutes() {
     setProjectId("s" + newId());
     setFileError(null);
     setInitialPrompt(null);
+    setInitialDirective(null);
     pendingName.current = null;
     setResetKey((k) => k + 1);
     navigate("/");
@@ -328,6 +333,7 @@ function AppRoutes() {
         setSources(sourcesByProject.current[id] ?? []);
         setProjectId(id);
         setInitialPrompt(null);
+        setInitialDirective(null);
         setFileError(null);
         pendingName.current = null;
       }
@@ -391,7 +397,8 @@ function AppRoutes() {
             projectId={projectId}
             tables={tables}
             initialPrompt={initialPrompt}
-            onConsumeInitialPrompt={() => setInitialPrompt(null)}
+            initialDirective={initialDirective}
+            onConsumeInitialPrompt={() => { setInitialPrompt(null); setInitialDirective(null); }}
             onFiles={loadFiles}
             onRemoveSource={removeSource}
             fileError={fileError}

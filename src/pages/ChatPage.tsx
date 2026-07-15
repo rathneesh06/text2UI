@@ -34,6 +34,8 @@ interface Props {
   projectId: string;
   tables: Table[];
   initialPrompt: string | null;
+  /** al1: analyst-loop evidence riding a workbench handoff (first build only). */
+  initialDirective?: string | null;
   onConsumeInitialPrompt: () => void;
   onFiles: (files: FileList | File[]) => void;
   onRemoveSource: (id: string) => void;
@@ -71,7 +73,7 @@ function detectArtifactSwitch(prompt: string): "ppt" | "pdf" | "dashboard" | nul
 }
 
 export default function ChatPage({
-  projectId, tables, initialPrompt, onConsumeInitialPrompt,
+  projectId, tables, initialPrompt, initialDirective = null, onConsumeInitialPrompt,
   onFiles, onRemoveSource, fileError, onNewProject, onBuildMeta,
 }: Props) {
   const [turns, setTurns] = useState<Turn[]>([]);
@@ -101,6 +103,9 @@ export default function ChatPage({
   // The first-turn orchestrator brief, carried into the spec-dashboard build so
   // its palette/design direction reach the spec planner (the missing junction).
   const lastBrief = useRef<unknown | null>(null);
+  // al1: evidence captured before the initial prompt is consumed; spent on the
+  // FIRST successful dashboard build, then cleared (edits use currentSpec).
+  const pendingDirective = useRef<string | null>(null);
   const builds = useRef(0);
   const startedRef = useRef(false);
   const threadRef = useRef<HTMLDivElement>(null);
@@ -324,7 +329,9 @@ export default function ChatPage({
         const { app, spec: nextSpec, warnings, summary } = await buildDashboard({
           datasets, userPrompt: prompt, ...(spec ? { currentSpec: spec } : {}),
           ...(lastBrief.current && !spec ? { brief: lastBrief.current } : {}),
+          ...(pendingDirective.current && !spec ? { analystDirective: pendingDirective.current } : {}),
         });
+        pendingDirective.current = null;
         setSpec(nextSpec);
         setResult({ kind: "dashboard", app });
         setDashVersion((v) => v + 1);
@@ -408,10 +415,11 @@ export default function ChatPage({
   useEffect(() => {
     if (initialPrompt && tables.length && !startedRef.current) {
       startedRef.current = true;
+      pendingDirective.current = initialDirective ?? null;
       onConsumeInitialPrompt();
       void runTurn(initialPrompt);
     }
-  }, [initialPrompt, tables.length, runTurn, onConsumeInitialPrompt]);
+  }, [initialPrompt, initialDirective, tables.length, runTurn, onConsumeInitialPrompt]);
 
   // ---- toolbar actions (only meaningful when a dashboard exists) ----
   const downloadProject = useCallback(async () => {

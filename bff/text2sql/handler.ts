@@ -32,6 +32,7 @@ import { COLO_PROJECT_ID, coloAvailable, coloProfiles, coloQuery } from "../sour
 import { isWorkbenchProject, wbQuery, combineSources } from "../sources/workbench-store";
 import { qid } from "../sources/mysql";
 import { guardSelect } from "./guard";
+import { runAnalystLoop, formatEvidenceDirective, compactEvidence, type AnalystRun } from "./analyst";
 import { planSqlTurn, type PlanSqlRun, type SqlTurnPlan } from "./planner";
 import { composeAnswer, composeFallback, type ComposeRun } from "./composer";
 import type { Dataset } from "../../shared/types";
@@ -41,10 +42,16 @@ const ROWS_TO_CLIENT = Number(process.env.T2SQL_ROWS_TO_CLIENT ?? 200);
 // Query classes get their own timeouts (blueprint): previews must feel instant.
 const PREVIEW_TIMEOUT_MS = Number(process.env.T2SQL_PREVIEW_TIMEOUT_MS ?? 10_000);
 const QUERY_TIMEOUT_MS = Number(process.env.T2SQL_LIVE_QUERY_TIMEOUT_MS ?? 30_000);
+// Analyst loop (al1): flag-gated, evaluated per call so tests can toggle it.
+// Analysis queries run against the LIVE attach with a generous timeout (the
+// user has accepted analysis latency in exchange for grounded dashboards).
+const ANALYST_ENABLED = () => (process.env.T2SQL_ANALYST ?? "0") === "1";
+const ANALYST_QUERY_TIMEOUT_MS = Number(process.env.T2SQL_ANALYST_QUERY_TIMEOUT_MS ?? 60_000);
 
 export interface SqlHandlerDeps {
   plan?: PlanSqlRun;        // Gemini runner for the planner (tests inject a fake)
   compose?: ComposeRun;     // Gemini runner for the composer
+  analyst?: AnalystRun;     // the analyst loop (tests inject a fake)
   chatStore?: ChatStore;
 }
 
@@ -267,7 +274,11 @@ export async function handleSqlChat(body: unknown, tenantId: string, deps: SqlHa
     await store.appendMessage(conversationId, {
       role: "assistant",
       content: String(out.answer ?? ""),
-      briefJson: out.sql ? JSON.stringify({ intent: out.intent, sql: out.sql, executionMeta: out.executionMeta, policy: out.policy }) : null,
+      // Analysis memory: build turns persist the compact evidence pack alongside
+      // the usual sql breadcrumbs, so follow-up turns can see what was computed.
+      briefJson: out.sql || out.analysis
+        ? JSON.stringify({ intent: out.intent, sql: out.sql, executionMeta: out.executionMeta, policy: out.policy, ...(out.analysis ? { analysis: out.analysis } : {}) })
+        : null,
     });
     return { status: 200, body: { conversationId, ...out } };
   };
@@ -336,23 +347,51 @@ export async function handleSqlChat(body: unknown, tenantId: string, deps: SqlHa
     }
 
     case "build": {
-      // Snapshot first (production is read once, never touched at build time),
+      // Analyst loop (al1, flag-gated): BEFORE the snapshot, decompose the ask
+      // into sub-questions and compute real findings from the LIVE attach —
+      // grounding → analysis plan → parallel component agents → evidence pack.
+      // The evidence rides the handoff as the spec planner's directive, so the
+      // dashboard is designed around what the data actually says. Any failure
+      // here falls back to the plain handoff (today's behavior, unchanged).
+      let evidence: string | undefined;
+      let analysis: ReturnType<typeof compactEvidence> | undefined;
+      if (ANALYST_ENABLED() && rec.status !== "degraded") {
+        try {
+          const pack = await (deps.analyst ?? runAnalystLoop)({
+            prompt, dialect: rec.conn.dialect, allTables: rec.allTables, datasets: rec.datasets, history,
+            runQuery: (sql) => runOnLiveAttach(rec, sql, ANALYST_QUERY_TIMEOUT_MS),
+          }, { plan: deps.plan, compose: deps.compose });
+          if (pack && pack.findings.some((f) => f.ok)) {
+            evidence = formatEvidenceDirective(pack);
+            analysis = compactEvidence(pack);
+            markExecution(rec, true);
+          }
+        } catch (err: any) {
+          console.warn(`[analyst] failed -> plain build handoff: ${err?.message ?? err}`);
+        }
+      }
+      // Snapshot next (production is read once for the artifact's runtime —
+      // the rendered dashboard queries the durable snapshot, not the live DB),
       // then hand the client everything it needs to drive the EXISTING pipeline.
       try {
         const { staged } = await stageSnapshot(rec, plan.tables ?? [], tenantId, conversationId);
         const source = finalizeStaged(conversationId, plan.tables?.length ? `${rec.conn.database} (${plan.tables.join(", ")})` : undefined);
         void staged;
+        const okCount = analysis ? analysis.findings.filter((f) => f.ok).length : 0;
         const answer =
-          `I've extracted ${source.tables.map((t) => t.tableName).join(", ")} and I'm handing off to the ` +
+          (okCount ? `I ran ${okCount} analysis quer${okCount === 1 ? "y" : "ies"} against the live database, then ` : "I've ") +
+          `extracted ${source.tables.map((t) => t.tableName).join(", ")} and I'm handing off to the ` +
           `${plan.artifact === "ppt" ? "deck" : "dashboard"} builder…`;
         return reply({
           intent: "build", answer,
+          ...(analysis ? { analysis } : {}),
           handoff: {
             projectId: source.projectId,
             label: source.label,
             tables: source.tables,
             artifact: plan.artifact ?? "dashboard",
             buildPrompt: plan.buildPrompt?.trim() || prompt,
+            ...(evidence ? { evidence } : {}),
           },
         });
       } catch (err: any) {

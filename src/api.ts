@@ -82,6 +82,9 @@ export interface BuildDashboardRequest {
   currentSpec?: DashboardSpec;
   /** Orchestrator brief (palette + design direction) — becomes the spec planner's visual directive. */
   brief?: unknown;
+  /** al1: analyst-loop evidence pack (findings computed from the live DB) — outranks
+   *  the brief's analytical half as the spec planner's directive on the first build. */
+  analystDirective?: string;
 }
 export interface BuildDashboardResult {
   app: GeneratedApp;

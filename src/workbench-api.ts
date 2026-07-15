@@ -39,6 +39,9 @@ export interface WbExtracted {
   projectId: string;
   label: string;
   tables: { tableName: string; profile: DataProfile }[];
+  /** al1: analyst-loop findings, present on build handoffs when T2SQL_ANALYST=1 —
+   *  carried into the first dashboard build as its analytical directive. */
+  evidence?: string;
 }
 
 export interface WbStagedTable {

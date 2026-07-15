@@ -28,7 +28,12 @@ export async function handleDashboardBuild(
   // the query-rewriting stage expands the raw ask into schema-grounded modeling
   // instructions instead. Either path may fail soft — the raw prompt proceeds.
   const styleHints = briefToStyleHints(b.brief);
-  const directive = briefToAnalyticalDirective(b.brief)
+  // al1: an analyst-loop evidence pack (real findings computed from the live DB
+  // before the build) outranks both the brief's analytical half and the query
+  // rewriter -- it is the most grounded directive we can have.
+  const analystDirective = typeof b.analystDirective === "string" && b.analystDirective.trim() ? b.analystDirective.trim() : null;
+  const directive = analystDirective
+    ?? briefToAnalyticalDirective(b.brief)
     ?? await rewritePrompt({ datasets, userPrompt: b.userPrompt, ...(currentSpec ? { currentSpec } : {}) });
 
   const planOnce = (extra?: string) => planner({

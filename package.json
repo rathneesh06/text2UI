@@ -29,7 +29,7 @@
     "test:eval:live": "tsx bff/eval/run.ts",
     "test:dbexport": "tsx bff/dbexport.test.ts",
     "test:metrics": "tsx bff/metrics.test.ts",
-    "test": "npm run test:errors && npm run test:sandbox && npm run test:domain && npm run test:design && npm run test:heal && npm run test:markitdown && npm run test:export && npm run test:eval && npm run test:dbexport && npm run test:exemplars && npm run test:metrics && npm run test:report && npm run test:slides && npm run test:security && npm run test:auth && npm run test:tenancy && npm run test:ratelimit && npm run test:designrag && npm run test:deck-edit && npm run test:t2sql-guard && npm run test:t2sql-planner && npm run test:db-conn && npm run test:conversational && npm run test:source-chat",
+    "test": "npm run test:errors && npm run test:sandbox && npm run test:domain && npm run test:design && npm run test:heal && npm run test:markitdown && npm run test:export && npm run test:eval && npm run test:dbexport && npm run test:exemplars && npm run test:metrics && npm run test:report && npm run test:slides && npm run test:security && npm run test:auth && npm run test:tenancy && npm run test:ratelimit && npm run test:designrag && npm run test:deck-edit && npm run test:t2sql-guard && npm run test:t2sql-planner && npm run test:db-conn && npm run test:conversational && npm run test:source-chat && npm run test:analyst",
     "test:heal": "tsx bff/heal.test.ts",
     "test:errors": "tsx shared/errors.test.ts",
     "test:report": "tsx bff/report.test.ts",
@@ -55,7 +55,8 @@
     "test:t2sql-planner": "tsx bff/text2sql/planner.test.ts",
     "test:db-conn": "tsx bff/sources/db-conn.test.ts",
     "test:conversational": "tsx bff/dashboard/conversational.test.ts",
-    "test:source-chat": "tsx bff/text2sql/source-chat.test.ts"
+    "test:source-chat": "tsx bff/text2sql/source-chat.test.ts",
+    "test:analyst": "tsx bff/text2sql/analyst.test.ts"
   },
   "dependencies": {
     "@codesandbox/sandpack-react": "^2.20.0",
