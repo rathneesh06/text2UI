@@ -35,6 +35,10 @@ export async function handleDashboardBuild(
   const directive = analystDirective
     ?? briefToAnalyticalDirective(b.brief)
     ?? await rewritePrompt({ datasets, userPrompt: b.userPrompt, ...(currentSpec ? { currentSpec } : {}) });
+  // al4 diagnostic: WHICH directive reached the spec planner. If a workbench
+  // build logs "brief"/"rewriter" instead of "analyst evidence", the evidence
+  // was dropped on the way (that produced duplicate count(*) KPIs pre-al4).
+  console.log(`[dashboard] directive: ${analystDirective ? `analyst evidence (${analystDirective.length} chars)` : briefToAnalyticalDirective(b.brief) ? "orchestrator brief" : directive ? "query rewriter" : "none"}`);
 
   const planOnce = (extra?: string) => planner({
     datasets,

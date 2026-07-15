@@ -220,7 +220,11 @@ export default function WorkbenchPage({ onUseWorkbenchSource, pgOnly = false }: 
     if (r.intent === "build" && r.handoff && onUseWorkbenchSource) {
       // Hand off to the existing pipeline: preselect the source, carry the prompt.
       onUseWorkbenchSource(r.handoff, r.handoff.buildPrompt);
-      navigate("/");
+      // al4: go STRAIGHT to the build page. The old landing-page detour made the
+      // user retype the prompt, which rebuilt without the buildPrompt AND wiped
+      // the analyst evidence (fresh landing builds clear the directive by
+      // design). ChatPage auto-starts from initialPrompt + consumes the directive.
+      navigate("/build");
     }
   }, [onUseWorkbenchSource, navigate, rememberConv]);
 
@@ -470,7 +474,7 @@ export default function WorkbenchPage({ onUseWorkbenchSource, pgOnly = false }: 
                   <button
                     type="button"
                     className="wb-btn wb-btn--source"
-                    onClick={() => { onUseWorkbenchSource?.(t.extracted!); navigate("/"); }}
+                    onClick={() => { onUseWorkbenchSource?.(t.extracted!); navigate("/build"); }}
                   >
                     ◈ Build with “{t.extracted.label}” →
                   </button>
