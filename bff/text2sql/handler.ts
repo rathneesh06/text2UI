@@ -162,6 +162,13 @@ export async function handleSourceChat(body: unknown, tenantId: string, deps: Sq
     if (!src || src.tenantId !== tenantId) return { status: 404, body: { error: "unknown source" } };
     tables = src.tables;
     runQuery = (sql) => wbQuery(projectId, sql, { rowCap: 500, timeoutMs: 20_000 }).then((r) => r.rows);
+  } else if (projectId.startsWith(LIVE_PREFIX)) {
+    // al2: live source — data questions answered straight from the live DB
+    // through the same views the dashboard's widgets use.
+    const rec = getConnection(tenantId, projectId.slice(LIVE_PREFIX.length));
+    if (!rec) return { status: 410, body: { error: "live connection expired — reconnect to the database" } };
+    tables = rec.datasets;
+    runQuery = async (sql) => { await ensureLiveViews(rec); return runOnLiveAttach(rec, sql, 20_000); };
   } else {
     return bad("projectId must be a published workbench source or the colo snapshot");
   }
@@ -374,6 +381,38 @@ export async function handleSqlChat(body: unknown, tenantId: string, deps: SqlHa
           console.warn(`[analyst] failed -> plain build handoff: ${err?.message ?? err}`);
         }
       }
+      // al2 (flag-gated): FULLY-LIVE source — skip storage entirely. Widgets
+      // query the live DB through per-table views; nothing survives a restart.
+      // Setup failure falls back to the snapshot path below (the product keeps
+      // working; the log says why the live path was skipped).
+      if (LIVE_SOURCE_ENABLED()) {
+        try {
+          const want = plan.tables?.length ? plan.tables : rec.datasets.map((d) => d.tableName);
+          let liveDatasets = await profileTables(rec, want).catch(() => [] as Dataset[]);
+          if (!liveDatasets.length) liveDatasets = rec.datasets;
+          if (!liveDatasets.length) throw new Error("no profiled tables on this connection");
+          await ensureLiveViews(rec);
+          const okCount = analysis ? analysis.findings.filter((f) => f.ok).length : 0;
+          const answer =
+            (okCount ? `I ran ${okCount} analysis quer${okCount === 1 ? "y" : "ies"} against the live database and ` : "I've ") +
+            `wired ${liveDatasets.map((t) => t.tableName).join(", ")} as a LIVE source — nothing is stored; the widgets ` +
+            `query the database directly — handing off to the ${plan.artifact === "ppt" ? "deck" : "dashboard"} builder…`;
+          return reply({
+            intent: "build", answer,
+            ...(analysis ? { analysis } : {}),
+            handoff: {
+              projectId: LIVE_PREFIX + rec.id,
+              label: `${rec.label} (live)`,
+              tables: liveDatasets.map((d) => ({ tableName: d.tableName, profile: d.profile })),
+              artifact: plan.artifact ?? "dashboard",
+              buildPrompt: plan.buildPrompt?.trim() || prompt,
+              ...(evidence ? { evidence } : {}),
+            },
+          });
+        } catch (err: any) {
+          console.warn(`[live-source] setup failed -> falling back to snapshot: ${err?.message ?? err}`);
+        }
+      }
       // Snapshot next (production is read once for the artifact's runtime —
       // the rendered dashboard queries the durable snapshot, not the live DB),
       // then hand the client everything it needs to drive the EXISTING pipeline.
@@ -424,6 +463,68 @@ async function runOnLiveAttach(rec: ConnRecord, sql: string, timeoutMs = QUERY_T
     closeConnectionHandle(rec);
     return attempt();
   }
+}
+
+// ---- al2: fully-live sources ("live_<connectionId>") --------------------------------
+// NOTHING is stored: the dashboard's compiled SQL (FROM "table") resolves through
+// CREATE OR REPLACE VIEWs on the connection's in-memory attach, and every widget
+// query runs against the LIVE database. The source dies with the connection
+// (BFF restart / TTL) — by design; a 410 tells the client to reconnect.
+export const LIVE_PREFIX = "live_";
+const LIVE_SOURCE_ENABLED = () => (process.env.T2SQL_LIVE_SOURCE ?? "0") === "1";
+const viewsApplied = new WeakSet<object>();
+
+function liveViewDefs(rec: ConnRecord): { name: string; ref: string }[] {
+  const refs = new Map(rec.allTables.map((t) => [t.name, t.ref] as const));
+  return rec.datasets.flatMap((d) => {
+    const ref = refs.get(d.tableName);
+    return ref ? [{ name: d.tableName, ref }] : [];
+  });
+}
+
+/** Idempotent per handle: a FRESH attach (retry after a dropped TCP) gets the
+ *  views re-applied automatically before the next query runs. */
+async function ensureLiveViews(rec: ConnRecord): Promise<void> {
+  const h = await getHandle(rec);
+  if (viewsApplied.has(h)) return;
+  for (const v of liveViewDefs(rec)) {
+    await h.run(`CREATE OR REPLACE VIEW main.${qid(v.name)} AS SELECT * FROM ${v.ref}`, 10_000, `live view ${v.name}`);
+  }
+  viewsApplied.add(h);
+}
+
+/** Runtime executor for live sources — the /api/query branch for "live_…" ids.
+ *  Guarded, capped, timed out, one fresh-handle retry (views re-applied). */
+export async function liveQuery(
+  tenantId: string,
+  projectId: string,
+  sql: string,
+  opts: { rowCap?: number; timeoutMs?: number } = {},
+): Promise<{ rows: Record<string, unknown>[]; truncated: boolean }> {
+  const connId = projectId.startsWith(LIVE_PREFIX) ? projectId.slice(LIVE_PREFIX.length) : projectId;
+  const rec = getConnection(tenantId, connId);
+  if (!rec) throw new Error("live connection expired — reconnect to the database and rebuild the dashboard");
+  const rowCap = opts.rowCap ?? 10_000;
+  const guarded = guardSelect(sql, rowCap);
+  if (!guarded.ok) throw new Error(guarded.error);
+  const timeoutMs = opts.timeoutMs ?? QUERY_TIMEOUT_MS;
+  const attempt = async () => {
+    await ensureLiveViews(rec);
+    const h = await getHandle(rec);
+    return Promise.race([
+      h.readAll(guarded.sql, "live widget query"),
+      new Promise<never>((_, reject) => setTimeout(() => reject(new Error(`query exceeded ${timeoutMs}ms`)), timeoutMs).unref?.()),
+    ]);
+  };
+  let rows: Record<string, unknown>[];
+  try {
+    rows = await attempt();
+  } catch {
+    closeConnectionHandle(rec);
+    try { rows = await attempt(); } catch (err2) { markExecution(rec, false); throw err2; }
+  }
+  markExecution(rec, true);
+  return { rows: rows.slice(0, rowCap), truncated: rows.length > rowCap };
 }
 
 export { profileTables }; // re-export for the schema-expansion route, if added later

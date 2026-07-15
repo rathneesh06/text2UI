@@ -25,6 +25,10 @@ async function request<T>(endpoint: string, options: RequestInit = {}): Promise<
 /** The projectId prefix the BFF uses for extracted workbench sources. */
 export const WB_PREFIX = "wb_";
 export const isWorkbenchProject = (projectId: string) => projectId.startsWith(WB_PREFIX);
+/** al2: fully-live sources — widgets query the live DB; nothing stored, gone on BFF restart. */
+export const isLiveProject = (projectId: string) => projectId.startsWith("live_");
+/** Any server-managed source (snapshot or live): tables live on the BFF, not in this tab. */
+export const isServerSource = (projectId: string) => isWorkbenchProject(projectId) || isLiveProject(projectId);
 
 export interface WbConnection {
   connectionId: string;

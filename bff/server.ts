@@ -20,7 +20,7 @@ import { buildExportZip, buildConnectedZip } from "./export";
 import { generateReport } from "./report";
 import { COLO_PROJECT_ID, COLO_LABEL, coloAvailable, coloProfiles, coloQuery } from "./sources/colo";
 import { isWorkbenchProject, listWorkbenchSources, wbQuery, removeWorkbenchSource } from "./sources/workbench-store";
-import { handleSqlConnect, handleSqlSchema, handleSqlChat, handleSqlExtract, handleSqlExtractDb, handleSqlStageGet, handleSqlStageDiscard, handleSourceChat, handleCombineSources } from "./text2sql/handler";
+import { handleSqlConnect, handleSqlSchema, handleSqlChat, handleSqlExtract, handleSqlExtractDb, handleSqlStageGet, handleSqlStageDiscard, handleSourceChat, handleCombineSources, liveQuery, LIVE_PREFIX } from "./text2sql/handler";
 import { handleDashboardBuild } from "./dashboard/handler";
 import { handleDeckBuild, handleDeckEdit } from "./deck/handler";
 import { loadRows } from "./deck/local-data";
@@ -501,6 +501,20 @@ export async function handleQuery(
       return { status: 400, body: { error: err?.message ?? "query failed" } };
     }
   }
+  // Live sources ("live_…", al2): the dashboard queries the LIVE database
+  // through the connection registry — nothing stored, dies with the connection.
+  // 410 = the connection expired/BFF restarted: the client should reconnect.
+  if (projectId.startsWith(LIVE_PREFIX)) {
+    try {
+      const result = await liveQuery(tenantId, projectId, sql, { rowCap: cap, timeoutMs: QUERY_TIMEOUT_MS });
+      return { status: 200, body: result };
+    } catch (err: any) {
+      const msg = String(err?.message ?? "query failed");
+      const gone = /expired/i.test(msg);
+      if (!gone) console.warn(`[live] query failed: ${msg}\n  SQL: ${sql}`);
+      return { status: gone ? 410 : 400, body: { error: msg } };
+    }
+  }
   // Workbench extracts ("wb_…"): query the per-source snapshot, exactly like colo.
   if (isWorkbenchProject(projectId)) {
     try {
@@ -884,6 +898,10 @@ export function createServer() {
       } else if (isWorkbenchProject(String(body.projectId ?? ""))) {
         const wbId = String(body.projectId);
         query = (sql: string) => wbQuery(wbId, sql, { rowCap: 5000, timeoutMs: QUERY_TIMEOUT_MS }).then((r) => r.rows);
+      } else if (String(body.projectId ?? "").startsWith(LIVE_PREFIX)) {
+        const liveId = String(body.projectId);
+        const tenant = req.tenantId ?? DEV_TENANT;
+        query = (sql: string) => liveQuery(tenant, liveId, sql, { rowCap: 5000, timeoutMs: QUERY_TIMEOUT_MS }).then((r) => r.rows);
       }
 
       // Prepend document prose as grounded context for the planners.

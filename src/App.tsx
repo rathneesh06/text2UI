@@ -16,7 +16,7 @@ import StyleGuidePage from "./pages/StyleGuidePage";
 import WorkbenchPage from "./pages/WorkbenchPage";
 import { assignTableNames, ingestFile, newId, type Source, type Table } from "./lib/datasets";
 import { COLO_PROJECT_ID, listSources, sourceTablesToTables, type SourceInfo } from "./api";
-import { isWorkbenchProject, wbDeleteSource, wbDiscardStage, wbCombineSources, type WbExtracted } from "./workbench-api";
+import { isWorkbenchProject, isLiveProject, isServerSource, wbDeleteSource, wbDiscardStage, wbCombineSources, type WbExtracted } from "./workbench-api";
 import "./index.css";
 
 export type ProjectMeta = {
@@ -84,7 +84,7 @@ function AppRoutes() {
   // Workbench extracts (text2SQL) — served by the BFF just like colo, listed by
   // the same /api/sources call, selectable as build sources.
   const [wbSources, setWbSources] = useState<SourceInfo[]>([]);
-  const wbActive = isWorkbenchProject(projectId);
+  const wbActive = isServerSource(projectId);   // wb_ snapshots AND live_ sources resolve tables from wbSources
   const pendingName = useRef<string | null>(null);
 
   const tables = useMemo(() => {
@@ -121,7 +121,7 @@ function AppRoutes() {
   useEffect(() => {
     try {
       sessionStorage.setItem("t2ui:proj", projectId);
-      if (projectId !== COLO_PROJECT_ID && !isWorkbenchProject(projectId)) sessionStorage.setItem("t2ui:sources", JSON.stringify(sources));
+      if (projectId !== COLO_PROJECT_ID && !isServerSource(projectId)) sessionStorage.setItem("t2ui:sources", JSON.stringify(sources));
     } catch { /* quota (very large uploads) — colo + small uploads still persist */ }
   }, [projectId, sources]);
 
@@ -220,7 +220,7 @@ function AppRoutes() {
     // source (old data + new data) and the build continues over the union.
     const active = isWorkbenchProject(projectId) ? wbSources.find((w) => w.projectId === projectId) : null;
     const alreadyIn = active && (active.projectId === src.projectId || active.components?.includes(src.projectId));
-    if (active && !alreadyIn) {
+    if (active && !alreadyIn && !isLiveProject(src.projectId) && !isLiveProject(active.projectId)) {
       try {
         const combined = await wbCombineSources({ projectIds: [active.projectId, src.projectId] });
         src = { id: combined.projectId, label: combined.label, projectId: combined.projectId, tables: combined.tables, ...(combined.components ? { components: combined.components } : {}) };

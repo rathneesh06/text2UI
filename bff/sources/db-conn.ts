@@ -17,6 +17,7 @@ import {
   parseMysqlUrl, attachMysql, introspectMysql, qstr, qid, duckTypeToColumnType,
   type MysqlConn, type AttachHandle, type AttachOptions, type IntrospectOptions,
 } from "./mysql";
+export type { AttachHandle } from "./mysql"; // engine-agnostic façade re-export (tests + callers)
 import type { ColumnProfile, Dataset } from "../../shared/types";
 
 export type Dialect = "mysql" | "postgres";

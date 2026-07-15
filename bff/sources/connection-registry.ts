@@ -109,6 +109,13 @@ export async function openConnectionWith(
   return rec;
 }
 
+/** Register a prebuilt record (used by openConnectionWith; exported as the test
+ *  seam for live-source tests, which register a record with a fake handle). */
+export function registerConnection(rec: ConnRecord): ConnRecord {
+  records.set(rec.id, rec);
+  return rec;
+}
+
 /** Tenant-scoped lookup. Returns null (never throws) for missing/foreign ids. */
 export function getConnection(tenantId: string, id: string): ConnRecord | null {
   sweep();

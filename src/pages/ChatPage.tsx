@@ -221,7 +221,7 @@ export default function ChatPage({
       const access = REMOTE_DATA ? { dataAccess: "remote" as const } : {};
       // Server-side sources (colo + workbench extracts) keep their data on the BFF —
       // the client never ships rows; runtime queries route by projectId.
-      const isColo = projectId === COLO_PROJECT_ID || projectId.startsWith("wb_");
+      const isColo = projectId === COLO_PROJECT_ID || projectId.startsWith("wb_") || projectId.startsWith("live_");
       // For uploaded data, send the rows so the deck pipeline can resolve charts server-side.
       const rows = isColo ? undefined : tables.map((t) => ({ tableName: t.tableName, rows: t.ingest.rows }));
 
@@ -237,7 +237,7 @@ export default function ChatPage({
       let enhancedPrompt = prompt;
       // Server-side sources (colo + published extracts) can ANSWER data questions
       // by querying their snapshot — the conversational join of the two pipelines.
-      const serverSource = projectId === COLO_PROJECT_ID || projectId.startsWith("wb_");
+      const serverSource = projectId === COLO_PROJECT_ID || projectId.startsWith("wb_") || projectId.startsWith("live_");
       const answerInstead = async (reply: string, dataQuestion?: boolean) => {
         if (dataQuestion && serverSource) {
           append("Looking that up in the data…");
