@@ -19,7 +19,7 @@
 import { getChatStore, type ChatStore } from "../chat-store";
 import {
   openConnection, openConnectionWith, getConnection, getHandle, closeConnectionHandle, publicView, profileTables,
-  markExecution, type ConnRecord,
+  markExecution, openGroup, type ConnRecord, type GroupPart,
 } from "../sources/connection-registry";
 import { connFromParts, type DbConnParts } from "../sources/db-conn";
 import {
@@ -72,6 +72,18 @@ export async function handleSqlConnect(body: unknown, tenantId: string): Promise
     const rec = hasParts
       ? await openConnectionWith(tenantId, connFromParts(b.parts as DbConnParts))
       : await openConnection(tenantId, b.connectionString);
+    // al3: addTo binds this database with an existing connection (or group) into
+    // ONE group record — merged schema, one attach, cross-DB joins. The chat,
+    // analyst, and live source then run over the union via the group's id.
+    if (typeof b.addTo === "string" && b.addTo.trim()) {
+      const base = getConnection(tenantId, b.addTo.trim());
+      if (!base) return { status: 404, body: { error: "the connection to add to is unknown or expired — reconnect it first" } };
+      const asPart = (r: ConnRecord): GroupPart[] =>
+        r.groupParts?.length ? r.groupParts : [{ conn: r.conn, label: r.label, allTables: r.allTables, datasets: r.datasets }];
+      const group = openGroup(tenantId, [...asPart(base), ...asPart(rec)]);
+      console.log(`[text2sql] grouped ${group.groupParts!.length} databases as ${group.id}`);
+      return { status: 200, body: publicView(group) };
+    }
     return { status: 200, body: publicView(rec) };
   } catch (err: any) {
     // Bad input / failed handshake / timeout — user-actionable, so a 400 with the message.
@@ -391,7 +403,19 @@ export async function handleSqlChat(body: unknown, tenantId: string, deps: SqlHa
           let liveDatasets = await profileTables(rec, want).catch(() => [] as Dataset[]);
           if (!liveDatasets.length) liveDatasets = rec.datasets;
           if (!liveDatasets.length) throw new Error("no profiled tables on this connection");
+          // al3: analyst findings become live views (cross-DB joins included) so
+          // the dashboard can render the joined numbers at runtime.
+          let findingDatasets: Dataset[] = [];
+          if (analysis) {
+            findingDatasets = await materializeFindings(rec, analysis.findings as any).catch(() => [] as Dataset[]);
+            if (findingDatasets.length && evidence) {
+              evidence += `\nLIVE FINDING TABLES — each finding above is also available as a live table (a view that re-executes its query, joins included): ` +
+                findingDatasets.map((d) => `${(d.profile.source.filename ?? "").replace("live finding: ", "")} → "${d.tableName}"`).join("; ") +
+                `. PREFER these exact tables for widgets that should reproduce the findings.`;
+            }
+          }
           await ensureLiveViews(rec);
+          liveDatasets = [...liveDatasets, ...findingDatasets];
           const okCount = analysis ? analysis.findings.filter((f) => f.ok).length : 0;
           const answer =
             (okCount ? `I ran ${okCount} analysis quer${okCount === 1 ? "y" : "ies"} against the live database and ` : "I've ") +
@@ -472,7 +496,7 @@ async function runOnLiveAttach(rec: ConnRecord, sql: string, timeoutMs = QUERY_T
 // (BFF restart / TTL) — by design; a 410 tells the client to reconnect.
 export const LIVE_PREFIX = "live_";
 const LIVE_SOURCE_ENABLED = () => (process.env.T2SQL_LIVE_SOURCE ?? "0") === "1";
-const viewsApplied = new WeakSet<object>();
+const viewsApplied = new WeakMap<object, number>();
 
 function liveViewDefs(rec: ConnRecord): { name: string; ref: string }[] {
   const refs = new Map(rec.allTables.map((t) => [t.name, t.ref] as const));
@@ -486,11 +510,68 @@ function liveViewDefs(rec: ConnRecord): { name: string; ref: string }[] {
  *  views re-applied automatically before the next query runs. */
 async function ensureLiveViews(rec: ConnRecord): Promise<void> {
   const h = await getHandle(rec);
-  if (viewsApplied.has(h)) return;
+  const version = rec.viewsVersion ?? 0;
+  if (viewsApplied.get(h) === version) return;
   for (const v of liveViewDefs(rec)) {
     await h.run(`CREATE OR REPLACE VIEW main.${qid(v.name)} AS SELECT * FROM ${v.ref}`, 10_000, `live view ${v.name}`);
   }
-  viewsApplied.add(h);
+  // al3: materialized analyst findings — live JOIN views (cross-DB included),
+  // re-applied on fresh handles and re-issued whenever a build replaces them.
+  for (const v of rec.extraViews ?? []) {
+    await h.run(`CREATE OR REPLACE VIEW main.${qid(v.name)} AS ${v.sql}`, 10_000, `finding view ${v.name}`);
+  }
+  viewsApplied.set(h, version);
+}
+
+const viewSlug = (s: string) =>
+  s.toLowerCase().replace(/[^a-z0-9]+/g, "_").replace(/^_+|_+$/g, "").slice(0, 48) || "finding";
+
+/** al3: turn each successful analyst finding into a LIVE view on the attach, so
+ *  widgets can render cross-DB joined numbers at runtime (the view re-executes
+ *  the join on every render — live, zero storage). Returns the view datasets
+ *  (profiled from the live view) for the build handoff. Fail-soft per finding. */
+async function materializeFindings(
+  rec: ConnRecord,
+  findings: { id: string; ok: boolean; question: string; sql: string }[],
+): Promise<Dataset[]> {
+  const h = await getHandle(rec);
+  const out: Dataset[] = [];
+  const defs: { name: string; sql: string }[] = [];
+  const taken = new Set(rec.datasets.map((d) => d.tableName));
+  for (const f of findings) {
+    if (!f.ok) continue;
+    let name = viewSlug(f.question);
+    for (let n = 2; taken.has(name); n++) name = `${viewSlug(f.question)}_${n}`;
+    try {
+      await h.run(`CREATE OR REPLACE VIEW main.${qid(name)} AS ${f.sql}`, 15_000, `finding view ${name}`);
+      const sample = await h.readAll(`SELECT * FROM main.${qid(name)} LIMIT 5`, `sample ${name}`);
+      const cnt = await h.readAll(`SELECT count(*) AS n FROM main.${qid(name)}`, `count ${name}`);
+      const columns = Object.keys(sample[0] ?? {}).map((col) => ({
+        name: col,
+        type: typeof sample[0]?.[col] === "number" ? "number" : "string",
+        nullable: sample.some((r) => r[col] == null),
+        uniqueCount: new Set(sample.map((r) => String(r[col]))).size,
+        sampleValues: sample.map((r) => r[col]).filter((v) => v != null).slice(0, 5),
+      }));
+      if (!columns.length) continue;
+      taken.add(name);
+      defs.push({ name, sql: f.sql });
+      out.push({
+        tableName: name,
+        profile: {
+          source: { filename: `live finding: ${f.id}`, format: "json" },
+          rowCount: Number((cnt[0] as any)?.n ?? sample.length),
+          columns: columns as any,
+          sampleRows: sample,
+        },
+      } as Dataset);
+    } catch (err: any) {
+      console.warn(`[live-source] finding view ${name} failed: ${err?.message ?? err}`);
+    }
+  }
+  rec.extraViews = defs;
+  rec.viewsVersion = (rec.viewsVersion ?? 0) + 1;
+  return out;
 }
 
 /** Runtime executor for live sources — the /api/query branch for "live_…" ids.

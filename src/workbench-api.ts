@@ -37,6 +37,8 @@ export interface WbConnection {
   allTables: { name: string; approxRows: number; schema?: string; ref?: string }[];
   datasets: Dataset[];
   warnings: string[];
+  /** al3: present when this "connection" is a GROUP of databases. */
+  members?: string[];
 }
 
 export interface WbExtracted {
@@ -73,10 +75,12 @@ export interface WbChatResponse {
 
 /** Connect + introspect. The connection string is sent once over the wire and the
  *  BFF never echoes credentials back. */
-export function wbConnect(connectionString: string): Promise<WbConnection> {
+export function wbConnect(connectionString: string, addTo?: string): Promise<WbConnection> {
   return request<WbConnection>("/api/sql/connect", {
     method: "POST",
-    body: JSON.stringify({ connectionString }),
+    // al3: addTo binds this DB with an existing connection/group into ONE group
+    // (merged schema, cross-DB joins) — the response's connectionId is the group.
+    body: JSON.stringify({ connectionString, ...(addTo ? { addTo } : {}) }),
   });
 }
 

@@ -15,7 +15,7 @@ import { randomUUID } from "node:crypto";
 import { Socket } from "node:net";
 import type { AttachHandle } from "./mysql";
 import {
-  parseDbUrl, describeDbConn, introspectDb, attachDb,
+  parseDbUrl, describeDbConn, introspectDb, attachDb, attachGroup,
   type DbConn, type DbTableInfo,
 } from "./db-conn";
 import type { Dataset } from "../../shared/types";
@@ -35,6 +35,21 @@ export interface ConnRecord {
   consecutiveFailures: number;
   handle?: AttachHandle;                             // lazy live attach for queries
   handleP?: Promise<AttachHandle>;                   // in-flight open (dedupes concurrent first queries)
+  /** al3: connection GROUP — several databases attached into one instance as
+   *  src0, src1, … so queries can JOIN across them. Self-sufficient: the group
+   *  holds member credentials + schemas and lives its own TTL. */
+  groupParts?: GroupPart[];
+  /** al2/al3: extra live views (materialized analyst findings) re-applied on
+   *  every fresh handle; bump viewsVersion whenever these change. */
+  extraViews?: { name: string; sql: string }[];
+  viewsVersion?: number;
+}
+
+export interface GroupPart {
+  conn: DbConn;
+  label: string;
+  allTables: DbTableInfo[];
+  datasets: Dataset[];
 }
 
 const TTL_MS = Number(process.env.WB_CONN_TTL_MS ?? 4 * 3_600_000); // 4h idle default
@@ -116,6 +131,54 @@ export function registerConnection(rec: ConnRecord): ConnRecord {
   return rec;
 }
 
+/** al3: merge member schemas into one namespace. Aliases follow member order
+ *  (src0, src1, …); table-name collisions get _2/_3 suffixes, and datasets are
+ *  renamed in lockstep so views, planner, and widgets all agree on the names. */
+export function mergeGroupParts(parts: GroupPart[]): { allTables: DbTableInfo[]; datasets: Dataset[] } {
+  const taken = new Set<string>();
+  const allTables: DbTableInfo[] = [];
+  const datasets: Dataset[] = [];
+  parts.forEach((p, i) => {
+    const rename = new Map<string, string>();
+    for (const t of p.allTables) {
+      let name = t.name;
+      for (let n = 2; taken.has(name); n++) name = `${t.name}_${n}`;
+      taken.add(name);
+      rename.set(t.name, name);
+      allTables.push({ ...t, name, ref: `src${i}."${t.schema}"."${t.table}"` });
+    }
+    for (const d of p.datasets) {
+      const name = rename.get(d.tableName) ?? d.tableName;
+      datasets.push(name === d.tableName ? d : { ...d, tableName: name });
+    }
+  });
+  return { allTables, datasets };
+}
+
+/** al3: bind several already-introspected databases into ONE group record that
+ *  walks and talks like a connection — every downstream consumer (grounding,
+ *  analyst, live views, liveQuery, source-chat) works over the union unchanged. */
+export function openGroup(tenantId: string, parts: GroupPart[]): ConnRecord {
+  if (parts.length < 2) throw new Error("a connection group needs at least two databases");
+  const merged = mergeGroupParts(parts);
+  const rec: ConnRecord = {
+    id: "grp_" + randomUUID().replace(/-/g, "").slice(0, 12),
+    tenantId,
+    conn: parts[0].conn, // placeholder for shape; groups attach via groupParts
+    label: parts.map((p) => p.label).join(" + "),
+    createdAt: Date.now(),
+    lastUsed: Date.now(),
+    allTables: merged.allTables,
+    datasets: merged.datasets,
+    warnings: [],
+    status: "active",
+    consecutiveFailures: 0,
+    groupParts: parts,
+  };
+  records.set(rec.id, rec);
+  return rec;
+}
+
 /** Tenant-scoped lookup. Returns null (never throws) for missing/foreign ids. */
 export function getConnection(tenantId: string, id: string): ConnRecord | null {
   sweep();
@@ -130,7 +193,10 @@ export function getConnection(tenantId: string, id: string): ConnRecord | null {
 export async function getHandle(rec: ConnRecord): Promise<AttachHandle> {
   if (rec.handle) return rec.handle;
   if (!rec.handleP) {
-    rec.handleP = attachDb(rec.conn, {})
+    const open = rec.groupParts?.length
+      ? attachGroup(rec.groupParts.map((p) => p.conn), {})
+      : attachDb(rec.conn, {});
+    rec.handleP = open
       .then((h) => { rec.handle = h; return h; })
       .catch((e) => { rec.handleP = undefined; throw e; }); // don't cache failures
   }
@@ -162,6 +228,7 @@ export function publicView(rec: ConnRecord) {
     allTables: rec.allTables,
     datasets: rec.datasets,
     warnings: rec.warnings,
+    ...(rec.groupParts ? { members: rec.groupParts.map((g) => g.label) } : {}),
   };
 }
 

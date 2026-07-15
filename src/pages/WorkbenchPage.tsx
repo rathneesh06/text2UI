@@ -167,9 +167,20 @@ export default function WorkbenchPage({ onUseWorkbenchSource, pgOnly = false }: 
     if (manual && (!pg.host.trim() || !pg.database.trim())) { setConnError("host and database are required"); return; }
     setConnecting(true); setConnError(null);
     try {
-      const c = manual
+      // al3: MULTIPLE connection strings (one per line) become ONE connection
+      // GROUP — merged schema, cross-DB joins. Sequential connects: the first
+      // opens normally, each next line is added to the running group.
+      // Separator: ';' or newline — never legal inside mysql://, postgres://,
+      // or key=value connection forms, so splitting is unambiguous.
+      const lines = connStr.split(/[;\n]+/).map((l) => l.trim()).filter(Boolean);
+      let c = manual
         ? await wbConnectParts({ ...pg, dialect: "postgres" })
-        : await wbConnect(pgOnly ? normalizePgString(connStr) : connStr.trim());
+        : await wbConnect(pgOnly ? normalizePgString(lines[0]) : lines[0]);
+      if (!manual) {
+        for (const line of lines.slice(1)) {
+          c = await wbConnect(pgOnly ? normalizePgString(line) : line, c.connectionId);
+        }
+      }
       setConn(c); setSelected(new Set()); setTurns([]); setConversationId(null);
       // never keep credentials in component state longer than needed
       setConnStr("");
@@ -289,7 +300,7 @@ export default function WorkbenchPage({ onUseWorkbenchSource, pgOnly = false }: 
                 className="wb-conninput"
                 type="password"
                 autoComplete="off"
-                placeholder="postgres://user:pass@host:5432/db   (encoded passwords like %40 are decoded; scheme optional)"
+                placeholder="postgres://user:pass@host:5432/db — separate MULTIPLE databases with ';' to connect them as one group (cross-DB joins)"
                 value={connStr}
                 onChange={(e) => setConnStr(e.target.value)}
                 onKeyDown={(e) => e.key === "Enter" && connect()}

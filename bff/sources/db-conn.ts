@@ -209,6 +209,72 @@ export async function attachDb(conn: DbConn, opts: AttachOptions = {}): Promise<
   } };
 }
 
+/** al3: attach SEVERAL engines READ_ONLY into ONE DuckDB instance as src0,
+ *  src1, … so a single query can JOIN across databases — the cross-DB
+ *  dependency case (values in one DB resolved by tables in another).
+ *  Extensions install/load once per dialect; each member gets its own SECRET.
+ *  Same close discipline as attachDb (al1h): connection AND instance. */
+export async function attachGroup(members: DbConn[], opts: AttachOptions = {}): Promise<AttachHandle> {
+  if (!members.length) throw new Error("attachGroup needs at least one member");
+  const log = opts.onPhase ?? (() => {});
+  const installMs = opts.installTimeoutMs ?? 90_000;
+  const attachMs = opts.attachTimeoutMs ?? 25_000;
+  const queryMs = opts.queryTimeoutMs ?? 30_000;
+  const { DuckDBInstance } = await import("@duckdb/node-api");
+  const instance = await DuckDBInstance.create(":memory:");
+  const c = await instance.connect();
+  const readAll = async (sql: string, label: string) => {
+    const reader = await withTimeout(c.runAndReadUntil(sql, 1_000_000), queryMs, label);
+    return (reader.getRowObjectsJS() as Record<string, unknown>[]).map((row) => {
+      for (const k in row) if (typeof row[k] === "bigint") row[k] = Number(row[k]);
+      return row;
+    });
+  };
+  const run = (sql: string, ms: number, label: string) => withTimeout(c.run(sql), ms, label).then(() => undefined);
+
+  const ensureExt = async (ext: "mysql" | "postgres") => {
+    let installed = false;
+    try {
+      const r = await readAll(`SELECT installed FROM duckdb_extensions() WHERE extension_name = '${ext}'`, "extension check");
+      installed = r.length > 0 && Boolean((r[0] as any).installed);
+    } catch { /* fall through to INSTALL */ }
+    if (!installed) {
+      log(`installing the '${ext}' extension…`);
+      await run(`INSTALL ${ext}`, installMs, `INSTALL ${ext}`);
+    }
+    await run(`LOAD ${ext}`, 30_000, `LOAD ${ext}`);
+  };
+  const exts = new Set<"mysql" | "postgres">(members.map((m) => (m.dialect === "postgres" ? "postgres" : "mysql")));
+  for (const ext of exts) {
+    await ensureExt(ext);
+  }
+
+  for (let i = 0; i < members.length; i++) {
+    const m = members[i];
+    const secret = `t2ui_g${i}`;
+    log(`attaching ${m.dialect} ${m.host}:${m.port}/${m.database} as src${i} (READ_ONLY)…`);
+    if (m.dialect === "postgres") {
+      await c.run(
+        `CREATE OR REPLACE SECRET ${secret} (TYPE postgres, HOST ${qstr(m.host)}, PORT ${m.port}, ` +
+        `USER ${qstr(m.user)}, PASSWORD ${qstr(m.password)}, DATABASE ${qstr(m.database)});`,
+      );
+      await run(`ATTACH ${qstr(m.ssl ? "sslmode=require" : "")} AS src${i} (TYPE postgres, READ_ONLY, SECRET ${secret})`, attachMs, `ATTACH src${i} (Postgres)`);
+    } else {
+      await c.run(
+        `CREATE OR REPLACE SECRET ${secret} (TYPE mysql, HOST ${qstr(m.host)}, PORT ${m.port}, ` +
+        `USER ${qstr(m.user)}, PASSWORD ${qstr(m.password)}, DATABASE ${qstr(m.database)}` +
+        `${m.ssl ? `, SSL_MODE 'required'` : ""});`,
+      );
+      await run(`ATTACH '' AS src${i} (TYPE mysql, READ_ONLY, SECRET ${secret})`, attachMs, `ATTACH src${i} (MySQL)`);
+    }
+  }
+
+  return { instance, c, readAll, run, close: () => {
+    try { c.disconnectSync(); } catch { /* already disconnected */ }
+    try { (instance as any).closeSync?.(); } catch { /* already closed */ }
+  } };
+}
+
 /** Introspect either engine into one uniform result with exact SQL refs. */
 export async function introspectDb(conn: DbConn, opts: IntrospectOptions = {}): Promise<DbIntrospectResult> {
   if (conn.dialect === "mysql") {

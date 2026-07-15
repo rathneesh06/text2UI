@@ -70,6 +70,7 @@ Coverage requirements (a dashboard needs all of these unless the data genuinely 
 Rules for every sql:
 - Exactly ONE SELECT (WITH...SELECT is fine). NEVER any write, DDL, ATTACH, COPY, or PRAGMA.
 - Reference every table by the EXACT "SQL ref" shown in the schema (e.g. src."public"."orders"). Never invent tables or columns.
+- Tables may come from MULTIPLE attached databases (refs with different aliases: src0, src1, …). JOIN across them freely via their exact refs whenever a question needs values resolved in another database (e.g. ids in one DB, names/attributes in another).
 - DuckDB dialect regardless of source engine: date_trunc('day', col), count(*), double-quoted identifiers, no backticks, no engine-specific functions. For "last N days" use col >= current_date - INTERVAL N DAY.
 - Apply the discovered VALUE FILTERS below when the user's terms match cell values (e.g. WHERE "ticket_type" = 'SOS') — this is what makes the analysis about what the user asked.
 - Aggregate aggressively: return summaries (grouped counts, sums, series), never raw dumps. Keep every result under ~100 rows (trend series, top-10 rankings, single-row KPIs).
