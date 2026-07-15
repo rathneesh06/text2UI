@@ -24,7 +24,7 @@ import {
 import { connFromParts, type DbConnParts } from "../sources/db-conn";
 import {
   registerWorkbenchSource, getWorkbenchSource, wbSlug, wbDbPath,
-  stagingDbPath, addStaged, getStaged, finalizeStaged, discardStaged,
+  stagingDbPath, addStaged, getStaged, finalizeStaged, discardStaged, releaseInstance,
   type WorkbenchSource, type StagedState,
 } from "../sources/workbench-store";
 import { snapshotTables } from "../sources/db-conn";
@@ -99,6 +99,10 @@ async function stageSnapshot(
 ): Promise<{ staged: StagedState; warnings: string[]; skipped: string[] }> {
   const cleaned = [...new Set(tables.map((t) => String(t).trim()).filter(Boolean))];
   if (!cleaned.length) throw new Error("no tables to extract");
+  // Windows lock discipline: if this conversation's stage was already published
+  // and queried, the lazy query cache holds the file open — evict it before the
+  // snapshot writer opens the same file (re-extract into the same stage).
+  await releaseInstance(stagingDbPath(conversationId));
   // Same file every time -> tables append (CREATE OR REPLACE dedupes re-extracts).
   const result = await snapshotTables(rec.conn, { tables: cleaned, dbPath: stagingDbPath(conversationId) });
   const skipped: string[] = result.skipped;

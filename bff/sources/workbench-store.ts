@@ -120,7 +120,9 @@ const instances = new Map<string, Promise<DuckDBInstance>>();
 
 /** Close and evict the cached instance for a file (best-effort) — needed before
  *  another instance ATTACHes the same file (a hard lock conflict on Windows). */
-async function releaseInstance(dbPath: string): Promise<void> {
+/** Evict + close a cached instance for a db file (no-op if not cached). Writers
+ *  MUST call this before opening a file the query cache may hold (Windows locks). */
+export async function releaseInstance(dbPath: string): Promise<void> {
   const p = instances.get(dbPath);
   instances.delete(dbPath);
   if (p) { try { (await p).closeSync(); } catch { /* already closed */ } }

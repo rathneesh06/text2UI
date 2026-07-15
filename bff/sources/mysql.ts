@@ -226,7 +226,14 @@ export async function attachMysql(conn: MysqlConn, opts: AttachOptions = {}): Pr
   log(`attaching MySQL ${conn.host}:${conn.port}/${conn.database} (READ_ONLY)…`);
   await run(`ATTACH '' AS src (TYPE mysql, READ_ONLY, SECRET t2ui_mysql)`, attachMs, "ATTACH (MySQL handshake)");
 
-  return { instance, c, readAll, run, close: () => c.disconnectSync() };
+  return { instance, c, readAll, run, close: () => {
+    // Close the CONNECTION and the INSTANCE. Closing only the connection leaks
+    // the file handle: on Windows the snapshot's stage .duckdb stays locked by
+    // this process and every later open (runtime wbQuery) fails with
+    // "being used by another process". Same lesson as model.ts's closeSync.
+    try { c.disconnectSync(); } catch { /* already disconnected */ }
+    try { (instance as any).closeSync?.(); } catch { /* already closed */ }
+  } };
 }
 
 export async function introspectMysql(conn: MysqlConn, opts: IntrospectOptions = {}): Promise<IntrospectResult> {

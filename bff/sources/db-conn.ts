@@ -198,7 +198,14 @@ export async function attachDb(conn: DbConn, opts: AttachOptions = {}): Promise<
   const attachStr = conn.ssl ? "sslmode=require" : "";
   await run(`ATTACH ${qstr(attachStr)} AS src (TYPE postgres, READ_ONLY, SECRET t2ui_postgres)`, attachMs, "ATTACH (Postgres handshake)");
 
-  return { instance, c, readAll, run, close: () => c.disconnectSync() };
+  return { instance, c, readAll, run, close: () => {
+    // Close the CONNECTION and the INSTANCE. Closing only the connection leaks
+    // the file handle: on Windows the snapshot's stage .duckdb stays locked by
+    // this process and every later open (runtime wbQuery) fails with
+    // "being used by another process". Same lesson as model.ts's closeSync.
+    try { c.disconnectSync(); } catch { /* already disconnected */ }
+    try { (instance as any).closeSync?.(); } catch { /* already closed */ }
+  } };
 }
 
 /** Introspect either engine into one uniform result with exact SQL refs. */
