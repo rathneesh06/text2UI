@@ -19,7 +19,7 @@ import PromptInput from "../components/PromptInput";
 import Sandbox from "../components/Sandbox";
 import {
   orchestratePlan, generate, generateStream, generateReport, generatePpt, downloadBase64,
-  exportProject, buildDashboard, buildDeck, gateTurn, COLO_PROJECT_ID, REMOTE_DATA, BFF_URL,
+  exportProject, buildDashboard, buildDeck, gateTurn, uploadDatasets, COLO_PROJECT_ID, REMOTE_DATA, BFF_URL,
   type StreamEvent, type ReportResult, type PptResult,
 } from "../api";
 import { sourceChat } from "../workbench-api";
@@ -224,6 +224,13 @@ export default function ChatPage({
       const isColo = projectId === COLO_PROJECT_ID || projectId.startsWith("wb_") || projectId.startsWith("live_");
       // For uploaded data, send the rows so the deck pipeline can resolve charts server-side.
       const rows = isColo ? undefined : tables.map((t) => ({ tableName: t.tableName, rows: t.ingest.rows }));
+
+      // Remote-data mode: the sandbox queries /api/query, so the rows must live
+      // on the server BEFORE the app mounts. Colo/wb/live sources are already there.
+      if (REMOTE_DATA && !isColo && tables.length) {
+        append("Syncing your data to the server…");
+        await uploadDatasets(projectId, tables);
+      }
 
       // Step 1 — decide the turn's mode.
       // CRITICAL: if an artifact already exists, this turn is an EDIT of it. We keep the
