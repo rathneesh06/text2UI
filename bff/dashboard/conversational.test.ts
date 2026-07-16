@@ -4,7 +4,7 @@
 // orchestrator's respond intent + follow-up gate (all with fake model runners).
 import assert from "node:assert";
 import { planSpec } from "./planner";
-import { summarizeSpecChange, briefToStyleHints } from "./handler";
+import { summarizeSpecChange, briefToStyleHints, handleDashboardBuild } from "./handler";
 import { renderPlanToApp } from "./renderer";
 import { orchestrate, gateTurn } from "../orchestrator";
 import type { DashboardSpec } from "../../shared/dashboard-spec";
@@ -20,9 +20,14 @@ const datasets = [{
   },
 } as any];
 
+// NOTE (al5): these fixtures use the REAL widget shapes from shared/dashboard-spec
+// (flat chart kinds: "bar"/"line"/…, Metric.col, Dimension.col). They previously
+// used an invented {kind:"chart", chart:"bar"} shape cast through `as any`, which
+// let a broken coverage check pass its tests for months while never once firing
+// in production. Fixtures must mirror the type, or they test a fantasy.
 const specBody = (meta: any): any => ({
   meta,
-  sections: [{ title: "Main", widgets: [{ id: "w1", kind: "kpi", title: "Total revenue", metric: { agg: "sum", column: "revenue" }, table: "orders" }] }],
+  sections: [{ title: "Main", widgets: [{ id: "w1", kind: "kpi", title: "Total revenue", metric: { agg: "sum", col: "revenue" }, table: "orders" }] }],
 });
 
 // ---- planner sanitizes style fields deterministically -----------------------------
@@ -49,7 +54,7 @@ console.log("style sanitization ✅");
   assert.ok(first[0].includes("Built “Sales”") && first[0].includes("1 widget"), first[0]);
 
   const b: DashboardSpec = specBody({ title: "Sales", theme: "dark", accent: "#0d9488", chartPalette: ["#0d9488", "#5eead4"] });
-  b.sections[0].widgets.push({ id: "w2", kind: "chart", chart: "bar", title: "Revenue by region", table: "orders", x: { column: "region" }, series: [{ agg: "sum", column: "revenue" }] } as any);
+  b.sections[0].widgets.push({ id: "w2", kind: "bar", title: "Revenue by region", table: "orders", x: { col: "region" }, series: [{ agg: "sum", col: "revenue" }] } as any);
   const diff = summarizeSpecChange(a, b);
   const joined = diff.join(" ");
   assert.ok(joined.includes("dark theme"), joined);
@@ -70,6 +75,42 @@ console.log("change summaries ✅");
   assert.equal(briefToStyleHints({}), null);
 }
 console.log("brief→styleHints ✅");
+
+// ---- al5: the handler returns the spec that ACTUALLY RENDERED ----------------------
+// Before: it returned the raw planner spec, so the summary counted widgets that
+// validation had dropped ("5 widgets" for a 4-widget board) and the client
+// persisted ghost widgets as currentSpec — the next edit turn then reasoned
+// about widgets that were not on screen.
+{
+  const ds = [{
+    tableName: "orders",
+    profile: {
+      source: { filename: "x", format: "json" }, rowCount: 10,
+      columns: [{ name: "region", type: "string" } as any, { name: "revenue", type: "number" } as any],
+      sampleRows: [{ region: "EMEA", revenue: 5 }],
+    },
+  } as any];
+  const ghosty = async () => ({
+    version: 1,
+    meta: { title: "T" },
+    sections: [{ id: "s1", title: "Main", widgets: [
+      { id: "w1", kind: "kpi", title: "Total revenue", table: "orders", metric: { agg: "sum", col: "revenue" } },
+      // references a column that does not exist -> validation MUST drop it
+      { id: "w2", kind: "bar", title: "By ghost", table: "orders", x: { col: "not_a_column" }, series: [{ agg: "sum", col: "revenue" }] },
+    ] }],
+  } as any);
+  const { status, body } = await handleDashboardBuild(
+    { datasets: ds, userPrompt: "x", analystDirective: "d" },
+    ghosty as any,
+  );
+  assert.equal(status, 200);
+  const returned = body.spec.sections.flatMap((x: any) => x.widgets);
+  assert.equal(returned.length, 1, "returned spec contains ONLY what rendered");
+  assert.equal(returned[0].id, "w1");
+  assert.ok(body.warnings.length >= 1, "the drop is reported, not silent");
+  assert.ok(body.summary.join(" ").includes("1 widget"), `summary must not claim dropped widgets: ${body.summary.join(" ")}`);
+}
+console.log("validated spec returned (no ghost widgets) ✅");
 
 // ---- theming reaches the generated app ---------------------------------------------
 {
@@ -137,20 +178,45 @@ console.log("conversational.test.ts: all assertions passed ✅");
   const rich = [{ tableName: "t", profile: { source: { filename: "x", format: "json" }, rowCount: 9, columns: Array.from({ length: 8 }, (_, i) => ({ name: "c" + i, type: "number" })), sampleRows: [] } } as any];
   const spec1: any = { meta: { title: "T" }, sections: [{ title: "S", widgets: [
     { id: "k1", kind: "kpi", title: "A" },
-    { id: "c1", kind: "chart", chart: "bar", title: "B" },
-    { id: "c2", kind: "chart", chart: "bar", title: "C" },
+    { id: "c1", kind: "bar", title: "B" },
+    { id: "c2", kind: "bar", title: "C" },
   ] }] };
   const s1 = coverageShortfalls(spec1, rich);
   assert.ok(s1.some((x) => x.includes("chart(s), need at least 4")), s1.join(";"));
   assert.ok(s1.some((x) => x.includes("KPI")), s1.join(";"));
   const spec2: any = { meta: { title: "T" }, sections: [{ title: "S", widgets: [
     { id: "k1", kind: "kpi", title: "A" }, { id: "k2", kind: "kpi", title: "B" }, { id: "k3", kind: "kpi", title: "C" },
-    { id: "c1", kind: "chart", chart: "bar", title: "1" }, { id: "c2", kind: "chart", chart: "line", title: "2" },
-    { id: "c3", kind: "chart", chart: "pie", title: "3" }, { id: "c4", kind: "chart", chart: "area", title: "4" },
+    { id: "c1", kind: "bar", title: "1" }, { id: "c2", kind: "line", title: "2" },
+    { id: "c3", kind: "pie", title: "3" }, { id: "c4", kind: "area", title: "4" },
   ] }] };
   assert.deepEqual(coverageShortfalls(spec2, rich), [], "compliant spec has no shortfalls");
   const thin = [{ tableName: "t", profile: { source: { filename: "x", format: "json" }, rowCount: 3, columns: [{ name: "v", type: "number" }], sampleRows: [] } } as any];
   const s3 = coverageShortfalls(spec1, thin);
   assert.ok(!s3.some((x) => x.includes("need at least 4")), "thin data never demands padding: " + s3.join(";"));
+
+  // al5 REGRESSION: the gate must count the kinds the PLANNER SCHEMA actually
+  // emits. The old filter tested `kind === "chart"` — a kind no widget ever has —
+  // so every real build reported "0 charts", burned a re-plan, and shipped
+  // KPI-only dashboards. Guard the real enum, and guard that a KPI-only board
+  // is flagged (it is the failure the user actually saw on screen).
+  const CHART_ENUM = ["line", "bar", "area", "pie", "donut"];
+  for (const kind of CHART_ENUM) {
+    const one: any = { meta: { title: "T" }, sections: [{ title: "S", widgets: [{ id: "c", kind, title: "x" }] }] };
+    const gaps = coverageShortfalls(one, rich);
+    assert.ok(!gaps.some((x) => x.includes("only 0 chart(s)")), `kind "${kind}" must count as a chart, got: ${gaps.join(";")}`);
+  }
+  const kpiOnly: any = { meta: { title: "T" }, sections: [{ title: "S", widgets: [
+    { id: "k1", kind: "kpi", title: "A" }, { id: "k2", kind: "kpi", title: "B" },
+    { id: "k3", kind: "kpi", title: "C" }, { id: "k4", kind: "kpi", title: "D" },
+  ] }] };
+  const kpiGaps = coverageShortfalls(kpiOnly, rich);
+  assert.ok(kpiGaps.some((x) => x.includes("only 0 chart(s)")), `a KPI-only dashboard MUST be flagged: ${kpiGaps.join(";")}`);
+  // chart-type diversity reads the widget kind (it used to read a phantom `.chart`).
+  const sameType: any = { meta: { title: "T" }, sections: [{ title: "S", widgets: [
+    { id: "k1", kind: "kpi", title: "A" }, { id: "k2", kind: "kpi", title: "B" }, { id: "k3", kind: "kpi", title: "C" },
+    { id: "c1", kind: "bar", title: "1" }, { id: "c2", kind: "bar", title: "2" },
+    { id: "c3", kind: "bar", title: "3" }, { id: "c4", kind: "bar", title: "4" },
+  ] }] };
+  assert.ok(coverageShortfalls(sameType, rich).some((x) => x.includes("chart type(s)")), "4 bars is not 3 types");
 }
 console.log("query rewriter + house style ✅");

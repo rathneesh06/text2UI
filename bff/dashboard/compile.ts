@@ -27,5 +27,5 @@ export function compileSpec(spec: DashboardSpec, profiles: Dataset[]): RenderPla
     return { id: s.id, title: s.title, widgets };
   });
 
-  return { meta: clean.meta, sections, warnings };
+  return { meta: clean.meta, sections, warnings, spec: clean };
 }

@@ -122,4 +122,9 @@ export interface RenderPlan {
   meta: DashboardMeta;
   sections: CompiledSection[];
   warnings: string[];
+  /** al5: the spec AFTER validation/repair — what actually renders. The handler
+   *  returns THIS to the client (persisted as currentSpec), so the next edit
+   *  turn reasons about widgets that exist on screen, and the change summary
+   *  can't claim widgets that validation dropped. */
+  spec: DashboardSpec;
 }

@@ -56,8 +56,21 @@ export async function handleDashboardBuild(
   // retry when short, then accept with a warning rather than block.
   const shortfalls = coverageShortfalls(spec, datasets);
   if (shortfalls.length && !currentSpec) {
+    console.log(`[dashboard] coverage shortfall -> re-plan: ${shortfalls.join("; ")}`);
     const retry = await planOnce(`REVISE: the previous plan was insufficient — ${shortfalls.join("; ")}. Keep everything that was good; add what is missing.`);
-    if (retry && coverageShortfalls(retry, datasets).length < shortfalls.length) spec = retry;
+    // Accept the retry when it is strictly better on EITHER axis: fewer
+    // shortfalls, or the same count but more charts (the old test compared only
+    // shortfall counts, so a genuinely richer retry was thrown away on a tie).
+    if (retry) {
+      const before = { gaps: shortfalls.length, charts: chartCount(spec) };
+      const after = { gaps: coverageShortfalls(retry, datasets).length, charts: chartCount(retry) };
+      if (after.gaps < before.gaps || (after.gaps <= before.gaps && after.charts > before.charts)) {
+        spec = retry;
+        console.log(`[dashboard] re-plan accepted: charts ${before.charts} -> ${after.charts}, gaps ${before.gaps} -> ${after.gaps}`);
+      } else {
+        console.log(`[dashboard] re-plan rejected (no improvement): charts ${after.charts}, gaps ${after.gaps}`);
+      }
+    }
   }
   // Vibrancy guarantee: never ship on drab defaults.
   if (!spec.meta.chartPalette?.length) spec.meta.chartPalette = ["#7c3aed", "#06b6d4", "#f59e0b", "#10b981", "#f43f5e", "#3b82f6"];
@@ -69,9 +82,15 @@ export async function handleDashboardBuild(
   }
 
   const app = renderPlanToApp(plan);
-  // Return the (post-coercion) spec the planner produced so the client can persist it
-  // and pass it back as currentSpec on the next turn.
-  return { status: 200, body: { app, spec, warnings: plan.warnings, summary: summarizeSpecChange(currentSpec, spec) } };
+  // al5: return the VALIDATED spec — the one that actually rendered. Returning
+  // the raw planner spec meant the summary counted widgets validation had
+  // dropped ("5 widgets" for a 4-widget board) and the client persisted ghost
+  // widgets as currentSpec, so the next edit turn reasoned about things that
+  // were not on screen.
+  const rendered = plan.spec;
+  const dropped = allWidgets(spec).length - allWidgets(rendered).length;
+  if (dropped > 0) console.log(`[dashboard] validation dropped ${dropped} widget(s): ${plan.warnings.join(" | ")}`);
+  return { status: 200, body: { app, spec: rendered, warnings: plan.warnings, summary: summarizeSpecChange(currentSpec, rendered) } };
 }
 
 /** The brief's ANALYTICAL half (kpis + charts) as a directive for the spec
@@ -92,9 +111,20 @@ export function briefToAnalyticalDirective(brief: any): string | null {
 /** House-style coverage check: what a build is missing vs the minimums
  *  (>=4 charts across >=3 types, >=3 KPI cards) — scaled down when the data
  *  is too thin to support them (never demand padding). */
+/** The REAL chart kinds. ChartWidget.kind is flat ("bar"|"line"|…), never the
+ *  string "chart" — the old filter here tested for `kind === "chart"`, matched
+ *  NOTHING, and so reported "0 charts" on every build: the coverage rule never
+ *  fired, and KPI-only dashboards shipped unchallenged. */
+const CHART_KINDS = new Set(["line", "bar", "area", "pie", "donut"]);
+
+/** Charts in a spec, by the real flat kinds. */
+function chartCount(spec: DashboardSpec): number {
+  return allWidgets(spec).filter((w: any) => CHART_KINDS.has(w.kind)).length;
+}
+
 export function coverageShortfalls(spec: DashboardSpec, datasets: Dataset[]): string[] {
   const widgets = allWidgets(spec);
-  const charts = widgets.filter((w: any) => w.kind === "chart");
+  const charts = widgets.filter((w: any) => CHART_KINDS.has(w.kind));
   const kpis = widgets.filter((w: any) => w.kind === "kpi");
   const columnCount = datasets.reduce((n, d) => n + d.profile.columns.length, 0);
   const wantCharts = Math.min(4, Math.max(1, Math.floor(columnCount / 2)));
@@ -102,7 +132,7 @@ export function coverageShortfalls(spec: DashboardSpec, datasets: Dataset[]): st
   const wantKpis = Math.min(3, Math.max(1, columnCount));
   const out: string[] = [];
   if (charts.length < wantCharts) out.push(`only ${charts.length} chart(s), need at least ${wantCharts} answering different questions`);
-  const types = new Set(charts.map((c: any) => c.chart ?? c.type));
+  const types = new Set(charts.map((c: any) => c.kind));
   if (charts.length >= wantCharts && types.size < wantTypes) out.push(`only ${types.size} chart type(s), use at least ${wantTypes} different types (bar/line/area/pie)`);
   if (kpis.length < wantKpis) out.push(`only ${kpis.length} KPI card(s), need at least ${wantKpis}`);
   return out;

@@ -335,7 +335,12 @@ export default function ChatPage({
         setSpec(nextSpec);
         setResult({ kind: "dashboard", app });
         setDashVersion((v) => v + 1);
-        const note = warnings.length ? ` · ${warnings.length} note${warnings.length === 1 ? "" : "s"}` : "";
+        // al5: SHOW the notes. "· 3 notes" hid the reason a widget vanished
+        // (dropped column, coerced agg, empty section) — the one thing the user
+        // needs to fix their prompt or spot a pipeline defect.
+        const note = warnings.length
+          ? `\n\nNotes:\n${warnings.slice(0, 5).map((w) => `• ${w}`).join("\n")}${warnings.length > 5 ? `\n• …and ${warnings.length - 5} more` : ""}`
+          : "";
         patch({ phase: "done", tail: null, assistantText: (summary?.length ? summary.join(" ") : nextSpec.meta.title || "Dashboard ready") + note });
         builds.current += 1;
         onBuildMeta?.({ versionCount: builds.current });
