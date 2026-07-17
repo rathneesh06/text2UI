@@ -550,7 +550,8 @@ console.log("renderer: inspiration design surfaces ✅");
   assert.ok(seen.line.includes("TrendQ"), "trend task reached the line agent");
   assert.ok(!seen.line.includes("RankQ"), "ranking task did NOT reach the line agent");
   assert.ok(seen.bar.includes("RankQ"), "ranking task reached the bar agent");
-  assert.ok(seen.kpi.includes("ASSIGNED") === false || true, "kpi agent runs with or without tasks");
+  assert.ok(seen.kpi, "kpi agent ran even with no assigned task (coverage preserved)");
+  assert.ok(!seen.kpi.includes("YOUR ASSIGNED QUESTIONS"), "kpi agent received no task block (none were kpi-kind)");
   assert.ok(body.spec.sections.length > 0, "build still completes");
 }
 console.log("decompose: breakdown layer routes tasks to agents ✅");

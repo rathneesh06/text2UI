@@ -147,6 +147,8 @@ export interface EnhanceInput {
   analystDirective?: string;    // text2SQL analyst-loop evidence pack (most grounded)
   /** disable the LLM rewrite (tests / offline) — baseline still applies */
   skipRewrite?: boolean;
+  /** semantic-model digest (entities, candidate metrics, join candidates) */
+  semanticDigest?: string;
 }
 
 export interface Enhancement {
@@ -191,7 +193,10 @@ export function briefToStyleHints(brief: any): string | null {
 /** Run the enhancement layer. Total: always resolves, always with a non-empty
  *  `combined`. The LLM rewrite is the only fallible part and it only ever ADDS. */
 export async function enhanceQuery(input: EnhanceInput): Promise<Enhancement> {
-  const baseline = baselineInstructions(input.datasets, input.userPrompt, input.currentSpec);
+  let baseline = baselineInstructions(input.datasets, input.userPrompt, input.currentSpec);
+  // The semantic layer rides the baseline: business concepts and the candidate
+  // metric menu are part of the always-on floor, not an optional extra.
+  if (input.semanticDigest) baseline = `${baseline}\n\n${input.semanticDigest}`;
   const styleHints = briefToStyleHints(input.brief);
 
   let directive: string | null = null;

@@ -30,6 +30,8 @@ import { planSpec, HEX_RE, type PlanSpecInput } from "./planner";
 import { enhanceQuery, briefToStyleHints, briefToAnalyticalDirective, type Enhancement } from "./enhance";
 import { runChartAgents, type AgentRun, type AgentHarvest } from "./agents";
 import { decomposeQuery } from "./decompose";
+import { buildSemanticModel, semanticDigest } from "../datasources/semantic";
+import { audit, newTurnId } from "../datasources/audit";
 import { mergeHarvest, DEFAULT_PALETTE } from "./merge";
 import { compileSpec } from "./compile";
 import { pushVersion, undo, redo, decisionsText, detectHistoryIntent, cursorIndex } from "./session";
@@ -96,15 +98,27 @@ export async function handleDashboardBuild(
   // ---- Context Manager: the conversation reaches the edit planner -------------
   const chatContext = buildChatContext(b.history, conversationId);
 
+  const turnId = newTurnId();
+  audit({ turnId, conversationId, stage: "prompt", detail: { userPrompt: String(b.userPrompt).slice(0, 500), edit: !!currentSpec, tables: datasets.map((d) => d.tableName) } });
+
+  // ---- Semantic model: deterministic business abstraction over the profiles ---
+  // (entities, candidate metrics, join candidates — the doc's semantic layer,
+  // generic instead of handwritten-per-schema, with the candidate-metrics tier
+  // solving cold start.)
+  const semModel = buildSemanticModel(datasets);
+  const semDigest = semanticDigest(semModel);
+
   // ---- Stage 1: the query enhancement layer (always on, never null) ----------
   const enhancement = await enhanceQuery({
+    semanticDigest: semDigest,
     datasets, userPrompt: b.userPrompt,
     ...(currentSpec ? { currentSpec } : {}),
     ...(b.brief ? { brief: b.brief } : {}),
     ...(typeof b.analystDirective === "string" ? { analystDirective: b.analystDirective } : {}),
     ...(deps.skipRewrite || legacyPlannerInjected ? { skipRewrite: true } : {}),
   });
-  console.log(`[dashboard] directive source: ${enhancement.directiveSource} (${enhancement.combined.length} chars, baseline always applied)`);
+  console.log(`[dashboard] directive source: ${enhancement.directiveSource} (${enhancement.combined.length} chars, baseline always applied) · semantic: ${semModel.metrics.length} candidate metric(s), ${semModel.joins.length} join candidate(s)`);
+  audit({ turnId, conversationId, stage: "enhance", detail: { directiveSource: enhancement.directiveSource, candidateMetrics: semModel.metrics.length, joinCandidates: semModel.joins.length } });
 
   let spec: DashboardSpec | null = null;
   let pipeline: "agents" | "planner" | "patch" = "planner";
@@ -114,11 +128,13 @@ export async function handleDashboardBuild(
     // QUERY BREAKDOWN LAYER: decompose the request into grounded analytical
     // tasks, routed to the agent families below. Trivial prompts skip the model
     // call; failures fall back to deterministic schema-derived tasks.
-    const { tasks } = await decomposeQuery(datasets, b.userPrompt, enhancement.combined, deps.agentRun);
+    const { tasks, source: taskSource } = await decomposeQuery(datasets, b.userPrompt, enhancement.combined, deps.agentRun);
+    audit({ turnId, conversationId, stage: "decompose", detail: { source: taskSource, tasks: tasks.map((t) => ({ kind: t.kind, q: t.question.slice(0, 80) })) } });
     const harvest = await runChartAgents(
       { datasets, userPrompt: b.userPrompt, directive: withStyle(enhancement), tasks },
       deps.agentRun,
     );
+    audit({ turnId, conversationId, stage: "agents", detail: { reports: harvest.reports } });
     const merged = mergeHarvest(harvest, datasets, b.userPrompt, mergeStyle(b.brief));
     if (countWidgets(merged) > 0) { spec = merged; pipeline = "agents"; }
     else console.warn("[dashboard] agent harvest empty — falling back to the monolithic planner");
@@ -150,6 +166,7 @@ export async function handleDashboardBuild(
       spec = r.spec;
       pipeline = "patch" as any;
       healedNotes = r.rejected;
+      audit({ turnId, conversationId, stage: "edit_ops", detail: { applied: r.applied, rejected: r.rejected } });
       if (r.rejected.length) console.log(`[dashboard] ops rejected: ${r.rejected.join(" | ")}`);
     } else {
       console.warn("[dashboard] op planning failed — falling back to full-spec edit + reconciliation");
@@ -192,6 +209,7 @@ export async function handleDashboardBuild(
   if (dropped > 0) console.log(`[dashboard] validation dropped ${dropped} widget(s): ${plan.warnings.join(" | ")}`);
   const warnings = [...healedNotes, ...plan.warnings];
   const summary = summarizeSpecChange(currentSpec, rendered);
+  audit({ turnId, conversationId, stage: "render", detail: { pipeline, widgets: allWidgets(rendered).length, dropped, warnings: plan.warnings.slice(0, 6), sql: plan.sections.flatMap((sc: any) => sc.widgets.map((cw: any) => cw.sql)).slice(0, 30) } });
   // Diff History: every accepted version enters the conversation's undo stack.
   if (conversationId) pushVersion(conversationId, rendered, summary.join(" "), b.userPrompt);
   return {
