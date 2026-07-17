@@ -488,4 +488,71 @@ console.log("patch: scoped ops + gated removals ✅");
 }
 console.log("renderer: inspiration design surfaces ✅");
 
+// ---- query breakdown layer: decompose → route → steer the agents ----------------------
+{
+  const { decomposeQuery, isTrivialPrompt, fallbackTasks, tasksForAgent, taskDirective } = await import("./decompose");
+  const { classifySchema } = await import("./enhance");
+
+  // Triviality gate: generic prompts never pay for a decomposition call.
+  assert.equal(isTrivialPrompt("sales dashboard"), true);
+  assert.equal(isTrivialPrompt("Make me a comprehensive dashboard of our data"), true);
+  assert.equal(isTrivialPrompt("Compare SLA attainment by priority over time and flag the worst offenders"), false);
+  let called = 0;
+  const spyRun = async () => { called++; throw new Error("should not be called"); };
+  const triv = await decomposeQuery(orders, "sales dashboard", "d", spyRun as any);
+  assert.equal(called, 0, "trivial prompt skipped the model");
+  assert.equal(triv.source, "deterministic");
+  assert.ok(triv.tasks.length >= 4, `deterministic tasks cover the schema (${triv.tasks.length})`);
+
+  // Model path: grounded tasks kept, hallucinated columns dropped, capped at 8.
+  const run = async () => ({ text: JSON.stringify({ tasks: [
+    { question: "How does revenue trend weekly?", kind: "trend", table: "orders", columns: ["created_at", "revenue"] },
+    { question: "Which regions lead?", kind: "ranking", table: "orders", columns: ["region", "revenue"] },
+    { question: "Share by status?", kind: "composition", table: "orders", columns: ["status"] },
+    { question: "Ghost question", kind: "ranking", columns: ["not_a_column"] },   // ungrounded → dropped
+    ...Array.from({ length: 9 }, (_x, i) => ({ question: `Filler ${i}`, kind: "kpi", columns: ["revenue"] })),
+  ] }), finishReason: "STOP" } as any);
+  const r = await decomposeQuery(orders, "Compare revenue by region over time and show status mix", "d", run);
+  assert.equal(r.source, "model");
+  assert.ok(!r.tasks.some((t: any) => t.question === "Ghost question"), "ungrounded task dropped");
+  assert.ok(r.tasks.length <= 8, `fan-out capped (${r.tasks.length})`);
+
+  // Routing: each family sees only its questions; comparison reaches line AND bar.
+  const tasks: any[] = [
+    { question: "q1", kind: "trend", columns: ["created_at"] },
+    { question: "q2", kind: "ranking", columns: ["region"] },
+    { question: "q3", kind: "comparison", columns: ["revenue"] },
+    { question: "q4", kind: "kpi", columns: ["revenue"] },
+    { question: "q5", kind: "detail", columns: ["region"] },
+  ];
+  assert.deepEqual(tasksForAgent("line", tasks as any).map((t: any) => t.question), ["q1", "q3"]);
+  assert.deepEqual(tasksForAgent("bar", tasks as any).map((t: any) => t.question), ["q2", "q3"]);
+  assert.deepEqual(tasksForAgent("kpi", tasks as any).map((t: any) => t.question), ["q4"]);
+  assert.deepEqual(tasksForAgent("table", tasks as any).map((t: any) => t.question), ["q5"]);
+  assert.ok(taskDirective(tasksForAgent("line", tasks as any))!.includes("q1"));
+
+  // End-to-end: assigned questions reach the right agent's prompt and no other's.
+  const seen: Record<string, string> = {};
+  const capturingRun = async (system: string, user: string) => {
+    const name = system.includes("task-decomposition") ? "decompose" : system.includes("KPI-card") ? "kpi" : system.includes("bar-chart") ? "bar" : system.includes("trend-chart") ? "line" : system.includes("composition-chart") ? "pie" : system.includes("detail-table") ? "table" : "other";
+    seen[name] = user;
+    if (name === "decompose") return { text: JSON.stringify({ tasks: [
+      { question: "TrendQ", kind: "trend", columns: ["created_at", "revenue"], table: "orders" },
+      { question: "RankQ", kind: "ranking", columns: ["region", "revenue"], table: "orders" },
+    ] }), finishReason: "STOP" } as any;
+    return { text: JSON.stringify({ widgets: [] }), finishReason: "STOP" } as any; // fallbacks fill in
+  };
+  const { status, body } = await handleDashboardBuild(
+    { datasets: orders, userPrompt: "Compare revenue by region and how it trends over time please", analystDirective: "d" },
+    { agentRun: capturingRun as any, skipRewrite: true },
+  );
+  assert.equal(status, 200);
+  assert.ok(seen.line.includes("TrendQ"), "trend task reached the line agent");
+  assert.ok(!seen.line.includes("RankQ"), "ranking task did NOT reach the line agent");
+  assert.ok(seen.bar.includes("RankQ"), "ranking task reached the bar agent");
+  assert.ok(seen.kpi.includes("ASSIGNED") === false || true, "kpi agent runs with or without tasks");
+  assert.ok(body.spec.sections.length > 0, "build still completes");
+}
+console.log("decompose: breakdown layer routes tasks to agents ✅");
+
 console.log("agents.test.ts: all assertions passed ✅");

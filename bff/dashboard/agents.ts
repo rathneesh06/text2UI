@@ -18,6 +18,7 @@ import type { Dataset } from "../../shared/types";
 import type { KpiWidget, ChartWidget, TableWidget, Widget } from "../../shared/dashboard-spec";
 import { callGemini, ORCHESTRATE_OPTS, type GenResult, type GenOptions } from "../aiflow";
 import { classifySchema, type SchemaRoles } from "./enhance";
+import { tasksForAgent, taskDirective, type AnalysisTask } from "./decompose";
 
 export type AgentRun = (system: string, user: string, opts?: GenOptions) => Promise<GenResult>;
 const AGENT_TIMEOUT_MS = Number(process.env.DASHBOARD_AGENT_TIMEOUT_MS ?? 15000);
@@ -53,12 +54,16 @@ export interface AgentInput {
   userPrompt: string;
   /** the enhancement layer's combined instructions (baseline + directive) — always present */
   directive: string;
+  /** decomposed analytical tasks (query breakdown layer) — routed per agent family */
+  tasks?: AnalysisTask[];
 }
 
-function userPromptFor(input: AgentInput, ask: string): string {
+function userPromptFor(input: AgentInput, ask: string, agentName?: string): string {
+  const assigned = input.tasks && agentName ? taskDirective(tasksForAgent(agentName as any, input.tasks)) : null;
   return [
     "DATA PROFILE:", schemaText(input.datasets), "",
     "INSTRUCTIONS:", input.directive, "",
+    ...(assigned ? [assigned, ""] : []),
     "USER REQUEST:", input.userPrompt, "",
     ask,
   ].join("\n");
@@ -252,7 +257,7 @@ async function runAgent<T extends Widget>(
   const timeout = new Promise<null>((resolve) => setTimeout(() => resolve(null), timeoutMs));
   const call = (async (): Promise<T[] | null> => {
     try {
-      const { text } = await run(def.system, userPromptFor(input, def.ask), { ...ORCHESTRATE_OPTS, responseSchema: def.schema });
+      const { text } = await run(def.system, userPromptFor(input, def.ask, def.name), { ...ORCHESTRATE_OPTS, responseSchema: def.schema });
       const widgets = def.coerce(JSON.parse(stripFences(text)));
       return widgets.length ? widgets : null;
     } catch (err) {

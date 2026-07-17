@@ -29,6 +29,7 @@ import type { DashboardSpec } from "../../shared/dashboard-spec";
 import { planSpec, HEX_RE, type PlanSpecInput } from "./planner";
 import { enhanceQuery, briefToStyleHints, briefToAnalyticalDirective, type Enhancement } from "./enhance";
 import { runChartAgents, type AgentRun, type AgentHarvest } from "./agents";
+import { decomposeQuery } from "./decompose";
 import { mergeHarvest, DEFAULT_PALETTE } from "./merge";
 import { compileSpec } from "./compile";
 import { pushVersion, undo, redo, decisionsText, detectHistoryIntent, cursorIndex } from "./session";
@@ -110,8 +111,12 @@ export async function handleDashboardBuild(
 
   if (!currentSpec && AGENTS_ENABLED && !legacyPlannerInjected) {
     // ---- Stage 2 (builds): parallel specialist agents + deterministic merge ----
+    // QUERY BREAKDOWN LAYER: decompose the request into grounded analytical
+    // tasks, routed to the agent families below. Trivial prompts skip the model
+    // call; failures fall back to deterministic schema-derived tasks.
+    const { tasks } = await decomposeQuery(datasets, b.userPrompt, enhancement.combined, deps.agentRun);
     const harvest = await runChartAgents(
-      { datasets, userPrompt: b.userPrompt, directive: withStyle(enhancement) },
+      { datasets, userPrompt: b.userPrompt, directive: withStyle(enhancement), tasks },
       deps.agentRun,
     );
     const merged = mergeHarvest(harvest, datasets, b.userPrompt, mergeStyle(b.brief));
