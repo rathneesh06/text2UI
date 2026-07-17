@@ -102,6 +102,7 @@ export const HOUSE_RULES = [
   "Coverage: aim for 3-6 KPI cards plus at least 4 charts of at least 3 different types (bar/line/area/pie), each answering a different question (trend, ranking, composition, comparison) — scale down only when the data genuinely cannot support it, never pad with duplicates.",
   "Layout: KPIs first at quarter width, charts at half width, tables full width. Dense and information-rich; no filler widgets.",
   "Style: vibrant by default — a concrete hex accent and a 5-6 color saturated palette unless the user asks otherwise.",
+  "Design language (executive-dashboard aesthetic): a punchy title with a one-line meta.subtitle describing the story of the data; short UPPERCASE-friendly KPI titles (e.g. 'Total tickets', 'Avg resolution') each with a brief subtitle giving context (e.g. 'All historical records', 'For closed tickets'); every chart gets a one-line subtitle explaining what it shows (e.g. 'Monthly ticket creation volume over entire history'); prefer varied, saturated per-category colors on breakdown bars; titles are human phrases, never column names.",
   "Trends use a real date/timestamp column with an explicit time grain; pie/donut only on a low-cardinality category with a single measure.",
 ].join(" ");
 

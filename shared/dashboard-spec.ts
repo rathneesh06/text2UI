@@ -94,6 +94,8 @@ export interface DashboardMeta {
   accent?: string;
   /** Chart series palette (hex[]) — "make the charts teal" lands here. */
   chartPalette?: string[];
+  /** One-line callout rendered as a highlight banner under the KPI strip. */
+  insight?: string;
 }
 
 export interface DashboardSpec {

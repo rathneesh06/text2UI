@@ -49,7 +49,7 @@ export function deriveTitle(userPrompt: string, datasets: Dataset[]): string {
   return `${name.charAt(0).toUpperCase()}${name.slice(1)} Dashboard`;
 }
 
-export interface MergeOptions { title?: string; theme?: "light" | "dark"; accent?: string; chartPalette?: string[] }
+export interface MergeOptions { title?: string; subtitle?: string; theme?: "light" | "dark"; accent?: string; chartPalette?: string[] }
 
 /** Assemble the harvest into a DashboardSpec. Never returns an empty spec if any
  *  agent produced anything at all. */
@@ -84,6 +84,7 @@ export function mergeHarvest(harvest: AgentHarvest, datasets: Dataset[], userPro
     version: 1,
     meta: {
       title: opts.title ?? deriveTitle(userPrompt, datasets),
+      ...(opts.subtitle ? { subtitle: opts.subtitle } : {}),
       theme: opts.theme ?? "light",
       accent: opts.accent ?? DEFAULT_PALETTE[0],
       chartPalette: opts.chartPalette?.length ? opts.chartPalette : DEFAULT_PALETTE,

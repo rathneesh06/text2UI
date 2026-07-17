@@ -32,9 +32,9 @@ const DIMENSION = { type: "object", properties: { col: { type: "string" }, timeG
 
 const wrap = (item: unknown) => ({ type: "object", properties: { widgets: { type: "array", items: item } }, required: ["widgets"] });
 
-const KPI_ITEM = { type: "object", properties: { title: { type: "string" }, table: { type: "string" }, metric: METRIC }, required: ["title", "table", "metric"] };
-const CHART_ITEM = { type: "object", properties: { title: { type: "string" }, table: { type: "string" }, x: DIMENSION, series: { type: "array", items: METRIC }, limit: { type: "integer" }, kind: { type: "string", enum: ["line", "bar", "area", "pie", "donut"] } }, required: ["title", "table", "x", "series"] };
-const TABLE_ITEM = { type: "object", properties: { title: { type: "string" }, table: { type: "string" }, columns: { type: "array", items: { type: "object", properties: { col: { type: "string" }, label: { type: "string" }, agg: AGG }, required: ["col"] } }, groupBy: { type: "array", items: DIMENSION }, limit: { type: "integer" } }, required: ["title", "table", "columns"] };
+const KPI_ITEM = { type: "object", properties: { title: { type: "string" }, subtitle: { type: "string", description: "short context line, e.g. 'All historical records'" }, table: { type: "string" }, metric: METRIC }, required: ["title", "table", "metric"] };
+const CHART_ITEM = { type: "object", properties: { title: { type: "string" }, subtitle: { type: "string", description: "one line explaining what the chart shows" }, table: { type: "string" }, x: DIMENSION, series: { type: "array", items: METRIC }, limit: { type: "integer" }, kind: { type: "string", enum: ["line", "bar", "area", "pie", "donut"] } }, required: ["title", "table", "x", "series"] };
+const TABLE_ITEM = { type: "object", properties: { title: { type: "string" }, subtitle: { type: "string" }, table: { type: "string" }, columns: { type: "array", items: { type: "object", properties: { col: { type: "string" }, label: { type: "string" }, agg: AGG }, required: ["col"] } }, groupBy: { type: "array", items: DIMENSION }, limit: { type: "integer" } }, required: ["title", "table", "columns"] };
 
 // ---------------------------------------------------------------------------
 // Prompt plumbing
@@ -46,7 +46,7 @@ function schemaText(datasets: Dataset[]): string {
   }).join("\n");
 }
 
-const COMMON = `You output ONLY the requested JSON. Ground every choice in columns that exist in the data profile — never invent a column or table. Follow the baseline instructions and analytical directive when given.`;
+const COMMON = `Give every widget a human title and a one-line subtitle that explains what it shows. You output ONLY the requested JSON. Ground every choice in columns that exist in the data profile — never invent a column or table. Follow the baseline instructions and analytical directive when given.`;
 
 export interface AgentInput {
   datasets: Dataset[];
@@ -78,7 +78,7 @@ const wid = (p: string) => `${p}${++seq}_${Math.random().toString(36).slice(2, 6
 function coerceKpis(parsed: any): KpiWidget[] {
   const arr = Array.isArray(parsed?.widgets) ? parsed.widgets : [];
   return arr.filter((w: any) => w?.title && w?.table && w?.metric?.col && w?.metric?.agg)
-    .map((w: any): KpiWidget => ({ id: wid("kpi"), kind: "kpi", title: String(w.title), table: String(w.table), metric: { col: String(w.metric.col), agg: w.metric.agg, label: w.metric.label, format: w.metric.format }, width: "quarter" }));
+    .map((w: any): KpiWidget => ({ id: wid("kpi"), kind: "kpi", title: String(w.title), ...(w.subtitle ? { subtitle: String(w.subtitle) } : {}), table: String(w.table), metric: { col: String(w.metric.col), agg: w.metric.agg, label: w.metric.label, format: w.metric.format }, width: "quarter" }));
 }
 
 function coerceCharts(parsed: any, kinds: ChartWidget["kind"][], fallbackKind: ChartWidget["kind"]): ChartWidget[] {
@@ -86,7 +86,7 @@ function coerceCharts(parsed: any, kinds: ChartWidget["kind"][], fallbackKind: C
   return arr.filter((w: any) => w?.title && w?.table && w?.x?.col && Array.isArray(w?.series) && w.series.length)
     .map((w: any): ChartWidget => ({
       id: wid(fallbackKind), kind: kinds.includes(w.kind) ? w.kind : fallbackKind,
-      title: String(w.title), table: String(w.table),
+      title: String(w.title), ...(w.subtitle ? { subtitle: String(w.subtitle) } : {}), table: String(w.table),
       x: { col: String(w.x.col), ...(w.x.timeGrain ? { timeGrain: w.x.timeGrain } : {}), ...(w.x.label ? { label: String(w.x.label) } : {}) },
       series: w.series.filter((m: any) => m?.col && m?.agg).map((m: any) => ({ col: String(m.col), agg: m.agg, label: m.label, format: m.format })),
       ...(Number.isInteger(w.limit) && w.limit > 0 ? { limit: Math.min(w.limit, 50) } : {}),
@@ -99,7 +99,7 @@ function coerceTables(parsed: any): TableWidget[] {
   const arr = Array.isArray(parsed?.widgets) ? parsed.widgets : [];
   return arr.filter((w: any) => w?.title && w?.table && Array.isArray(w?.columns) && w.columns.length)
     .map((w: any): TableWidget => ({
-      id: wid("tbl"), kind: "table", title: String(w.title), table: String(w.table),
+      id: wid("tbl"), kind: "table", title: String(w.title), ...(w.subtitle ? { subtitle: String(w.subtitle) } : {}), table: String(w.table),
       columns: w.columns.filter((c: any) => c?.col).map((c: any) => ({ col: String(c.col), ...(c.label ? { label: String(c.label) } : {}), ...(c.agg ? { agg: c.agg } : {}) })),
       ...(Array.isArray(w.groupBy) ? { groupBy: w.groupBy.filter((g: any) => g?.col).map((g: any) => ({ col: String(g.col), ...(g.timeGrain ? { timeGrain: g.timeGrain } : {}) })) } : {}),
       limit: Number.isInteger(w.limit) && w.limit > 0 ? Math.min(w.limit, 100) : 25,

@@ -59,7 +59,7 @@ export const DASHBOARD_SCHEMA = {
     meta: {
       type: "object",
       properties: {
-        title: { type: "string" }, subtitle: { type: "string" },
+        title: { type: "string" }, subtitle: { type: "string" }, insight: { type: "string" },
         audience: { type: "string" }, theme: { type: "string", enum: ["light", "dark"] },
         accent: { type: "string", description: "Primary accent color as hex, e.g. #0d9488." },
         chartPalette: { type: "array", items: { type: "string" }, description: "Chart series colors as hex values." },
@@ -190,7 +190,7 @@ function coerce(parsed: any): DashboardSpec | null {
   return {
     version: 1,
     meta: {
-      title: String(parsed.meta.title ?? "Dashboard"), subtitle: parsed.meta.subtitle, audience: parsed.meta.audience,
+      title: String(parsed.meta.title ?? "Dashboard"), subtitle: parsed.meta.subtitle, audience: parsed.meta.audience, insight: typeof parsed.meta.insight === "string" && parsed.meta.insight.trim() ? parsed.meta.insight : undefined,
       theme: parsed.meta.theme === "dark" ? "dark" : "light",
       // Style fields are sanitized deterministically — a bad hex silently drops.
       accent: HEX_RE.test(String(parsed.meta.accent ?? "")) ? String(parsed.meta.accent) : undefined,

@@ -33,6 +33,7 @@ import { mergeHarvest, DEFAULT_PALETTE } from "./merge";
 import { compileSpec } from "./compile";
 import { pushVersion, undo, redo, decisionsText, detectHistoryIntent, cursorIndex } from "./session";
 import { reconcileEdit } from "./reconcile";
+import { planEditOps, applyOps } from "./patch";
 import { renderPlanToApp } from "./renderer";
 
 // Re-exported so existing imports/tests keep working after the brief helpers
@@ -105,7 +106,7 @@ export async function handleDashboardBuild(
   console.log(`[dashboard] directive source: ${enhancement.directiveSource} (${enhancement.combined.length} chars, baseline always applied)`);
 
   let spec: DashboardSpec | null = null;
-  let pipeline: "agents" | "planner" = "planner";
+  let pipeline: "agents" | "planner" | "patch" = "planner";
 
   if (!currentSpec && AGENTS_ENABLED && !legacyPlannerInjected) {
     // ---- Stage 2 (builds): parallel specialist agents + deterministic merge ----
@@ -119,6 +120,36 @@ export async function handleDashboardBuild(
   }
 
   let healedNotes: string[] = [];
+  // ---- EDIT turns: patch-based by default (the Figma model) -------------------
+  // The model emits a minimal op list against widget ids; application is
+  // deterministic, so widgets not named in an op physically cannot change, and
+  // removals are gated on explicit removal intent (or the selected widget).
+  // Falls back to the full-spec planner + reconciliation if op planning fails.
+  // Hermeticity rule: an injected planner WITHOUT an injected runner means the
+  // caller (a test, or a legacy call site) wants the planner path — op planning
+  // must not escape to the live API. Production (no deps) uses the real model;
+  // op-planning tests inject agentRun.
+  const opsPathEnabled = !legacyPlannerInjected && !(deps.planner && !deps.agentRun);
+  if (!spec && currentSpec && opsPathEnabled) {
+    const ops = await planEditOps(
+      { datasets, userPrompt: b.userPrompt, currentSpec, chatContext, selectedWidget, directive: enhancement.styleHints ?? undefined },
+      deps.agentRun,
+    );
+    if (ops) {
+      const r = applyOps(currentSpec, ops, b.userPrompt, selectedWidget?.id);
+      if (ops.length === 0) {
+        // The model judged the request unactionable — better to say so than guess.
+        return { status: 200, body: { app: null, spec: currentSpec, warnings: [], noChange: true, pipeline: "patch",
+          summary: ["I wasn't sure what to change there — could you name the widget or describe the edit more specifically?"] } };
+      }
+      spec = r.spec;
+      pipeline = "patch" as any;
+      healedNotes = r.rejected;
+      if (r.rejected.length) console.log(`[dashboard] ops rejected: ${r.rejected.join(" | ")}`);
+    } else {
+      console.warn("[dashboard] op planning failed — falling back to full-spec edit + reconciliation");
+    }
+  }
   if (!spec) {
     // ---- Planner path: edit turns, kill-switch, or agent-harvest fallback ------
     spec = await runPlannerPath(planner, datasets, b.userPrompt, enhancement, currentSpec, chatContext, selectedWidget);
@@ -187,10 +218,11 @@ function withStyle(e: Enhancement): string {
 }
 
 /** Pull concrete style choices out of an orchestrator brief for the merger. */
-function mergeStyle(brief: any): { title?: string; accent?: string; chartPalette?: string[] } {
-  const out: { title?: string; accent?: string; chartPalette?: string[] } = {};
+function mergeStyle(brief: any): { title?: string; subtitle?: string; accent?: string; chartPalette?: string[] } {
+  const out: { title?: string; subtitle?: string; accent?: string; chartPalette?: string[] } = {};
   if (brief && typeof brief === "object") {
     if (typeof brief.title === "string" && brief.title.trim()) out.title = brief.title.trim();
+    if (typeof brief.narrative === "string" && brief.narrative.trim()) out.subtitle = brief.narrative.trim().slice(0, 160);
     const p = brief.palette;
     if (p && typeof p === "object") {
       if (HEX_RE.test(String(p.primary ?? ""))) out.accent = String(p.primary);

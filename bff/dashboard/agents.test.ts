@@ -409,4 +409,83 @@ console.log("orchestrator: respond:false no longer eats the brief ✅");
 }
 console.log("reconcile: gutted edits healed, removals respected ✅");
 
+// ---- patch-based edits: the Figma model — scoped ops, gated removals ------------------
+// Production failure this replaces: "the table displays many rows, stick to just 5"
+// came back as a full-spec rewrite that DELETED five unrelated widgets. Edits are
+// now op lists applied deterministically: unnamed widgets cannot change, and
+// removals only apply with explicit removal intent (or on the selected widget).
+{
+  const { applyOps } = await import("./patch");
+  const cur: any = { version: 1, meta: { title: "Helpdesk", theme: "light" }, sections: [
+    { id: "s1", widgets: [
+      { id: "k1", kind: "kpi", title: "Total tickets", table: "orders", metric: { col: "revenue", agg: "sum" } },
+      { id: "c1", kind: "bar", title: "By region", table: "orders", x: { col: "region" }, series: [{ col: "revenue", agg: "sum" }] },
+      { id: "t1", kind: "table", title: "Oldest open tickets", table: "orders", columns: [{ col: "region" }], limit: 25 },
+    ] },
+  ] };
+
+  // The exact production ask: one field on one widget. Nothing else may move.
+  const r1 = applyOps(cur, [{ op: "update_widget", id: "t1", set: { limit: 5 } }], "stick to just 5 rows");
+  const w1: any[] = r1.spec.sections[0].widgets as any[];
+  assert.equal(w1.length, 3, "no widgets lost");
+  assert.equal(w1.find((w) => w.id === "t1").limit, 5, "limit updated");
+  assert.equal(w1.find((w) => w.id === "c1").series[0].col, "revenue", "untouched widget untouched");
+
+  // A spurious removal (no removal intent in the prompt) is REJECTED, not applied.
+  const r2 = applyOps(cur, [
+    { op: "update_widget", id: "t1", set: { limit: 5 } },
+    { op: "remove_widget", id: "c1" },
+  ], "stick to just 5 rows");
+  assert.equal((r2.spec.sections[0].widgets as any[]).length, 3, "spurious removal blocked");
+  assert.ok(r2.rejected.some((x: string) => x.includes("didn't ask for a removal")), r2.rejected.join("|"));
+
+  // Explicit removal intent applies; empty-array sets can never wipe fields.
+  const r3 = applyOps(cur, [
+    { op: "remove_widget", id: "c1" },
+    { op: "update_widget", id: "t1", set: { columns: [] } },
+  ], "remove the region chart");
+  assert.equal((r3.spec.sections[0].widgets as any[]).length, 2, "requested removal applied");
+  assert.equal((r3.spec.sections[0].widgets as any[]).find((w: any) => w.id === "t1").columns.length, 1, "empty array cannot wipe columns");
+
+  // The selected widget is removable without magic words ("delete this").
+  const r4 = applyOps(cur, [{ op: "remove_widget", id: "c1" }], "this one", "c1");
+  assert.equal((r4.spec.sections[0].widgets as any[]).length, 2, "selected widget removal allowed");
+
+  // add_widget + update_meta round out the op set.
+  const r5 = applyOps(cur, [
+    { op: "add_widget", sectionId: "s1", widget: { kind: "donut", title: "Share", subtitle: "Revenue share by region", table: "orders", x: { col: "region" }, series: [{ col: "revenue", agg: "sum" }] } },
+    { op: "update_meta", meta: { theme: "dark", insight: "EMEA drives 60% of revenue" } },
+  ], "add a share donut and make it dark");
+  assert.equal((r5.spec.sections[0].widgets as any[]).length, 4);
+  assert.equal(r5.spec.meta.theme, "dark");
+  assert.equal((r5.spec.meta as any).insight, "EMEA drives 60% of revenue");
+
+  // End-to-end: the handler's edit path plans ops (injected runner), applies, renders.
+  const opsRun = async () => ({ text: JSON.stringify({ ops: [{ op: "update_widget", id: "t1", set: { limit: 5 } }] }), finishReason: "STOP" } as any);
+  const { status, body } = await handleDashboardBuild(
+    { datasets: orders, userPrompt: "stick to just 5 rows", currentSpec: cur },
+    { agentRun: opsRun as any, skipRewrite: true },
+  );
+  assert.equal(status, 200);
+  assert.equal(body.pipeline, "patch");
+  const outW = body.spec.sections.flatMap((s: any) => s.widgets);
+  assert.equal(outW.length, 3, "patch path loses nothing");
+  assert.equal(outW.find((w: any) => w.id === "t1").limit, 5);
+  assert.ok(!body.summary.join(" ").includes("Removed"), "no phantom removals");
+}
+console.log("patch: scoped ops + gated removals ✅");
+
+// ---- design surfaces: insight banner, icon chips, rainbow bars ------------------------
+{
+  const { renderPlanToApp } = await import("./renderer");
+  const plan: any = { meta: { title: "T", subtitle: "The story", insight: "Alpha drives most downtime" },
+    sections: [{ id: "s", widgets: [{ widget: { id: "k1", kind: "kpi", title: "Total", subtitle: "All records", table: "orders", metric: { col: "revenue", agg: "sum", format: "currency" } }, sql: "select 1 as value" }] }],
+    warnings: [], spec: {} };
+  const src = renderPlanToApp(plan).files[0].content;
+  for (const needle of ["PLAN.meta.insight", "kpiGlyph", "linearGradient", "The story", "Alpha drives most downtime"]) {
+    assert.ok(src.includes(needle), `design surface missing: ${needle}`);
+  }
+}
+console.log("renderer: inspiration design surfaces ✅");
+
 console.log("agents.test.ts: all assertions passed ✅");

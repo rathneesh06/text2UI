@@ -35,7 +35,7 @@ const PAD = COMPACT ? " p-2.5" : " p-3";
 const GAP = COMPACT ? "grid grid-cols-12 gap-2" : "grid grid-cols-12 gap-2.5";
 const SECTION_MT = COMPACT ? "mt-2.5" : "mt-4";
 const KPI_TXT = COMPACT ? " text-xl" : " text-2xl";
-const CARD_CLS = (DARK ? " bg-slate-900 rounded-lg border border-slate-800 shadow-sm" : " bg-white rounded-lg border border-slate-200 shadow-sm") + PAD;
+const CARD_CLS = (DARK ? " bg-slate-900 rounded-xl border border-slate-800 shadow-sm" : " bg-white rounded-xl border border-slate-200 shadow-sm") + PAD;
 const TICK = DARK ? "#94a3b8" : "#64748b";
 const GRID = DARK ? "#334155" : "#e2e8f0";
 
@@ -91,17 +91,33 @@ function Card(props) {
     </div>
   );
 }
+function kpiGlyph(w) {
+  const f = (w.metric && w.metric.format) || w.format || "";
+  const a = (w.metric && w.metric.agg) || "";
+  if (f === "currency") return "$";
+  if (f === "percent") return "%";
+  if (f === "hours" || f === "days") return "\u23F1";
+  if (a === "avg" || a === "median") return "\u00D8";
+  if (a === "count_distinct") return "\u2211";
+  return "#";
+}
 function Kpi(props) {
   const w = props.w;
   const s = useRows(props.sql);
   const value = s.rows && s.rows[0] ? s.rows[0].value : null;
+  const chip = COLORS[(props.idx || 0) % COLORS.length];
   return (
     <div className={widthClass(w.width || "quarter") + CARD_CLS + " cursor-pointer"}
          onClick={function () { if (selectFeature) selectFeature({ id: w.id, title: w.title, type: "kpi", kind: "kpi", query: props.sql }); }}>
-      <div className="text-xs font-medium uppercase tracking-wide text-slate-500">{w.title}</div>
+      <div className="flex items-start justify-between gap-2">
+        <div className="text-[11px] font-semibold uppercase tracking-wider text-slate-500 pt-1">{w.title}</div>
+        <div className="flex-none flex items-center justify-center rounded-lg font-semibold"
+             style={{ width: 30, height: 30, fontSize: 14, color: chip, background: chip + (DARK ? "2e" : "1a") }}>{kpiGlyph(w)}</div>
+      </div>
       {s.loading ? <div className="mt-2 h-8 w-24 animate-pulse rounded bg-slate-100" />
         : s.error ? <ErrorBox msg={s.error} />
-        : <div className={"mt-0.5 font-semibold tabular-nums" + KPI_TXT} style={{ color: ACCENT }}>{fmt(value, (w.metric && w.metric.format) || w.format)}</div>}
+        : <div className={"mt-0.5 font-bold tabular-nums tracking-tight" + KPI_TXT} style={{ color: ACCENT }}>{fmt(value, (w.metric && w.metric.format) || w.format)}</div>}
+      {w.subtitle ? <div className="mt-0.5 text-xs text-slate-400">{w.subtitle}</div> : null}
     </div>
   );
 }
@@ -143,8 +159,30 @@ function Chart(props) {
           <Tooltip contentStyle={{ borderRadius: 8, border: "1px solid #e2e8f0", fontSize: 12 }} />
           {keys.length > 1 ? <Legend /> : null}
           {keys.map(function (k, i) {
-            if (w.kind === "bar") return <Bar key={k.key} dataKey={k.key} name={k.label} fill={COLORS[i % COLORS.length]} radius={[4, 4, 0, 0]} />;
-            if (w.kind === "area") return <Area key={k.key} dataKey={k.key} name={k.label} stroke={COLORS[i % COLORS.length]} fill={COLORS[i % COLORS.length]} fillOpacity={0.15} strokeWidth={2} />;
+            if (w.kind === "bar") {
+              if (keys.length === 1) {
+                return (
+                  <Bar key={k.key} dataKey={k.key} name={k.label} radius={[5, 5, 0, 0]}>
+                    {data.map(function (_e, ci) { return <Cell key={ci} fill={COLORS[ci % COLORS.length]} />; })}
+                  </Bar>
+                );
+              }
+              return <Bar key={k.key} dataKey={k.key} name={k.label} fill={COLORS[i % COLORS.length]} radius={[5, 5, 0, 0]} />;
+            }
+            if (w.kind === "area") {
+              const gid = "g_" + w.id + "_" + i;
+              return (
+                <React.Fragment key={k.key}>
+                  <defs>
+                    <linearGradient id={gid} x1="0" y1="0" x2="0" y2="1">
+                      <stop offset="0%" stopColor={COLORS[i % COLORS.length]} stopOpacity={0.35} />
+                      <stop offset="100%" stopColor={COLORS[i % COLORS.length]} stopOpacity={0.02} />
+                    </linearGradient>
+                  </defs>
+                  <Area dataKey={k.key} name={k.label} stroke={COLORS[i % COLORS.length]} fill={"url(#" + gid + ")"} strokeWidth={2.5} />
+                </React.Fragment>
+              );
+            }
             return <Line key={k.key} dataKey={k.key} name={k.label} stroke={COLORS[i % COLORS.length]} strokeWidth={2} dot={false} />;
           })}
         </Cmp>
@@ -195,7 +233,7 @@ function DataTable(props) {
 }
 function Widget(props) {
   const w = props.cw.widget;
-  if (w.kind === "kpi") return <Kpi w={w} sql={props.cw.sql} />;
+  if (w.kind === "kpi") return <Kpi w={w} sql={props.cw.sql} idx={props.idx} />;
   if (w.kind === "table") return <DataTable w={w} sql={props.cw.sql} />;
   return <Chart w={w} sql={props.cw.sql} seriesKeys={props.cw.seriesKeys} />;
 }
@@ -203,14 +241,21 @@ export default function App() {
   return (
     <div className={"min-h-screen font-sans " + (DARK ? "bg-slate-950 text-slate-100" : "bg-slate-50 text-slate-900")}>
       <div className="mx-auto p-3 md:p-4" style={{ maxWidth: "1600px" }}>
-        <h1 className="text-2xl font-semibold tracking-tight">{PLAN.meta.title}</h1>
-        {PLAN.meta.subtitle ? <p className="text-sm text-slate-500 mt-1">{PLAN.meta.subtitle}</p> : null}
+        <h1 className="text-2xl font-bold tracking-tight">{PLAN.meta.title}</h1>
+        {PLAN.meta.subtitle ? <p className={"text-sm mt-1 " + (DARK ? "text-slate-400" : "text-slate-500")}>{PLAN.meta.subtitle}</p> : null}
+        {PLAN.meta.insight ? (
+          <div className="mt-3 rounded-xl px-4 py-3 text-sm font-medium text-white flex items-center gap-3"
+               style={{ background: "linear-gradient(90deg, " + ACCENT + ", " + (COLORS[1] || ACCENT) + ")" }}>
+            <span className="flex-none inline-flex items-center justify-center rounded-lg bg-white/20" style={{ width: 26, height: 26 }}>{"\u2726"}</span>
+            <span>{PLAN.meta.insight}</span>
+          </div>
+        ) : null}
         {PLAN.sections.map(function (sec) {
           return (
             <div key={sec.id} className={SECTION_MT}>
               {sec.title ? <div className={"text-sm font-semibold mb-1.5 " + (DARK ? "text-slate-300" : "text-slate-700")}>{sec.title}</div> : null}
               <div className={GAP}>
-                {sec.widgets.map(function (cw) { return <Widget key={cw.widget.id} cw={cw} />; })}
+                {sec.widgets.map(function (cw, wi) { return <Widget key={cw.widget.id} cw={cw} idx={wi} />; })}
               </div>
             </div>
           );
