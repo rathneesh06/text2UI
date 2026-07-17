@@ -14,7 +14,7 @@ import { compileCss } from "./tailwind";
 import { DuckDBStorage } from "./storage/duckdb";
 import { PostgresStorage } from "./storage/postgres";
 import { PROJECT_ID_RE, TABLE_NAME_RE, type StorageEngine, type TenantStorageEngine, type DatasetUpload } from "./storage/types";
-import type { AssembleInput, DataProfile, Dataset, GeneratedApp } from "../shared/types";
+import type { AssembleInput, DataProfile, Dataset, GeneratedApp, OrchestratorBrief } from "../shared/types";
 import { convertToMarkdown, isDocumentFile } from "./markitdown";
 import { buildExportZip, buildConnectedZip } from "./export";
 import { generateReport } from "./report";
@@ -311,17 +311,20 @@ export async function handleChat(body: unknown, deps: ChatDeps = {}): Promise<{ 
     await persistAssistant(result.question);
     return { status: 200, body: { conversationId, needsClarification: true, question: result.question } };
   }
-  if (result && "respond" in result) {
+  if (result && "respond" in result && result.respond === true) {
     await persistAssistant(result.reply);
     return { status: 200, body: { conversationId, respond: true, reply: result.reply, dataQuestion: !!result.dataQuestion } };
   }
   if (!result) { const r = await generate(b); await persistAssistant("Built dashboard"); return withConv(r); }
 
-  const rewritten = { ...b, userPrompt: composePrompt(result) };
-  const dispatch = result.outputMode === "pdf" ? report : result.outputMode === "ppt" ? ppt : generate;
+  // Clarification and respond turns returned above; orchestrate() strips stray
+  // discriminator keys from briefs, so what remains is a build brief.
+  const brief = result as OrchestratorBrief;
+  const rewritten = { ...b, userPrompt: composePrompt(brief) };
+  const dispatch = brief.outputMode === "pdf" ? report : brief.outputMode === "ppt" ? ppt : generate;
   const res = await dispatch(rewritten);
-  if (res.status === 200 && res.body && typeof res.body === "object") res.body = { ...res.body, brief: result, conversationId };
-  await persistAssistant(result.title ?? `Built ${result.outputMode}`, result);
+  if (res.status === 200 && res.body && typeof res.body === "object") res.body = { ...res.body, brief, conversationId };
+  await persistAssistant(brief.title ?? `Built ${brief.outputMode}`, brief);
   return res;
 }
 
@@ -352,7 +355,7 @@ export async function handleOrchestrate(body: unknown, deps: OrchestrateDeps = {
     if (conversationId) history = await store.getHistory(conversationId);
     else conversationId = await store.createConversation(b.userPrompt.slice(0, 80));
     await store.appendMessage(conversationId, { role: "user", content: b.userPrompt });
-  } catch (e) { console.warn(`[orchestrate] memory unavailable: ${(e as Error).message}`); }
+  } catch (e: any) { console.warn(`[orchestrate] memory unavailable: ${e?.name ?? typeof e}: ${e?.message || String(e)}${e?.code ? ` (code ${e.code})` : ""}`); }
 
   const persist = async (content: string, brief?: any) => {
     try { await store.appendMessage(conversationId, { role: "assistant", content, briefJson: brief ? JSON.stringify(brief) : null, outputMode: brief?.outputMode ?? null }); } catch { /* best-effort */ }
@@ -370,16 +373,19 @@ export async function handleOrchestrate(body: unknown, deps: OrchestrateDeps = {
     await persist(result.question);
     return { status: 200, body: { conversationId, needsClarification: true, question: result.question } };
   }
-  if (result && "respond" in result) {
+  if (result && "respond" in result && result.respond === true) {
     console.log(`[orchestrate] -> respond (dataQuestion=${!!result.dataQuestion})`);
     await persist(result.reply);
     return { status: 200, body: { conversationId, respond: true, reply: result.reply, dataQuestion: !!result.dataQuestion } };
   }
   if (!result) { console.log("[orchestrate] planner returned null -> raw dashboard plan"); return rawPlan; }
 
-  console.log(`[orchestrate] -> mode=${result.outputMode} title="${result.title}"`);
-  await persist(result.title ?? `Plan: ${result.outputMode}`, result);
-  return { status: 200, body: { conversationId, brief: result, outputMode: result.outputMode, enhancedPrompt: composePrompt(result) } };
+  // Clarification and respond turns returned above; orchestrate() strips stray
+  // discriminator keys from briefs, so what remains is a build brief.
+  const brief = result as OrchestratorBrief;
+  console.log(`[orchestrate] -> mode=${brief.outputMode} title="${brief.title}"`);
+  await persist(brief.title ?? `Plan: ${brief.outputMode}`, brief);
+  return { status: 200, body: { conversationId, brief, outputMode: brief.outputMode, enhancedPrompt: composePrompt(brief) } };
 }
 
 /** Pure handler for POST /api/datasets — storage is injectable for tests. */
@@ -834,8 +840,28 @@ export function createServer() {
   // Spec-driven dashboard build (planner → validate/compile → deterministic render).
   // Returns { app, spec, warnings }; the client persists `spec` and sends it back as
   // currentSpec next turn so each prompt edits the same dashboard.
+  // CONVERSATION JOIN: when a conversationId rides along, the route (1) hands the
+  // handler the recent chat history so the edit planner can resolve references, and
+  // (2) writes BOTH sides of the turn into conversation memory — the user's ask
+  // (deduped: /api/gate and /api/orchestrate may have appended it already) and the
+  // assistant's change summary, which previously never entered memory at all.
   app.post("/api/dashboard/build", async (req, res) => {
-    const { status, body } = await handleDashboardBuild(req.body);
+    const convId = typeof (req.body as any)?.conversationId === "string" ? (req.body as any).conversationId : "";
+    const store = getChatStore();
+    let history: any[] = [];
+    if (convId) {
+      try { history = await store.getHistory(convId, 20); } catch { /* memory best-effort */ }
+    }
+    const { status, body } = await handleDashboardBuild({ ...(req.body as any), history });
+    if (status === 200 && convId) {
+      try {
+        const prompt = String((req.body as any).userPrompt ?? "");
+        const lastUser = [...history].reverse().find((m) => m?.role === "user");
+        if (prompt && lastUser?.content !== prompt) await store.appendMessage(convId, { role: "user", content: prompt });
+        const summary = Array.isArray(body.summary) ? body.summary.join(" ") : "";
+        if (summary) await store.appendMessage(convId, { role: "assistant", content: summary });
+      } catch { /* memory best-effort */ }
+    }
     res.status(status).json(body);
   });
 

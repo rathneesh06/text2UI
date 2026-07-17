@@ -85,13 +85,21 @@ export interface BuildDashboardRequest {
   /** al1: analyst-loop evidence pack (findings computed from the live DB) — outranks
    *  the brief's analytical half as the spec planner's directive on the first build. */
   analystDirective?: string;
+  /** Conversation join: enables chat memory for the planner, version history, and undo/redo. */
+  conversationId?: string;
+  /** The widget the user clicked in the preview — "this"/"that" in the next edit. */
+  selectedWidget?: { id?: string; title?: string };
 }
 export interface BuildDashboardResult {
-  app: GeneratedApp;
+  app: GeneratedApp | null;
   spec: DashboardSpec;
   warnings: string[];
   /** Human-readable description of what this turn changed. */
   summary?: string[];
+  /** Which pipeline served the turn: agents | planner | history (undo/redo). */
+  pipeline?: string;
+  /** True when a history intent had nothing to do (e.g. undo at the first version). */
+  noChange?: boolean;
 }
 export function buildDashboard(body: BuildDashboardRequest): Promise<BuildDashboardResult> {
   return request<BuildDashboardResult>("/api/dashboard/build", {

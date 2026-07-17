@@ -218,3 +218,17 @@
 }
 .cp-deck-title { font-size: 13px; font-weight: 600; color: #e5e7eb; }
 .cp-deck-scroll { flex: 1; min-height: 0; }
+/* Widget-selection chip: shows which widget the next edit targets */
+.cp-selchip {
+  display: inline-flex; align-items: center; gap: 6px;
+  margin: 0 0 6px 0; padding: 3px 8px;
+  border: 1px solid #c7d2fe; background: #eef2ff; color: #4338ca;
+  border-radius: 999px; font-size: 12px; max-width: 100%;
+}
+.cp-selchip-dot { width: 7px; height: 7px; border-radius: 50%; background: #6366f1; flex: none; }
+.cp-selchip-text { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.cp-selchip-x {
+  border: none; background: none; color: #6366f1; cursor: pointer;
+  font-size: 14px; line-height: 1; padding: 0 0 0 2px; flex: none;
+}
+.cp-selchip-x:hover { color: #312e81; }

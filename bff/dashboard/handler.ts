@@ -1,20 +1,65 @@
-// bff/dashboard/handler.ts — the spec-driven build endpoint. One call runs the whole
-// pipeline: plan (or edit) a DashboardSpec, validate+compile it to SQL, and render it
-// to a runnable app. It returns BOTH the app AND the spec; the client persists the
-// spec and sends it back as `currentSpec` next turn, so each prompt edits the same
-// dashboard. Pure handler (deps injectable) so it can be unit-tested without a server.
+// bff/dashboard/handler.ts — the spec-driven build endpoint, restored and upgraded.
+//
+// One call runs the whole pipeline:
+//
+//   enhance (ALWAYS)  →  specialist agents (parallel)  →  merge  →  validate/compile  →  render
+//                         kpi · bar · line · pie · table
+//
+//   1. The QUERY ENHANCEMENT LAYER (./enhance) runs on EVERY turn and produces the
+//      baseline instructions deterministically — schema roles, house rules, coverage
+//      minimums — regardless of how small the data or the prompt is. The best
+//      available model directive (analyst evidence > orchestrator brief > LLM
+//      rewrite) enriches it; none of them can suppress it.
+//   2. BUILD turns fan out to the per-widget agents (./agents): separate focused
+//      calls for KPI cards, bar charts, line/area trends, pie/donut compositions,
+//      and tables, each with a deterministic profile-derived fallback. The merger
+//      (./merge) assembles the harvest into one DashboardSpec.
+//   3. EDIT turns keep the single-planner minimal-mutation path (./planner) — a
+//      node-level edit of the persisted spec is one surgical change, not five
+//      parallel proposals — with the enhancement layer's instructions attached.
+//   4. The monolithic planner remains as a fallback for builds (kill-switch
+//      DASHBOARD_AGENTS=0, or an empty harvest), so the endpoint's contract and
+//      failure behavior only ever got stronger.
+//
+// It returns BOTH the app AND the spec; the client persists the spec and sends it
+// back as `currentSpec` next turn, so each prompt edits the same dashboard.
+// Pure handler (deps injectable) so it can be unit-tested without a server.
 import type { Dataset } from "../../shared/types";
 import type { DashboardSpec } from "../../shared/dashboard-spec";
-import { planSpec, rewritePrompt, HEX_RE, type PlanSpecInput } from "./planner";
+import { planSpec, HEX_RE, type PlanSpecInput } from "./planner";
+import { enhanceQuery, briefToStyleHints, briefToAnalyticalDirective, type Enhancement } from "./enhance";
+import { runChartAgents, type AgentRun, type AgentHarvest } from "./agents";
+import { mergeHarvest, DEFAULT_PALETTE } from "./merge";
 import { compileSpec } from "./compile";
+import { pushVersion, undo, redo, decisionsText, detectHistoryIntent, cursorIndex } from "./session";
+import { reconcileEdit } from "./reconcile";
 import { renderPlanToApp } from "./renderer";
 
+// Re-exported so existing imports/tests keep working after the brief helpers
+// moved into the enhancement layer where they belong.
+export { briefToStyleHints, briefToAnalyticalDirective };
+
 type Planner = (input: PlanSpecInput) => Promise<DashboardSpec | null>;
+const AGENTS_ENABLED = (process.env.DASHBOARD_AGENTS ?? "1") === "1";
+
+export interface HandlerDeps {
+  planner?: Planner;
+  agentRun?: AgentRun;
+  /** injectable for tests: skip the enhancement layer's LLM rewrite */
+  skipRewrite?: boolean;
+}
 
 export async function handleDashboardBuild(
   body: unknown,
-  planner: Planner = planSpec,
+  plannerOrDeps: Planner | HandlerDeps = {},
 ): Promise<{ status: number; body: any }> {
+  // Back-compat: the old signature took the planner function directly. A directly
+  // injected planner also PINS the planner path (tests inject fakes and must stay
+  // offline — fanning out to the real agents would defeat the injection).
+  const legacyPlannerInjected = typeof plannerOrDeps === "function";
+  const deps: HandlerDeps = legacyPlannerInjected ? { planner: plannerOrDeps as Planner } : (plannerOrDeps as HandlerDeps);
+  const planner = deps.planner ?? planSpec;
+
   const b = body as any;
   if (!b || typeof b !== "object") return { status: 400, body: { error: "body must be a JSON object" } };
   if (!Array.isArray(b.datasets) || !b.datasets.length) return { status: 400, body: { error: "datasets[] is required" } };
@@ -22,38 +67,161 @@ export async function handleDashboardBuild(
 
   const datasets = b.datasets as Dataset[];
   const currentSpec = b.currentSpec as DashboardSpec | undefined;
-  // The orchestrator's brief becomes BOTH directives for the spec planner: its
-  // palette/designDirection as visual direction, and its kpis/charts as the
-  // analytical directive. When there is no brief (edit turns, direct builds),
-  // the query-rewriting stage expands the raw ask into schema-grounded modeling
-  // instructions instead. Either path may fail soft — the raw prompt proceeds.
-  const styleHints = briefToStyleHints(b.brief);
-  // al1: an analyst-loop evidence pack (real findings computed from the live DB
-  // before the build) outranks both the brief's analytical half and the query
-  // rewriter -- it is the most grounded directive we can have.
-  const analystDirective = typeof b.analystDirective === "string" && b.analystDirective.trim() ? b.analystDirective.trim() : null;
-  const directive = analystDirective
-    ?? briefToAnalyticalDirective(b.brief)
-    ?? await rewritePrompt({ datasets, userPrompt: b.userPrompt, ...(currentSpec ? { currentSpec } : {}) });
-  // al4 diagnostic: WHICH directive reached the spec planner. If a workbench
-  // build logs "brief"/"rewriter" instead of "analyst evidence", the evidence
-  // was dropped on the way (that produced duplicate count(*) KPIs pre-al4).
-  console.log(`[dashboard] directive: ${analystDirective ? `analyst evidence (${analystDirective.length} chars)` : briefToAnalyticalDirective(b.brief) ? "orchestrator brief" : directive ? "query rewriter" : "none"}`);
+  const conversationId: string = typeof b.conversationId === "string" ? b.conversationId : "";
+  const selectedWidget = b.selectedWidget && typeof b.selectedWidget === "object"
+    ? { id: b.selectedWidget.id ? String(b.selectedWidget.id) : undefined, title: b.selectedWidget.title ? String(b.selectedWidget.title) : undefined }
+    : undefined;
 
+  // ---- Diff History: undo/redo are deterministic, instant, and exact ----------
+  // A bare "undo"/"redo" NEVER goes to a model — the session's version stack is
+  // the truth, and re-rendering a stored spec cannot drift.
+  const historyIntent = currentSpec && conversationId ? detectHistoryIntent(b.userPrompt) : null;
+  if (historyIntent) {
+    const v = historyIntent === "undo" ? undo(conversationId) : redo(conversationId);
+    if (!v) {
+      return { status: 200, body: { app: null, spec: currentSpec, warnings: [], noChange: true, pipeline: "history",
+        summary: [historyIntent === "undo" ? "Nothing to undo — this is the earliest version I have." : "Nothing to redo — you are on the latest version."] } };
+    }
+    const plan = compileSpec(v.spec, datasets);
+    if (!plan.sections.length) return { status: 422, body: { error: "stored version no longer valid for this data", warnings: plan.warnings } };
+    const app = renderPlanToApp(plan);
+    const n = cursorIndex(conversationId) + 1;
+    console.log(`[dashboard] ${historyIntent} -> version ${n} ("${v.spec.meta.title}")`);
+    return { status: 200, body: { app, spec: plan.spec, warnings: plan.warnings, pipeline: "history",
+      summary: [`${historyIntent === "undo" ? "Reverted to" : "Restored"} version ${n} — the one from "${v.prompt.slice(0, 60)}".`] } };
+  }
+
+  // ---- Context Manager: the conversation reaches the edit planner -------------
+  const chatContext = buildChatContext(b.history, conversationId);
+
+  // ---- Stage 1: the query enhancement layer (always on, never null) ----------
+  const enhancement = await enhanceQuery({
+    datasets, userPrompt: b.userPrompt,
+    ...(currentSpec ? { currentSpec } : {}),
+    ...(b.brief ? { brief: b.brief } : {}),
+    ...(typeof b.analystDirective === "string" ? { analystDirective: b.analystDirective } : {}),
+    ...(deps.skipRewrite || legacyPlannerInjected ? { skipRewrite: true } : {}),
+  });
+  console.log(`[dashboard] directive source: ${enhancement.directiveSource} (${enhancement.combined.length} chars, baseline always applied)`);
+
+  let spec: DashboardSpec | null = null;
+  let pipeline: "agents" | "planner" = "planner";
+
+  if (!currentSpec && AGENTS_ENABLED && !legacyPlannerInjected) {
+    // ---- Stage 2 (builds): parallel specialist agents + deterministic merge ----
+    const harvest = await runChartAgents(
+      { datasets, userPrompt: b.userPrompt, directive: withStyle(enhancement) },
+      deps.agentRun,
+    );
+    const merged = mergeHarvest(harvest, datasets, b.userPrompt, mergeStyle(b.brief));
+    if (countWidgets(merged) > 0) { spec = merged; pipeline = "agents"; }
+    else console.warn("[dashboard] agent harvest empty — falling back to the monolithic planner");
+  }
+
+  let healedNotes: string[] = [];
+  if (!spec) {
+    // ---- Planner path: edit turns, kill-switch, or agent-harvest fallback ------
+    spec = await runPlannerPath(planner, datasets, b.userPrompt, enhancement, currentSpec, chatContext, selectedWidget);
+    if (!spec) return { status: 502, body: { error: "planner could not produce a dashboard spec" } };
+    // EDIT RECONCILIATION: the previous version is the truth for everything the
+    // user didn't touch — heal any kept widget the model re-emitted with missing
+    // required fields, BEFORE validation gets a chance to drop it. A style-only
+    // edit can no longer gut the board because the model forgot the series arrays.
+    if (currentSpec) {
+      const r = reconcileEdit(currentSpec, spec);
+      spec = r.spec;
+      healedNotes = r.healed;
+      if (r.healed.length) console.log(`[dashboard] edit reconciliation healed ${r.healed.length} field(s): ${r.healed.slice(0, 4).join(" | ")}${r.healed.length > 4 ? " | …" : ""}`);
+    }
+  }
+
+  // Vibrancy guarantee: never ship on drab defaults.
+  if (!spec.meta.chartPalette?.length) spec.meta.chartPalette = DEFAULT_PALETTE;
+  if (!spec.meta.accent || !HEX_RE.test(spec.meta.accent)) spec.meta.accent = spec.meta.chartPalette[0];
+
+  // ---- Stage 3: validate + compile to deterministic SQL, then render ----------
+  const plan = compileSpec(spec, datasets);
+  if (!plan.sections.length) {
+    return { status: 422, body: { error: "no valid widgets after validation", warnings: plan.warnings } };
+  }
+
+  const app = renderPlanToApp(plan);
+  // al5: return the VALIDATED spec — the one that actually rendered. Returning
+  // the raw planner spec meant the summary counted widgets validation had
+  // dropped ("5 widgets" for a 4-widget board) and the client persisted ghost
+  // widgets as currentSpec, so the next edit turn reasoned about things that
+  // were not on screen.
+  const rendered = plan.spec;
+  const dropped = allWidgets(spec).length - allWidgets(rendered).length;
+  if (dropped > 0) console.log(`[dashboard] validation dropped ${dropped} widget(s): ${plan.warnings.join(" | ")}`);
+  const warnings = [...healedNotes, ...plan.warnings];
+  const summary = summarizeSpecChange(currentSpec, rendered);
+  // Diff History: every accepted version enters the conversation's undo stack.
+  if (conversationId) pushVersion(conversationId, rendered, summary.join(" "), b.userPrompt);
+  return {
+    status: 200,
+    body: { app, spec: rendered, warnings, summary, pipeline },
+  };
+}
+
+/** Render the recent conversation + rolling decisions for the edit planner.
+ *  History arrives from the route (chat store) or the client; decisions come
+ *  from this module's session. Either alone is still useful; both is best. */
+function buildChatContext(history: unknown, conversationId: string): string | null {
+  const parts: string[] = [];
+  if (Array.isArray(history) && history.length) {
+    const turns = history
+      .filter((m: any) => m && (m.role === "user" || m.role === "assistant") && typeof m.content === "string" && m.content.trim())
+      .slice(-8)
+      .map((m: any) => `${m.role === "user" ? "User" : "Assistant"}: ${String(m.content).slice(0, 220)}`);
+    if (turns.length) parts.push(turns.join("\n"));
+  }
+  const d = decisionsText(conversationId);
+  if (d) parts.push(d);
+  return parts.length ? parts.join("\n\n") : null;
+}
+
+/** The enhancement's combined directive plus the visual direction, for the agents. */
+function withStyle(e: Enhancement): string {
+  return e.styleHints ? `${e.combined}\n\nVISUAL DIRECTION: ${e.styleHints}` : e.combined;
+}
+
+/** Pull concrete style choices out of an orchestrator brief for the merger. */
+function mergeStyle(brief: any): { title?: string; accent?: string; chartPalette?: string[] } {
+  const out: { title?: string; accent?: string; chartPalette?: string[] } = {};
+  if (brief && typeof brief === "object") {
+    if (typeof brief.title === "string" && brief.title.trim()) out.title = brief.title.trim();
+    const p = brief.palette;
+    if (p && typeof p === "object") {
+      if (HEX_RE.test(String(p.primary ?? ""))) out.accent = String(p.primary);
+      const pal = [p.primary, p.accent, ...(Array.isArray(p.neutrals) ? p.neutrals : [])]
+        .map(String).filter((c) => HEX_RE.test(c));
+      if (pal.length >= 3) out.chartPalette = pal.slice(0, 8);
+    }
+  }
+  return out;
+}
+
+/** The original single-planner flow, kept intact: plan once, verify house-style
+ *  coverage, one corrective retry when short, accept-with-warning otherwise. */
+async function runPlannerPath(
+  planner: Planner, datasets: Dataset[], userPrompt: string,
+  enhancement: Enhancement, currentSpec?: DashboardSpec,
+  chatContext?: string | null, selectedWidget?: { id?: string; title?: string },
+): Promise<DashboardSpec | null> {
   const planOnce = (extra?: string) => planner({
     datasets,
-    userPrompt: extra ? `${b.userPrompt}\n\n${extra}` : b.userPrompt,
+    userPrompt: extra ? `${userPrompt}\n\n${extra}` : userPrompt,
     currentSpec,
-    ...(styleHints ? { styleHints } : {}),
-    ...(directive ? { directive } : {}),
+    ...(enhancement.styleHints ? { styleHints: enhancement.styleHints } : {}),
+    ...(chatContext ? { chatContext } : {}),
+    ...(selectedWidget ? { selectedWidget } : {}),
+    directive: enhancement.combined,   // the enhancement layer's guarantee: never absent
   });
 
   let spec = await planOnce();
-  if (!spec) return { status: 502, body: { error: "planner could not produce a dashboard spec" } };
+  if (!spec) return null;
 
-  // HOUSE-STYLE ENFORCEMENT (deterministic — the model is instructed, but the
-  // guarantee lives here): >=4 charts and >=3 KPIs on builds, one corrective
-  // retry when short, then accept with a warning rather than block.
   const shortfalls = coverageShortfalls(spec, datasets);
   if (shortfalls.length && !currentSpec) {
     console.log(`[dashboard] coverage shortfall -> re-plan: ${shortfalls.join("; ")}`);
@@ -72,40 +240,7 @@ export async function handleDashboardBuild(
       }
     }
   }
-  // Vibrancy guarantee: never ship on drab defaults.
-  if (!spec.meta.chartPalette?.length) spec.meta.chartPalette = ["#7c3aed", "#06b6d4", "#f59e0b", "#10b981", "#f43f5e", "#3b82f6"];
-  if (!spec.meta.accent || !HEX_RE.test(spec.meta.accent)) spec.meta.accent = spec.meta.chartPalette[0];
-
-  const plan = compileSpec(spec, datasets);
-  if (!plan.sections.length) {
-    return { status: 422, body: { error: "no valid widgets after validation", warnings: plan.warnings } };
-  }
-
-  const app = renderPlanToApp(plan);
-  // al5: return the VALIDATED spec — the one that actually rendered. Returning
-  // the raw planner spec meant the summary counted widgets validation had
-  // dropped ("5 widgets" for a 4-widget board) and the client persisted ghost
-  // widgets as currentSpec, so the next edit turn reasoned about things that
-  // were not on screen.
-  const rendered = plan.spec;
-  const dropped = allWidgets(spec).length - allWidgets(rendered).length;
-  if (dropped > 0) console.log(`[dashboard] validation dropped ${dropped} widget(s): ${plan.warnings.join(" | ")}`);
-  return { status: 200, body: { app, spec: rendered, warnings: plan.warnings, summary: summarizeSpecChange(currentSpec, rendered) } };
-}
-
-/** The brief's ANALYTICAL half (kpis + charts) as a directive for the spec
- *  planner — first builds get the orchestrator's content plan for free, no
- *  extra model call. */
-export function briefToAnalyticalDirective(brief: any): string | null {
-  if (!brief || typeof brief !== "object") return null;
-  const bits: string[] = [];
-  if (Array.isArray(brief.kpis) && brief.kpis.length) bits.push(`Headline KPI cards: ${brief.kpis.join("; ")}.`);
-  if (Array.isArray(brief.charts) && brief.charts.length) {
-    const cs = brief.charts.map((c: any) => `${c?.type ?? "chart"} of ${c?.y ?? "?"} by ${c?.x ?? "?"}${c?.why ? ` — ${c.why}` : ""}`).join("; ");
-    bits.push(`Charts: ${cs}.`);
-  }
-  if (typeof brief.enhancedPrompt === "string" && brief.enhancedPrompt.trim()) bits.push(brief.enhancedPrompt.trim());
-  return bits.length ? bits.join(" ") : null;
+  return spec;
 }
 
 /** House-style coverage check: what a build is missing vs the minimums
@@ -122,6 +257,10 @@ function chartCount(spec: DashboardSpec): number {
   return allWidgets(spec).filter((w: any) => CHART_KINDS.has(w.kind)).length;
 }
 
+function countWidgets(spec: DashboardSpec): number {
+  return allWidgets(spec).length;
+}
+
 export function coverageShortfalls(spec: DashboardSpec, datasets: Dataset[]): string[] {
   const widgets = allWidgets(spec);
   const charts = widgets.filter((w: any) => CHART_KINDS.has(w.kind));
@@ -136,22 +275,6 @@ export function coverageShortfalls(spec: DashboardSpec, datasets: Dataset[]): st
   if (charts.length >= wantCharts && types.size < wantTypes) out.push(`only ${types.size} chart type(s), use at least ${wantTypes} different types (bar/line/area/pie)`);
   if (kpis.length < wantKpis) out.push(`only ${kpis.length} KPI card(s), need at least ${wantKpis}`);
   return out;
-}
-
-/** Flatten an orchestrator brief into a one-line visual directive. Tolerant of
- *  partial/absent briefs — returns null when there is nothing useful. */
-export function briefToStyleHints(brief: any): string | null {
-  if (!brief || typeof brief !== "object") return null;
-  const bits: string[] = [];
-  const p = brief.palette;
-  if (p && typeof p === "object") {
-    if (p.primary) bits.push(`primary ${p.primary}`);
-    if (p.accent) bits.push(`accent ${p.accent}`);
-    if (Array.isArray(p.neutrals) && p.neutrals.length) bits.push(`neutrals ${p.neutrals.join(" ")}`);
-    if (p.vibe) bits.push(`vibe: ${p.vibe}`);
-  }
-  if (typeof brief.designDirection === "string" && brief.designDirection.trim()) bits.push(brief.designDirection.trim());
-  return bits.length ? bits.join(" · ") : null;
 }
 
 const allWidgets = (s: DashboardSpec) => s.sections.flatMap((sec) => sec.widgets ?? []);

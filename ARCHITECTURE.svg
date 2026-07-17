@@ -1,0 +1,252 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1720 1500" font-family="'Segoe UI', system-ui, -apple-system, sans-serif">
+  <defs>
+    <filter id="shadow" x="-4%" y="-4%" width="108%" height="112%">
+      <feDropShadow dx="0" dy="1.5" stdDeviation="2.5" flood-color="#0f172a" flood-opacity="0.14"/>
+    </filter>
+    <marker id="ah-violet" markerWidth="9" markerHeight="9" refX="7" refY="4.5" orient="auto"><path d="M0,0 L9,4.5 L0,9 Z" fill="#7c3aed"/></marker>
+    <marker id="ah-orange" markerWidth="9" markerHeight="9" refX="7" refY="4.5" orient="auto"><path d="M0,0 L9,4.5 L0,9 Z" fill="#ea580c"/></marker>
+    <marker id="ah-green" markerWidth="9" markerHeight="9" refX="7" refY="4.5" orient="auto"><path d="M0,0 L9,4.5 L0,9 Z" fill="#059669"/></marker>
+    <marker id="ah-gray" markerWidth="9" markerHeight="9" refX="7" refY="4.5" orient="auto"><path d="M0,0 L9,4.5 L0,9 Z" fill="#64748b"/></marker>
+    <marker id="ah-slate" markerWidth="10" markerHeight="10" refX="8" refY="5" orient="auto"><path d="M0,0 L10,5 L0,10 Z" fill="#475569"/></marker>
+    <marker id="ah-slate-start" markerWidth="10" markerHeight="10" refX="2" refY="5" orient="auto"><path d="M10,0 L0,5 L10,10 Z" fill="#475569"/></marker>
+  </defs>
+
+  <rect x="0" y="0" width="1720" height="1500" fill="#f1f5f9"/>
+
+  <!-- ===== Title ===== -->
+  <text x="40" y="42" font-size="27" font-weight="700" fill="#0f172a">text2UI — System Architecture</text>
+  <text x="41" y="64" font-size="13.5" fill="#475569">Prompt + data → live full-stack app · dashboards · decks · PDFs.  In-browser Sandpack preview, Gemini-powered Node/Express BFF, DuckDB/Postgres storage.</text>
+
+  <!-- Legend -->
+  <g font-size="11.5">
+    <rect x="1245" y="16" width="455" height="52" rx="8" fill="#ffffff" stroke="#cbd5e1"/>
+    <text x="1258" y="34" font-weight="700" fill="#334155">Legend</text>
+    <text x="1258" y="52" fill="#475569">◆ = Gemini LLM call</text>
+    <line x1="1258" y1="60" x2="1284" y2="60" stroke="#7c3aed" stroke-width="2.5"/><text x="1290" y="63" fill="#475569">LLM</text>
+    <line x1="1330" y1="60" x2="1356" y2="60" stroke="#ea580c" stroke-width="2.5"/><text x="1362" y="63" fill="#475569">binary/sidecar</text>
+    <line x1="1470" y1="60" x2="1496" y2="60" stroke="#059669" stroke-width="2.5"/><text x="1502" y="63" fill="#475569">database</text>
+    <line x1="1580" y1="60" x2="1606" y2="60" stroke="#64748b" stroke-width="2.5"/><text x="1612" y="63" fill="#475569">CDN</text>
+    <text x="1420" y="34" fill="#475569">via docker-compose: web · bff · db(pg) · markitdown</text>
+  </g>
+
+  <!-- ============================================================ -->
+  <!-- BAND A — CLIENT -->
+  <!-- ============================================================ -->
+  <rect x="40" y="84" width="1640" height="210" rx="12" fill="#eef2ff" stroke="#c7d2fe" filter="url(#shadow)"/>
+  <text x="60" y="112" font-size="16" font-weight="700" fill="#3730a3">Browser — React SPA (Vite)  ·  src/App.tsx routed shell</text>
+
+  <!-- A1 Pages -->
+  <g>
+    <rect x="56" y="124" width="396" height="158" rx="9" fill="#ffffff" stroke="#c7d2fe"/>
+    <rect x="56" y="124" width="5" height="158" rx="2.5" fill="#6366f1"/>
+    <text x="72" y="145" font-size="13" font-weight="700" fill="#312e81">Pages (React Router)</text>
+    <text x="72" y="166" font-size="11.5" fill="#334155"><tspan x="72" dy="0">▸ LandingPage &#160;/</tspan><tspan x="72" dy="16">▸ DashboardPage &#160;/dashboard &#160;(codegen)</tspan><tspan x="72" dy="16">▸ ChatPage &#160;/build &#160;(spec-driven)</tspan><tspan x="72" dy="16">▸ WorkbenchPage &#160;/workbench · /postgres</tspan><tspan x="72" dy="16">▸ ProjectsPage &#160;/projects</tspan><tspan x="72" dy="16">▸ StyleGuidePage · DocumentPage</tspan></text>
+  </g>
+  <!-- A2 Components -->
+  <g>
+    <rect x="464" y="124" width="396" height="158" rx="9" fill="#ffffff" stroke="#c7d2fe"/>
+    <rect x="464" y="124" width="5" height="158" rx="2.5" fill="#6366f1"/>
+    <text x="480" y="145" font-size="13" font-weight="700" fill="#312e81">Components</text>
+    <text x="480" y="166" font-size="11.5" fill="#334155"><tspan x="480" dy="0">▸ Sandbox &#160;(Sandpack iframe — runs gen app)</tspan><tspan x="480" dy="16">▸ LivePreview · FinalDesign</tspan><tspan x="480" dy="16">▸ CodeViewer · FeatureInspector</tspan><tspan x="480" dy="16">▸ DeckPreview · PromptInput</tspan><tspan x="480" dy="16">▸ Sidebar · ProgressBar</tspan></text>
+  </g>
+  <!-- A3 Client libs -->
+  <g>
+    <rect x="872" y="124" width="396" height="158" rx="9" fill="#ffffff" stroke="#c7d2fe"/>
+    <rect x="872" y="124" width="5" height="158" rx="2.5" fill="#6366f1"/>
+    <text x="888" y="145" font-size="13" font-weight="700" fill="#312e81">Client libs (src/lib)</text>
+    <text x="888" y="166" font-size="11.5" fill="#334155"><tspan x="888" dy="0">▸ ingest &#160;(papaparse · xlsx)</tspan><tspan x="888" dy="16">▸ datasets &#160;(type profiling)</tspan><tspan x="888" dy="16">▸ data / sandbox &#160;build config</tspan><tspan x="888" dy="16">▸ DuckDB-WASM &#160;(inline data mode)</tspan><tspan x="888" dy="16">▸ remote mode → POST /api/query</tspan></text>
+  </g>
+  <!-- A4 API clients -->
+  <g>
+    <rect x="1280" y="124" width="396" height="158" rx="9" fill="#ffffff" stroke="#c7d2fe"/>
+    <rect x="1280" y="124" width="5" height="158" rx="2.5" fill="#6366f1"/>
+    <text x="1296" y="145" font-size="13" font-weight="700" fill="#312e81">API clients</text>
+    <text x="1296" y="166" font-size="11.5" fill="#334155"><tspan x="1296" dy="0">▸ api.ts &#160;→ /api/*</tspan><tspan x="1296" dy="16">▸ workbench-api.ts → /api/sql/*</tspan><tspan x="1296" dy="16">▸ fetch (JSON) · SSE stream reader</tspan><tspan x="1296" dy="16">▸ Bearer token → tenant (VITE_AUTH)</tspan><tspan x="1296" dy="16">▸ inline vs REMOTE_DATA switch</tspan></text>
+  </g>
+
+  <!-- Client <-> BFF connector -->
+  <line x1="860" y1="294" x2="860" y2="316" stroke="#475569" stroke-width="2.5" marker-end="url(#ah-slate)" marker-start="url(#ah-slate-start)"/>
+  <rect x="612" y="296" width="496" height="18" rx="9" fill="#e2e8f0"/>
+  <text x="860" y="309" font-size="11.5" font-weight="600" fill="#334155" text-anchor="middle">HTTPS · JSON &amp; SSE  ·  Bearer-token auth  ·  key stays server-side</text>
+
+  <!-- ============================================================ -->
+  <!-- BAND B — BFF -->
+  <!-- ============================================================ -->
+  <rect x="40" y="316" width="1640" height="912" rx="12" fill="#f8fafc" stroke="#cbd5e1" filter="url(#shadow)"/>
+  <text x="60" y="343" font-size="16" font-weight="700" fill="#0f172a">BFF — Node + Express  (bff/server.ts, :8787)</text>
+
+  <!-- Middleware strip -->
+  <rect x="56" y="352" width="1608" height="42" rx="8" fill="#fef9c3" stroke="#fde047"/>
+  <text x="66" y="378" font-size="12" font-weight="600" fill="#713f12">Middleware:  security (CORS + headers)  ·  auth (Bearer → tenantId)  ·  ratelimit (request rate + token/cost quota)  ·  express.json (64 MB)  ·  metrics (AsyncLocalStorage tokens/cost)  ·  /health</text>
+
+  <!-- ===== Row 1 ===== -->
+  <!-- B: Orchestration -->
+  <g>
+    <rect x="56" y="408" width="520" height="200" rx="9" fill="#ffffff" stroke="#cbd5e1"/>
+    <rect x="56" y="408" width="5" height="200" rx="2.5" fill="#0ea5e9"/>
+    <text x="72" y="429" font-size="13" font-weight="700" fill="#0c4a6e">Orchestration &amp; Conversation Memory</text>
+    <text x="72" y="447" font-size="10.5" fill="#64748b" font-family="monospace">/api/chat · /api/orchestrate · /api/gate · /api/conversations</text>
+    <text x="72" y="468" font-size="11.5" fill="#334155"><tspan x="72" dy="0">▸ orchestrator ◆ — brief: mode · KPIs · charts · palette</tspan><tspan x="72" dy="16">▸ composePrompt · gateTurn (edit vs answer vs chat)</tspan><tspan x="72" dy="16">▸ chat-store — in-memory | Postgres (_conversations)</tspan><tspan x="72" dy="16">▸ routes output → dashboard / pdf / ppt pipeline</tspan><tspan x="72" dy="16">▸ clarify · respond · dataQuestion branches</tspan></text>
+  </g>
+  <!-- B: Codegen core -->
+  <g>
+    <rect x="592" y="408" width="520" height="200" rx="9" fill="#ffffff" stroke="#cbd5e1"/>
+    <rect x="592" y="408" width="5" height="200" rx="2.5" fill="#7c3aed"/>
+    <text x="608" y="429" font-size="13" font-weight="700" fill="#4c1d95">Codegen Core  (freeform App.tsx generation)</text>
+    <text x="608" y="447" font-size="10.5" fill="#64748b" font-family="monospace">/api/generate · /api/generate/stream · /api/summary</text>
+    <text x="608" y="468" font-size="11.5" fill="#334155"><tspan x="608" dy="0">▸ assembler — builds system + user prompt (inline/remote)</tspan><tspan x="608" dy="16">▸ aiflow ◆ — Gemini client · stitch loop · SSE stream</tspan><tspan x="608" dy="16">▸ domain · design · exemplars — priors · theme · few-shot</tspan><tspan x="608" dy="16">▸ heal — self-heal by error class (SQL/TS/runtime)</tspan><tspan x="608" dy="16">▸ tailwind → CLI · metrics — tokens · cost · latency</tspan></text>
+  </g>
+  <!-- B: design-rag -->
+  <g>
+    <rect x="1128" y="408" width="536" height="200" rx="9" fill="#ffffff" stroke="#cbd5e1"/>
+    <rect x="1128" y="408" width="5" height="200" rx="2.5" fill="#db2777"/>
+    <text x="1144" y="429" font-size="13" font-weight="700" fill="#831843">design-rag  (retrieval-augmented design refs · flag-gated)</text>
+    <text x="1144" y="447" font-size="10.5" fill="#64748b" font-family="monospace">build-turn hook: retrieveForBuild · enrollGeneration</text>
+    <text x="1144" y="468" font-size="11" fill="#334155"><tspan x="1144" dy="0">▸ Retrieve: build-context · retrieve · embeddings ◆ · caption ◆</tspan><tspan x="1144" dy="15.5">▸ Ingest: enroll · ingest · seed · import · gallery · site-capture · hash</tspan><tspan x="1144" dy="15.5">▸ Store: store → Postgres/pgvector (_design_refs) · corpus/ PNGs</tspan><tspan x="1144" dy="15.5">▸ Render: render · render-service · render-data (Chromium · esm.sh)</tspan><tspan x="1144" dy="15.5">▸ Synth: generate·archetypes·knobs·distributions·timeseries·prng</tspan></text>
+  </g>
+
+  <!-- ===== Row 2 ===== -->
+  <!-- B: Dashboard spec pipeline -->
+  <g>
+    <rect x="56" y="622" width="520" height="216" rx="9" fill="#ffffff" stroke="#cbd5e1"/>
+    <rect x="56" y="622" width="5" height="216" rx="2.5" fill="#0d9488"/>
+    <text x="72" y="643" font-size="13" font-weight="700" fill="#134e4a">Dashboard Spec Pipeline</text>
+    <text x="72" y="661" font-size="10.5" fill="#64748b" font-family="monospace">/api/dashboard/build</text>
+    <text x="72" y="682" font-size="11.5" fill="#334155"><tspan x="72" dy="0">▸ planner ◆ — prompt/brief → typed DashboardSpec</tspan><tspan x="72" dy="16.5">▸ validate — repair spec against real data profile</tspan><tspan x="72" dy="16.5">▸ sql — deterministic, dialect-safe DuckDB SELECT</tspan><tspan x="72" dy="16.5">▸ compile — spec → RenderPlan (SQL per widget)</tspan><tspan x="72" dy="16.5">▸ renderer — fixed App.tsx (never model-authored)</tspan><tspan x="72" dy="16.5">▸ house-style coverage checks + 1 corrective replan</tspan></text>
+  </g>
+  <!-- B: Deck pipeline -->
+  <g>
+    <rect x="592" y="622" width="520" height="216" rx="9" fill="#ffffff" stroke="#cbd5e1"/>
+    <rect x="592" y="622" width="5" height="216" rx="2.5" fill="#ea580c"/>
+    <text x="608" y="643" font-size="13" font-weight="700" fill="#7c2d12">Deck / Slides Pipeline  (bff/deck)</text>
+    <text x="608" y="661" font-size="10.5" fill="#64748b" font-family="monospace">/api/deck/build · /api/deck/preview · /api/session/:id</text>
+    <text x="608" y="681" font-size="11" fill="#334155"><tspan x="608" dy="0">▸ Plan: facts · catalog(-store) · outline-planner ◆ · slide-planner ◆</tspan><tspan x="608" dy="15.5">▸ Validate: narrative-validate · content-validate · visual-fallback</tspan><tspan x="608" dy="15.5">▸ Render: compile (shared dashboard SQL) · pptx (pptxgenjs)</tspan><tspan x="608" dy="15.5">▸ Edit: edit-planner ◆ · edit-ops (targeted ops, else replan)</tspan><tspan x="608" dy="15.5">▸ State: spec-store · session-store · session-router · asset-store</tspan><tspan x="608" dy="15.5">▸ Ingest: doc-parse (jszip) · doc-bridge · image-parse · local-data</tspan><tspan x="608" dy="15.5">▸ Preview: render-preview → LibreOffice → pdfjs → canvas</tspan></text>
+  </g>
+  <!-- B: Doc + export -->
+  <g>
+    <rect x="1128" y="622" width="536" height="216" rx="9" fill="#ffffff" stroke="#cbd5e1"/>
+    <rect x="1128" y="622" width="5" height="216" rx="2.5" fill="#ca8a04"/>
+    <text x="1144" y="643" font-size="13" font-weight="700" fill="#713f12">Doc Pipelines &amp; Export</text>
+    <text x="1144" y="661" font-size="10.5" fill="#64748b" font-family="monospace">/api/report · /api/ppt · /api/export · /api/convert-doc</text>
+    <text x="1144" y="682" font-size="11.5" fill="#334155"><tspan x="1144" dy="0">▸ report ◆ → pdfkit  (single-shot PDF)</tspan><tspan x="1144" dy="16.5">▸ slides ◆ → pptxgenjs  (single-shot PPT)</tspan><tspan x="1144" dy="16.5">▸ export — scaffold runnable Vite project (jszip)</tspan><tspan x="1144" dy="16.5">▸ dbexport — portable schema.sql + seed.sql</tspan><tspan x="1144" dy="16.5">▸ markitdown → sidecar (PDF/Word/PPT → markdown)</tspan><tspan x="1144" dy="16.5">▸ inline (DuckDB-WASM) or remote (/api/query) bundle</tspan></text>
+  </g>
+
+  <!-- ===== Row 3 ===== -->
+  <!-- B: text2SQL -->
+  <g>
+    <rect x="56" y="852" width="520" height="250" rx="9" fill="#ffffff" stroke="#cbd5e1"/>
+    <rect x="56" y="852" width="5" height="250" rx="2.5" fill="#2563eb"/>
+    <text x="72" y="873" font-size="13" font-weight="700" fill="#1e3a8a">text2SQL  (SQL Workbench + Analyst loop)</text>
+    <text x="72" y="890" font-size="9.5" fill="#64748b" font-family="monospace">/api/sql/connect·chat·extract·extract-db · /api/source/chat</text>
+    <text x="72" y="903" font-size="9.5" fill="#64748b" font-family="monospace">/api/sql/stage · /api/sources · /api/sources/combine</text>
+    <text x="72" y="924" font-size="11.5" fill="#334155"><tspan x="72" dy="0">▸ planner ◆ — intent (query/preview/extract/build/chat) + SQL</tspan><tspan x="72" dy="16.5">▸ grounding ◆ — cell-value links (DISTINCT probes)</tspan><tspan x="72" dy="16.5">▸ analysis-planner ◆ — decompose into 4–8 sub-questions</tspan><tspan x="72" dy="16.5">▸ analyst — parallel exec + deterministic summary + evidence</tspan><tspan x="72" dy="16.5">▸ composer ◆ — grounded natural-language answer</tspan><tspan x="72" dy="16.5">▸ guard — read-only assert + row-cap (subselect wrap)</tspan><tspan x="72" dy="16.5">▸ al1 analyst-loop · al2 live sources · al3 multi-DB groups</tspan></text>
+  </g>
+  <!-- B: Sources -->
+  <g>
+    <rect x="592" y="852" width="520" height="250" rx="9" fill="#ffffff" stroke="#cbd5e1"/>
+    <rect x="592" y="852" width="5" height="250" rx="2.5" fill="#16a34a"/>
+    <text x="608" y="873" font-size="13" font-weight="700" fill="#14532d">Sources  (bff/sources)</text>
+    <text x="608" y="890" font-size="10.5" fill="#64748b" font-family="monospace">named backend data sources → GET /api/sources</text>
+    <text x="608" y="911" font-size="11.5" fill="#334155"><tspan x="608" dy="0">▸ colo — curated snapshot (coloQuery · coloProfiles)</tspan><tspan x="608" dy="16.5">▸ workbench-store — wb_* extracts (manifest.json,</tspan><tspan x="608" dy="16.5">&#160;&#160;&#160;stage_*.duckdb, wb_*.duckdb · combine · tenant-scoped)</tspan><tspan x="608" dy="16.5">▸ connection-registry — live_* conns (TTL 4h · groups)</tspan><tspan x="608" dy="16.5">▸ db-conn — MySQL + Postgres dialect layer</tspan><tspan x="608" dy="16.5">▸ mysql · mysql-snapshot · model · size-check</tspan><tspan x="608" dy="16.5">▸ live attach via DuckDB mysql / postgres extensions</tspan></text>
+  </g>
+  <!-- B: Storage -->
+  <g>
+    <rect x="1128" y="852" width="536" height="250" rx="9" fill="#ffffff" stroke="#cbd5e1"/>
+    <rect x="1128" y="852" width="5" height="250" rx="2.5" fill="#059669"/>
+    <text x="1144" y="873" font-size="13" font-weight="700" fill="#064e3b">Storage &amp; Persistence  (bff/storage)</text>
+    <text x="1144" y="890" font-size="10.5" fill="#64748b" font-family="monospace">/api/datasets · /api/query · /api/projects/* · /api/session</text>
+    <text x="1144" y="911" font-size="11.5" fill="#334155"><tspan x="1144" dy="0">▸ StorageEngine interface (types) — pluggable engine</tspan><tspan x="1144" dy="16.5">▸ duckdb — embedded .duckdb file (default)</tspan><tspan x="1144" dy="16.5">▸ postgres — pg + pg-cursor (+ pgvector for design-rag)</tspan><tspan x="1144" dy="16.5">▸ tenant-scope — namespaces tenant__projectId</tspan><tspan x="1144" dy="16.5">▸ guard — read-only SQL classifier</tspan><tspan x="1144" dy="16.5">▸ schema per project p_{projectId}</tspan><tspan x="1144" dy="16.5">▸ registries: _datasets · _projects · _versions</tspan></text>
+  </g>
+
+  <!-- routing note -->
+  <text x="60" y="1128" font-size="11" fill="#64748b">Query router (/api/query): colosnapshot → coloQuery  ·  live_* → connection-registry (410 on expiry)  ·  wb_* → workbench-store  ·  else → tenant storage engine</text>
+  <text x="60" y="1146" font-size="11" fill="#64748b">Build handoff: WorkbenchPage extract → /build auto-fires spec dashboard build with analyst evidence directive</text>
+
+  <!-- ============================================================ -->
+  <!-- BAND C — EXTERNAL / DATA -->
+  <!-- ============================================================ -->
+  <text x="40" y="1200" font-size="15" font-weight="700" fill="#0f172a">External Services &amp; Data Stores</text>
+
+  <!-- 9 external cards -->
+  <!-- helper coords: x = 56 + 180*i, w=169, y=1214 h=124 -->
+  <g font-size="10.5">
+    <!-- 1 Gemini -->
+    <rect x="56" y="1214" width="169" height="124" rx="9" fill="#f5f3ff" stroke="#ddd6fe" filter="url(#shadow)"/>
+    <text x="140" y="1235" font-size="11.5" font-weight="700" fill="#5b21b6" text-anchor="middle">Google Gemini API</text>
+    <text x="140" y="1256" fill="#6d28d9" text-anchor="middle">generativelanguage</text>
+    <text x="140" y="1270" fill="#6d28d9" text-anchor="middle">.googleapis.com</text>
+    <text x="140" y="1292" fill="#475569" text-anchor="middle">generate · stream</text>
+    <text x="140" y="1307" fill="#475569" text-anchor="middle">embeddings · vision</text>
+    <text x="140" y="1325" fill="#94a3b8" text-anchor="middle">all LLM calls</text>
+    <!-- 2 markitdown -->
+    <rect x="236" y="1214" width="169" height="124" rx="9" fill="#fff7ed" stroke="#fed7aa" filter="url(#shadow)"/>
+    <text x="320" y="1235" font-size="11.5" font-weight="700" fill="#9a3412" text-anchor="middle">markitdown</text>
+    <text x="320" y="1256" fill="#c2410c" text-anchor="middle">Python FastAPI</text>
+    <text x="320" y="1270" fill="#c2410c" text-anchor="middle">sidecar :8001</text>
+    <text x="320" y="1292" fill="#475569" text-anchor="middle">doc → markdown</text>
+    <text x="320" y="1307" fill="#475569" text-anchor="middle">PDF/Word/PPT</text>
+    <!-- 3 LibreOffice -->
+    <rect x="416" y="1214" width="169" height="124" rx="9" fill="#fff7ed" stroke="#fed7aa" filter="url(#shadow)"/>
+    <text x="500" y="1235" font-size="11.5" font-weight="700" fill="#9a3412" text-anchor="middle">LibreOffice</text>
+    <text x="500" y="1256" fill="#c2410c" text-anchor="middle">soffice binary</text>
+    <text x="500" y="1278" fill="#475569" text-anchor="middle">pptx → pdf</text>
+    <text x="500" y="1293" fill="#475569" text-anchor="middle">deck preview</text>
+    <text x="500" y="1315" fill="#94a3b8" text-anchor="middle">+ pdfjs · canvas</text>
+    <!-- 4 Playwright -->
+    <rect x="596" y="1214" width="169" height="124" rx="9" fill="#fff7ed" stroke="#fed7aa" filter="url(#shadow)"/>
+    <text x="680" y="1235" font-size="11.5" font-weight="700" fill="#9a3412" text-anchor="middle">Playwright</text>
+    <text x="680" y="1256" fill="#c2410c" text-anchor="middle">headless Chromium</text>
+    <text x="680" y="1278" fill="#475569" text-anchor="middle">render design</text>
+    <text x="680" y="1293" fill="#475569" text-anchor="middle">exemplars → PNG</text>
+    <text x="680" y="1315" fill="#94a3b8" text-anchor="middle">design-rag only</text>
+    <!-- 5 Tailwind CLI -->
+    <rect x="776" y="1214" width="169" height="124" rx="9" fill="#fff7ed" stroke="#fed7aa" filter="url(#shadow)"/>
+    <text x="860" y="1235" font-size="11.5" font-weight="700" fill="#9a3412" text-anchor="middle">Tailwind CLI</text>
+    <text x="860" y="1256" fill="#c2410c" text-anchor="middle">@tailwindcss/cli</text>
+    <text x="860" y="1278" fill="#475569" text-anchor="middle">subprocess</text>
+    <text x="860" y="1293" fill="#475569" text-anchor="middle">compile CSS</text>
+    <text x="860" y="1315" fill="#94a3b8" text-anchor="middle">CDN fallback</text>
+    <!-- 6 esm.sh -->
+    <rect x="956" y="1214" width="169" height="124" rx="9" fill="#f8fafc" stroke="#cbd5e1" filter="url(#shadow)"/>
+    <text x="1040" y="1235" font-size="11.5" font-weight="700" fill="#334155" text-anchor="middle">esm.sh CDN</text>
+    <text x="1040" y="1258" fill="#475569" text-anchor="middle">React · Recharts</text>
+    <text x="1040" y="1273" fill="#475569" text-anchor="middle">lucide-react</text>
+    <text x="1040" y="1295" fill="#475569" text-anchor="middle">at render time</text>
+    <text x="1040" y="1317" fill="#94a3b8" text-anchor="middle">+ Sandpack CDN</text>
+    <!-- 7 DuckDB -->
+    <rect x="1136" y="1214" width="169" height="124" rx="9" fill="#ecfdf5" stroke="#a7f3d0" filter="url(#shadow)"/>
+    <text x="1220" y="1235" font-size="11.5" font-weight="700" fill="#065f46" text-anchor="middle">DuckDB</text>
+    <text x="1220" y="1256" fill="#047857" text-anchor="middle">embedded + WASM</text>
+    <text x="1220" y="1276" fill="#475569" text-anchor="middle">text2ui.duckdb</text>
+    <text x="1220" y="1290" fill="#475569" text-anchor="middle">colo · wb_* · stage_*</text>
+    <text x="1220" y="1304" fill="#475569" text-anchor="middle">mysql/pg extensions</text>
+    <text x="1220" y="1324" fill="#94a3b8" text-anchor="middle">browser: in-page</text>
+    <!-- 8 Postgres -->
+    <rect x="1316" y="1214" width="169" height="124" rx="9" fill="#ecfdf5" stroke="#a7f3d0" filter="url(#shadow)"/>
+    <text x="1400" y="1235" font-size="11.5" font-weight="700" fill="#065f46" text-anchor="middle">PostgreSQL</text>
+    <text x="1400" y="1256" fill="#047857" text-anchor="middle">+ pgvector</text>
+    <text x="1400" y="1278" fill="#475569" text-anchor="middle">storage engine</text>
+    <text x="1400" y="1293" fill="#475569" text-anchor="middle">chat memory</text>
+    <text x="1400" y="1315" fill="#475569" text-anchor="middle">_design_refs (ANN)</text>
+    <!-- 9 User DBs -->
+    <rect x="1496" y="1214" width="169" height="124" rx="9" fill="#ecfdf5" stroke="#a7f3d0" filter="url(#shadow)"/>
+    <text x="1580" y="1235" font-size="11.5" font-weight="700" fill="#065f46" text-anchor="middle">User databases</text>
+    <text x="1580" y="1256" fill="#047857" text-anchor="middle">MySQL / Postgres</text>
+    <text x="1580" y="1278" fill="#475569" text-anchor="middle">live attach</text>
+    <text x="1580" y="1293" fill="#475569" text-anchor="middle">read-only</text>
+    <text x="1580" y="1315" fill="#94a3b8" text-anchor="middle">workbench sources</text>
+  </g>
+
+  <!-- BFF -> External arrows (origin band-B bottom y=1228, to card tops y=1214 -> draw to 1214) -->
+  <g stroke-width="2">
+    <line x1="300" y1="1174" x2="150" y2="1213" stroke="#7c3aed" marker-end="url(#ah-violet)"/>
+    <line x1="1400" y1="855" x2="320" y2="1213" stroke="#ea580c" marker-end="url(#ah-orange)" opacity="0.55"/>
+    <line x1="852" y1="838" x2="500" y2="1213" stroke="#ea580c" marker-end="url(#ah-orange)"/>
+    <line x1="1396" y1="608" x2="680" y2="1213" stroke="#ea580c" marker-end="url(#ah-orange)"/>
+    <line x1="900" y1="608" x2="860" y2="1213" stroke="#ea580c" marker-end="url(#ah-orange)"/>
+    <line x1="1396" y1="600" x2="1040" y2="1213" stroke="#64748b" marker-end="url(#ah-gray)" opacity="0.7"/>
+    <line x1="1390" y1="1102" x2="1220" y2="1213" stroke="#059669" marker-end="url(#ah-green)"/>
+    <line x1="1400" y1="1102" x2="1400" y2="1213" stroke="#059669" marker-end="url(#ah-green)"/>
+    <line x1="852" y1="1102" x2="1560" y2="1213" stroke="#059669" stroke-dasharray="5 4" marker-end="url(#ah-green)"/>
+  </g>
+</svg>

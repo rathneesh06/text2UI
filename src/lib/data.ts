@@ -89,15 +89,60 @@ export interface RemoteDataConfig {
 
 export function remoteDataModuleFiles(cfg: RemoteDataConfig): Record<string, string> {
   const src = `// data.js (remote) — all data access goes through the BFF's /api/query.
+//
+// TRANSPORT: the sandbox preview runs on a foreign (https) iframe origin, and
+// browsers can block its direct fetches to http://localhost (CORS aside — mixed
+// content and private-network rules apply too). So queries ride the SAME
+// postMessage bridge the widget-click events already use: the sandbox asks the
+// HOST page, the host (same-site with the BFF) performs the fetch, and posts the
+// rows back. Direct fetch remains as the fallback so downloaded/standalone apps
+// (no host page) and older hosts keep working unchanged.
 const BFF = ${JSON.stringify(cfg.bffUrl)};
 const PROJECT = ${JSON.stringify(cfg.projectId)};
+const BRIDGE_TIMEOUT_MS = 6000;
 
 // Remote mode serves data via query(). \`rows\`/\`tables\` are empty stubs so apps
 // that import them still build; use query() for data access in remote mode.
 export const tables = {};
 export const rows = [];
 
-export async function query(sql) {
+const pending = new Map();
+let listening = false;
+let seq = 0;
+
+function ensureListener() {
+  if (listening || typeof window === "undefined") return;
+  listening = true;
+  window.addEventListener("message", function (e) {
+    const d = e && e.data;
+    if (!d || d.type !== "t2ui.queryResult" || !pending.has(d.id)) return;
+    const p = pending.get(d.id);
+    pending.delete(d.id);
+    clearTimeout(p.timer);
+    if (d.ok) p.resolve(d.rows);
+    else p.reject(new Error(d.error || "query failed"));
+  });
+}
+
+function bridgeAvailable() {
+  try { return typeof window !== "undefined" && window.parent && window.parent !== window; }
+  catch (_e) { return false; }
+}
+
+function queryViaBridge(sql) {
+  ensureListener();
+  return new Promise(function (resolve, reject) {
+    const id = "q" + (++seq) + "_" + Math.random().toString(36).slice(2, 8);
+    const timer = setTimeout(function () {
+      pending.delete(id);
+      reject(new Error("bridge timeout"));
+    }, BRIDGE_TIMEOUT_MS);
+    pending.set(id, { resolve, reject, timer });
+    window.parent.postMessage({ type: "t2ui.query", id: id, projectId: PROJECT, sql: sql }, "*");
+  });
+}
+
+async function queryViaFetch(sql) {
   const res = await fetch(BFF + "/api/query", {
     method: "POST",
     headers: { "Content-Type": "application/json" },
@@ -107,6 +152,18 @@ export async function query(sql) {
   if (!res.ok) throw new Error(json.error || ("query failed: HTTP " + res.status));
   if (json.truncated) console.warn("[data] result truncated by the server row cap");
   return json.rows;
+}
+
+export async function query(sql) {
+  if (bridgeAvailable()) {
+    try { return await queryViaBridge(sql); }
+    catch (e) {
+      // Host not listening (old host, or opened standalone in a frame) — fall through.
+      if (!(e && e.message === "bridge timeout")) throw e;
+      console.warn("[data] query bridge unavailable, falling back to direct fetch");
+    }
+  }
+  return queryViaFetch(sql);
 }
 `;
   return { "/data.js": src };

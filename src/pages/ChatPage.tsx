@@ -78,6 +78,13 @@ export default function ChatPage({
 }: Props) {
   const [turns, setTurns] = useState<Turn[]>([]);
   const [conversationId, setConversationId] = useState<string | null>(null);
+  // Stale-closure guard: the FIRST turn receives a fresh conversationId from
+  // orchestrate/gate and must use it for the build call IN THE SAME closure —
+  // React state won't have committed yet. Reading only the state variable meant
+  // the first build posted without a conversationId, so version 1 was never
+  // recorded and the first "undo" found nothing beneath it.
+  const convIdRef = useRef<string | null>(null);
+  const adoptConvId = (id?: string | null) => { if (id) { convIdRef.current = id; setConversationId(id); } };
   const [result, setResult] = useState<Result | null>(null);
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
@@ -97,6 +104,22 @@ export default function ChatPage({
   const [expandedTable, setExpandedTable] = useState<string | null>(null);
   const [exporting, setExporting] = useState(false);
   const [bundling, setBundling] = useState(false);
+
+  // Widget selection from the live preview — the "this" of the next edit prompt.
+  // The generated app posts t2ui.featureSelected on any widget click (id + title);
+  // holding it here is what turns the chat into a direct-manipulation editor:
+  // click a chart, type "make this a pie", done.
+  const [selectedWidget, setSelectedWidget] = useState<{ id?: string; title?: string; kind?: string } | null>(null);
+  useEffect(() => {
+    const onMsg = (e: MessageEvent) => {
+      const data = e.data as any;
+      if (!data || data.type !== "t2ui.featureSelected" || !data.payload) return;
+      const p = data.payload;
+      if (p.id || p.title) setSelectedWidget({ id: p.id, title: p.title, kind: p.kind ?? p.type });
+    };
+    window.addEventListener("message", onMsg);
+    return () => window.removeEventListener("message", onMsg);
+  }, []);
 
   const turnSeq = useRef(0);
   const tailBuf = useRef("");
@@ -147,7 +170,7 @@ export default function ChatPage({
       const raw = localStorage.getItem(SESSION_KEY);
       if (!raw) return;
       const s = JSON.parse(raw);
-      if (s.conversationId) setConversationId(s.conversationId);
+      if (s.conversationId) adoptConvId(s.conversationId);
       if (s.deckId) setDeckId(s.deckId);
       if (s.deckSpec) setDeckSpec(s.deckSpec);
       if (s.spec) setSpec(s.spec);
@@ -250,7 +273,7 @@ export default function ChatPage({
           append("Looking that up in the data…");
           try {
             const r = await sourceChat({ projectId, prompt, ...(conversationId ? { conversationId } : {}) });
-            if (r.conversationId) setConversationId(r.conversationId);
+            if (r.conversationId) adoptConvId(r.conversationId);
             patch({ phase: "done", tail: null, assistantText: r.answer });
             return;
           } catch { /* fall back to the model's grounded reply */ }
@@ -282,14 +305,14 @@ export default function ChatPage({
             artifactSummary: spec?.meta?.title ?? deckSpec?.meta?.title ?? undefined,
             datasets,
           });
-          if (g.conversationId) setConversationId(g.conversationId);
+          if (g.conversationId) adoptConvId(g.conversationId);
           if (g.action !== "edit" && g.reply) { await answerInstead(g.reply, g.dataQuestion); return; }
         } catch { /* gate unavailable — behave exactly as before (edit) */ }
       } else {
         let plan: Awaited<ReturnType<typeof orchestratePlan>>;
         try {
           plan = await orchestratePlan({ datasets, userPrompt: prompt, ...(conversationId ? { conversationId } : {}), ...access });
-          if ((plan as any).conversationId) setConversationId((plan as any).conversationId);
+          if ((plan as any).conversationId) adoptConvId((plan as any).conversationId);
         } catch {
           append("Planner unavailable — building a dashboard directly…");
           plan = { conversationId: conversationId ?? "", outputMode: "dashboard", enhancedPrompt: prompt } as any;
@@ -329,29 +352,50 @@ export default function ChatPage({
         return;
       }
 
-      // ---- Dashboard on colo → spec-driven dashboard (pilot) ----
-      if (mode === "dashboard" && isColo) {
-        append(spec ? "Updating the dashboard spec…" : "Planning the dashboard spec…");
-        patch({ phase: "building" });
-        const { app, spec: nextSpec, warnings, summary } = await buildDashboard({
-          datasets, userPrompt: prompt, ...(spec ? { currentSpec: spec } : {}),
-          ...(lastBrief.current && !spec ? { brief: lastBrief.current } : {}),
-          ...(pendingDirective.current && !spec ? { analystDirective: pendingDirective.current } : {}),
-        });
-        pendingDirective.current = null;
-        setSpec(nextSpec);
-        setResult({ kind: "dashboard", app });
-        setDashVersion((v) => v + 1);
-        // al5: SHOW the notes. "· 3 notes" hid the reason a widget vanished
-        // (dropped column, coerced agg, empty section) — the one thing the user
-        // needs to fix their prompt or spot a pipeline defect.
-        const note = warnings.length
-          ? `\n\nNotes:\n${warnings.slice(0, 5).map((w) => `• ${w}`).join("\n")}${warnings.length > 5 ? `\n• …and ${warnings.length - 5} more` : ""}`
-          : "";
-        patch({ phase: "done", tail: null, assistantText: (summary?.length ? summary.join(" ") : nextSpec.meta.title || "Dashboard ready") + note });
-        builds.current += 1;
-        onBuildMeta?.({ versionCount: builds.current });
-        return;
+      // ---- Dashboard → spec-driven pipeline (ALL sources) ----
+      // RESTORED: this used to be gated to colo/workbench/live sources only — a
+      // leftover of the text2SQL integration pilot — which silently pushed every
+      // uploaded-data build onto the fragile legacy codegen path. The spec pipeline
+      // (enhancement layer → widget agents → validate → deterministic render) is
+      // now the ONE dashboard pipeline for every source; legacy codegen survives
+      // strictly as the in-flight fallback below if this call fails.
+      if (mode === "dashboard") {
+        try {
+          append(spec ? "Updating the dashboard spec…" : "Planning the dashboard spec…");
+          patch({ phase: "building" });
+          const { app, spec: nextSpec, warnings, summary, noChange } = await buildDashboard({
+            datasets, userPrompt: prompt, ...(spec ? { currentSpec: spec } : {}),
+            ...(lastBrief.current && !spec ? { brief: lastBrief.current } : {}),
+            ...(pendingDirective.current && !spec ? { analystDirective: pendingDirective.current } : {}),
+            ...((convIdRef.current ?? conversationId) ? { conversationId: (convIdRef.current ?? conversationId)! } : {}),
+            ...(selectedWidget && spec ? { selectedWidget: { id: selectedWidget.id, title: selectedWidget.title } } : {}),
+          });
+          pendingDirective.current = null;
+          setSelectedWidget(null);   // a selection targets ONE edit, like any editor
+          if (noChange || !app) {    // e.g. "undo" at the first version — reply, keep the canvas
+            patch({ phase: "done", tail: null, assistantText: summary?.length ? summary.join(" ") : "No change." });
+            return;
+          }
+          setSpec(nextSpec);
+          setResult({ kind: "dashboard", app });
+          setDashVersion((v) => v + 1);
+          // al5: SHOW the notes. "· 3 notes" hid the reason a widget vanished
+          // (dropped column, coerced agg, empty section) — the one thing the user
+          // needs to fix their prompt or spot a pipeline defect.
+          const note = warnings.length
+            ? `\n\nNotes:\n${warnings.slice(0, 5).map((w) => `• ${w}`).join("\n")}${warnings.length > 5 ? `\n• …and ${warnings.length - 5} more` : ""}`
+            : "";
+          patch({ phase: "done", tail: null, assistantText: (summary?.length ? summary.join(" ") : nextSpec.meta.title || "Dashboard ready") + note });
+          builds.current += 1;
+          onBuildMeta?.({ versionCount: builds.current });
+          return;
+        } catch (specErr) {
+          // Network-level failures should surface normally; only fall back when the
+          // spec pipeline itself declined (planner/agents 5xx or empty validation).
+          const msg = (specErr as Error)?.message ?? String(specErr);
+          if (/failed to fetch|networkerror|load failed|fetch failed|connection refused/i.test(msg)) throw specErr;
+          append(`Spec pipeline unavailable (${msg}) — falling back to code generation…`);
+        }
       }
 
       // ---- Legacy path: non-colo dashboards (codegen) + PDF reports ----
@@ -557,6 +601,13 @@ export default function ChatPage({
         </div>
 
         <div className="cp-composer">
+          {selectedWidget && (
+            <div className="cp-selchip" title="Your next edit targets this widget. Click × to clear.">
+              <span className="cp-selchip-dot" />
+              <span className="cp-selchip-text">Selected: {selectedWidget.title ?? selectedWidget.id}{selectedWidget.kind ? ` (${selectedWidget.kind})` : ""}</span>
+              <button className="cp-selchip-x" onClick={() => setSelectedWidget(null)} aria-label="Clear selection">×</button>
+            </div>
+          )}
           {(fileError ?? error) && serverUp !== false && (
             <div className="cp-composer-err">{fileError ?? error}</div>
           )}

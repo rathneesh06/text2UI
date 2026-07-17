@@ -98,7 +98,13 @@ export async function orchestrate(input: OrchestrateInput, run: OrchestrateRun =
       // almost always supplies them — even when it also flags clarification.
       // Checking the brief FIRST stops spurious "needs clarification" stalls.
       if (isValidBrief(parsed)) {
-        const { needsClarification: _nc, question: _q, ...brief } = parsed as any; // keep the discriminator clean
+        // Strip EVERY discriminator, not just clarification: BRIEF_SCHEMA includes
+        // respond/reply/dataQuestion, so the model returns respond:false on build
+        // turns — and a brief carrying that key was being misrouted as a respond
+        // turn downstream ("respond" in result matched respond:false), silently
+        // DISCARDING the whole plan (title, palette, KPIs). Evidenced in prod logs:
+        // "[orchestrator] brief: ..." immediately followed by "-> respond".
+        const { needsClarification: _nc, question: _q, respond: _r, reply: _rp, dataQuestion: _dq, ...brief } = parsed as any;
         console.log(`[orchestrator] brief: mode=${brief.outputMode} title="${brief.title}"`);
         return brief as OrchestratorBrief;
       }

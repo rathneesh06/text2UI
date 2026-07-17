@@ -123,7 +123,8 @@ Rules:
 - Give each widget a stable, unique id. KPIs go in the first section. Use width to lay out: kpi=quarter, charts=half, tables=full.
 - Keep it focused and readable (a KPI strip plus 4-8 charts/tables is plenty). Do not exceed what the data supports.
 
-On an EDIT turn you are given the CURRENT spec. Return the FULL updated spec, changing as little as possible: keep existing widget ids and untouched widgets exactly, and apply only what the user asked.`;
+On an EDIT turn you are given the CURRENT spec. Return the FULL updated spec, changing as little as possible: keep existing widget ids and untouched widgets exactly, and apply only what the user asked.
+CONVERSATION AWARENESS (edit turns): when a CONVERSATION section is provided, resolve references through it — "the chart we added", "like before", "the same color as earlier", "no, the OTHER one" all point at things said or done in prior turns. When a SELECTED WIDGET is provided, that is the user's "this"/"that"/"it": apply the edit to that exact widget (match its id) unless the user clearly names a different one. Never reinterpret the whole dashboard because of a reference you cannot resolve — leave unclear things unchanged.`;
 
 function schemaText(datasets: Dataset[]): string {
   return datasets.map((d) => {
@@ -132,12 +133,21 @@ function schemaText(datasets: Dataset[]): string {
   }).join("\n");
 }
 
-function buildUserPrompt(datasets: Dataset[], userPrompt: string, currentSpec?: DashboardSpec, styleHints?: string, directive?: string): string {
+function buildUserPrompt(datasets: Dataset[], userPrompt: string, currentSpec?: DashboardSpec, styleHints?: string, directive?: string, chatContext?: string, selectedWidget?: { id?: string; title?: string }): string {
   const parts = [
     "DATA PROFILE:",
     schemaText(datasets),
     "",
   ];
+  if (chatContext) {
+    parts.push("CONVERSATION (recent turns + decisions — resolve references like \"before\"/\"that one\" against this):");
+    parts.push(chatContext);
+    parts.push("");
+  }
+  if (selectedWidget && (selectedWidget.id || selectedWidget.title)) {
+    parts.push(`SELECTED WIDGET (the user clicked this in the preview — it is what \"this\"/\"that\"/\"it\" refers to): id=${selectedWidget.id ?? "?"} title=\"${selectedWidget.title ?? ""}\"`);
+    parts.push("");
+  }
   if (styleHints) {
     parts.push("VISUAL DIRECTION (from the planning stage — realize it via meta.theme/accent/chartPalette):");
     parts.push(styleHints);
@@ -192,14 +202,14 @@ function coerce(parsed: any): DashboardSpec | null {
   };
 }
 
-export interface PlanSpecInput { datasets: Dataset[]; userPrompt: string; currentSpec?: DashboardSpec; styleHints?: string; directive?: string }
+export interface PlanSpecInput { datasets: Dataset[]; userPrompt: string; currentSpec?: DashboardSpec; styleHints?: string; directive?: string; chatContext?: string; selectedWidget?: { id?: string; title?: string } }
 
 /** Plan (or edit) a DashboardSpec. Never throws; returns null on failure/timeout. */
 export async function planSpec(input: PlanSpecInput, run: PlannerRun = callGemini, timeoutMs = PLAN_TIMEOUT_MS): Promise<DashboardSpec | null> {
   const timeout = new Promise<null>((resolve) => setTimeout(() => resolve(null), timeoutMs));
   const call = (async (): Promise<DashboardSpec | null> => {
     try {
-      const { text } = await run(SYSTEM, buildUserPrompt(input.datasets, input.userPrompt, input.currentSpec, input.styleHints, input.directive), { ...ORCHESTRATE_OPTS, responseSchema: DASHBOARD_SCHEMA });
+      const { text } = await run(SYSTEM, buildUserPrompt(input.datasets, input.userPrompt, input.currentSpec, input.styleHints, input.directive, input.chatContext, input.selectedWidget), { ...ORCHESTRATE_OPTS, responseSchema: DASHBOARD_SCHEMA });
       const spec = coerce(JSON.parse(stripFences(text)));
       if (spec) console.log(`[dashboard-planner] spec: "${spec.meta.title}" with ${spec.sections.reduce((n, s) => n + s.widgets.length, 0)} widget(s)`);
       else console.warn("[dashboard-planner] model returned no usable spec");

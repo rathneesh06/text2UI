@@ -3,10 +3,15 @@
 import type { Dataset } from "../../shared/types";
 import type { DashboardSpec, RenderPlan, CompiledSection, CompiledWidget } from "../../shared/dashboard-spec";
 import { validateSpec } from "./validate";
+import { balanceLayout } from "./layout";
 import { buildKpiSql, buildChartSql, buildTableSql } from "./sql";
 
 export function compileSpec(spec: DashboardSpec, profiles: Dataset[]): RenderPlan {
-  const { spec: clean, warnings } = validateSpec(spec, profiles);
+  const { spec: valid, warnings } = validateSpec(spec, profiles);
+  // Layout pass AFTER validation: dropped widgets can orphan a row, so widths are
+  // finalized against what actually survived. The balanced spec is also what gets
+  // returned/persisted, so edit turns keep reasoning about the real layout.
+  const clean = balanceLayout(valid);
 
   const sections: CompiledSection[] = clean.sections.map((s) => {
     const widgets: CompiledWidget[] = s.widgets.map((w) => {
