@@ -61,27 +61,38 @@ export function deriveGlobalFilters(profiles: Dataset[]): CompiledGlobalFilter[]
   const filters: CompiledGlobalFilter[] = [];
   if (!profiles.length) return filters;
 
-  // Date range: the date column with the most distinct values from the
-  // largest table that has one (best proxy for "the event timestamp").
+  // Date range: applies to EVERY table that has a temporal column, each on its
+  // own best date column (highest cardinality ≈ the event timestamp). Tables
+  // do NOT need to share a column name — without this, only widgets on the
+  // anchor table would filter (the "only KPIs change" symptom). The anchor
+  // (label + col) comes from the largest table; bounds are the union.
   const byRows = [...profiles].sort((a, b) => b.profile.rowCount - a.profile.rowCount);
-  let dateCol: { col: ColumnProfile; table: string } | null = null;
+  const dateColByTable: Record<string, ColumnProfile> = {};
   for (const d of byRows) {
     const dates = d.profile.columns.filter((c) => c.type === "date");
     if (!dates.length) continue;
-    const best = [...dates].sort((a, b) => b.uniqueCount - a.uniqueCount)[0];
-    dateCol = { col: best, table: d.tableName };
-    break;
+    dateColByTable[d.tableName] = [...dates].sort((a, b) => b.uniqueCount - a.uniqueCount)[0];
   }
-  if (dateCol) {
-    const min = isoDay(dateCol.col.min);
-    const max = isoDay(dateCol.col.max);
+  const dateTables = Object.keys(dateColByTable);
+  if (dateTables.length) {
+    const anchorTable = byRows.find((d) => dateColByTable[d.tableName])!.tableName;
+    const anchor = dateColByTable[anchorTable];
+    let min: string | undefined, max: string | undefined;
+    const cols: Record<string, string> = {};
+    for (const t of dateTables) {
+      cols[t] = dateColByTable[t].name;
+      const lo = isoDay(dateColByTable[t].min), hi = isoDay(dateColByTable[t].max);
+      if (lo && (!min || lo < min)) min = lo;
+      if (hi && (!max || hi > max)) max = hi;
+    }
     filters.push({
-      id: `gf_date_${dateCol.col.name}`,
-      col: dateCol.col.name,
+      id: `gf_date_${anchor.name}`,
+      col: anchor.name,
       kind: "daterange",
-      label: labelize(dateCol.col.name),
-      table: dateCol.table,
-      tables: tablesWithCol(profiles, dateCol.col.name, new Set(["date"])),
+      label: labelize(anchor.name),
+      table: anchorTable,
+      tables: dateTables,
+      cols,
       ...(min ? { min } : {}), ...(max ? { max } : {}),
     });
   }
@@ -91,7 +102,7 @@ export function deriveGlobalFilters(profiles: Dataset[]): CompiledGlobalFilter[]
   // much of the table the topValues cover (a real status/category column
   // covers ~everything; a free-text column doesn't).
   type Cand = { col: ColumnProfile; table: string; rowCount: number; coverage: number };
-  const seen = new Set<string>(dateCol ? [dateCol.col.name] : []);
+  const seen = new Set<string>(Object.values(dateColByTable).map((c) => c.name));
   const cands: Cand[] = [];
   for (const d of byRows) {
     for (const c of d.profile.columns) {
@@ -141,11 +152,19 @@ export function resolveGlobalFilters(spec: DashboardSpec, profiles: Dataset[]): 
       const hit = derived.find((d) => d.col === f.col && d.kind === f.kind);
       if (hit) { resolved.push({ ...hit, id: f.id || hit.id, label: f.label || hit.label }); continue; }
       const types = f.kind === "daterange" ? new Set(["date"]) : new Set(["string"]);
-      const tables = tablesWithCol(profiles, f.col, types);
-      if (!tables.length) continue; // column gone from the data — prune
       if (f.kind === "daterange") {
-        resolved.push({ ...f, tables });
+        // Re-anchor on the derived daterange if one exists (it carries the
+        // per-table cols map); else rebuild a minimal map for this column.
+        const der = derived.find((d) => d.kind === "daterange");
+        if (der) { resolved.push({ ...der, id: f.id || der.id, label: f.label || der.label }); continue; }
+        const tables = tablesWithCol(profiles, f.col, types);
+        if (!tables.length) continue;
+        const cols: Record<string, string> = {};
+        for (const t of tables) cols[t] = f.col;
+        resolved.push({ ...f, tables, cols });
       } else {
+        const tables = tablesWithCol(profiles, f.col, types);
+        if (!tables.length) continue; // column gone from the data — prune
         // options from the first table's topValues
         const prof = profiles.find((d) => tables.includes(d.tableName));
         const cp = prof?.profile.columns.find((c) => c.name === f.col);
@@ -161,7 +180,13 @@ export function resolveGlobalFilters(spec: DashboardSpec, profiles: Dataset[]): 
   const widgetTables = new Set<string>();
   for (const s of spec.sections) for (const w of s.widgets) widgetTables.add(w.table);
   return resolved
-    .map((f) => ({ ...f, tables: f.tables.filter((t) => widgetTables.has(t)) }))
+    .map((f) => {
+      const tables = f.tables.filter((t) => widgetTables.has(t));
+      if (!f.cols) return { ...f, tables };
+      const cols: Record<string, string> = {};
+      for (const t of tables) if (f.cols[t]) cols[t] = f.cols[t];
+      return { ...f, tables, cols };
+    })
     .filter((f) => f.tables.length > 0);
 }
 

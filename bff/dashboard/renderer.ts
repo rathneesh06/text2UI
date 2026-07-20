@@ -57,7 +57,8 @@ function activeFor(table, fv) {
     const v = fv[f.id];
     if (f.kind === "daterange") {
       if (v && ((v.from && v.from.length) || (v.to && v.to.length))) {
-        out.push({ col: f.col, kind: f.kind, value: { from: v.from || "", to: v.to || "" } });
+        const col = (f.cols && f.cols[table]) || f.col;
+        out.push({ col: col, kind: f.kind, value: { from: v.from || "", to: v.to || "" } });
       }
     } else if (v && v.length) {
       out.push({ col: f.col, kind: f.kind, value: v });

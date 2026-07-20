@@ -48,6 +48,9 @@ const AGENTS: Dataset = {
     columns: [
       col("name", "string", 20, { topValues: [{ value: "Ada", count: 1 }] }),
       col("status", "string", 2, { topValues: [{ value: "active", count: 15 }, { value: "away", count: 5 }] }),
+      // A date column with a DIFFERENT name than tickets.created_at — the date
+      // range must still apply to widgets on this table, on THIS column.
+      col("hired_on", "date", 18, { min: "2023-11-01", max: "2024-05-10" }),
     ],
     sampleRows: [],
   },
@@ -69,10 +72,11 @@ function specOn(tables: string[]): DashboardSpec {
   const fs = deriveGlobalFilters([TICKETS, AGENTS]);
   const date = fs.find((f) => f.kind === "daterange");
   assert.ok(date, "a daterange filter is derived");
-  assert.equal(date!.col, "created_at", "picks the highest-cardinality date column of the largest table");
-  assert.equal(date!.min, "2024-01-05", "min trimmed to ISO day");
+  assert.equal(date!.col, "created_at", "anchor is the highest-cardinality date column of the largest table");
+  assert.equal(date!.min, "2023-11-01", "bounds are the UNION across all mapped tables");
   assert.equal(date!.max, "2024-06-30");
-  assert.deepEqual(date!.tables, ["tickets"], "applies only to tables that have the column");
+  assert.deepEqual([...date!.tables].sort(), ["agents", "tickets"], "applies to EVERY table with a temporal column");
+  assert.deepEqual(date!.cols, { tickets: "created_at", agents: "hired_on" }, "per-table date column map — names need not match");
 
   const sels = fs.filter((f) => f.kind === "select");
   assert.ok(sels.length >= 1 && sels.length <= 2, "1-2 select filters");
@@ -87,12 +91,22 @@ function specOn(tables: string[]): DashboardSpec {
 
 // ---- 2. resolution against the board --------------------------------------
 {
-  // Board only shows agents → tickets-only filters (the date range) are pruned.
+  // Board only shows agents → the date range now APPLIES (agents.hired_on),
+  // and the cols map is pruned to the rendered tables.
   const onlyAgents = resolveGlobalFilters(specOn(["agents"]), [TICKETS, AGENTS]);
-  assert.ok(!onlyAgents.some((f) => f.kind === "daterange"), "date filter pruned when no widget uses its table");
+  const dr = onlyAgents.find((f) => f.kind === "daterange");
+  assert.ok(dr, "date filter survives on a table with its own date column");
+  assert.deepEqual(dr!.tables, ["agents"]);
+  assert.deepEqual(dr!.cols, { agents: "hired_on" }, "cols map pruned alongside tables");
   const st = onlyAgents.find((f) => f.col === "status");
   assert.ok(st, "status survives");
   assert.deepEqual(st!.tables, ["agents"], "applicability narrowed to rendered tables");
+
+  // A table with NO temporal column gets no date filtering.
+  const NODATE: Dataset = { tableName: "tags", profile: { source: { filename: "t.csv", format: "csv" }, rowCount: 10,
+    columns: [col("tag", "string", 5, { topValues: [{ value: "a", count: 6 }, { value: "b", count: 4 }] })], sampleRows: [] } };
+  const noDate = resolveGlobalFilters(specOn(["tags"]), [NODATE]);
+  assert.ok(!noDate.some((f) => f.kind === "daterange"), "no temporal column anywhere → no date filter");
 
   // Explicit empty list = the user removed all filters. Respect it.
   const none = resolveGlobalFilters({ ...specOn(["tickets"]), filters: [] }, [TICKETS]);
@@ -220,12 +234,14 @@ await (async () => {
       widgets: [
         { id: "k1", kind: "kpi", title: "Tickets", table: "tickets", metric: { col: "", agg: "count" } },
         { id: "c1", kind: "bar", title: "By status", table: "tickets", x: { col: "status" }, series: [{ col: "", agg: "count" }] },
+        { id: "k2", kind: "kpi", title: "Agents", table: "agents", metric: { col: "", agg: "count" } },
       ],
     }],
   };
   const plan = compileSpec(spec, [TICKETS, AGENTS]);
   assert.ok(plan.filters && plan.filters.length >= 2, "plan carries the resolved filter bar");
-  assert.ok(plan.filters!.some((f) => f.kind === "daterange" && f.min === "2024-01-05"), "date bounds resolved");
+  assert.ok(plan.filters!.some((f) => f.kind === "daterange" && f.min === "2023-11-01"), "date bounds resolved (union)");
+  assert.deepEqual(plan.filters!.find((f) => f.kind === "daterange")!.cols, { tickets: "created_at", agents: "hired_on" }, "cols map rides the plan");
   assert.ok(Array.isArray(plan.spec.filters) && plan.spec.filters.length === plan.filters!.length, "lean filters persisted on the spec for edit turns");
   assert.ok(!(plan.spec.filters![0] as any).options, "spec form is lean (no options)");
 
@@ -261,10 +277,10 @@ await (async () => {
   fv[dateId] = { from: "2024-02-01", to: "" };
   fv[selId] = "open";
   const active = fn("tickets", fv, JSON.parse(filtersLit));
-  assert.ok(active.some((a: any) => a.kind === "daterange" && a.value.from === "2024-02-01"), "date value surfaces");
+  assert.ok(active.some((a: any) => a.kind === "daterange" && a.col === "created_at" && a.value.from === "2024-02-01"), "tickets widgets filter on created_at");
   assert.ok(active.some((a: any) => a.kind === "select" && a.value === "open"), "select value surfaces");
   const activeAgents = fn("agents", fv, JSON.parse(filtersLit));
-  assert.ok(!activeAgents.some((a: any) => a.kind === "daterange"), "date filter not applied to a table without the column");
+  assert.ok(activeAgents.some((a: any) => a.kind === "daterange" && a.col === "hired_on"), "agents widgets filter on THEIR date column (hired_on) — charts/tables on other tables re-query too");
   console.log("filters: compile + renderer integration ✅");
 }
 
@@ -319,6 +335,33 @@ await (async () => {
   assert.equal(rows[0].value, 0, "injection payload matches zero rows");
   rows = await run(`SELECT count(*) AS n FROM tickets`);
   assert.equal(rows[0].n, 5, "table intact after the attempt");
+  // MULTI-TABLE + all widget kinds: a second table whose date column has a
+  // DIFFERENT name. Simulate exactly what the renderer does — activeFor picks
+  // the per-table column, buildWidgetSql runs it — for a chart AND a table
+  // widget, which is the regression the user reported (only KPIs changed).
+  await conn.run(`CREATE TABLE agents (name VARCHAR, status VARCHAR, hired_on DATE)`);
+  await conn.run(`INSERT INTO agents VALUES
+    ('Ada','active', DATE '2023-12-01'),
+    ('Bo', 'active', DATE '2024-02-10'),
+    ('Cy', 'away',   DATE '2024-04-05')`);
+  const perTable = { tickets: "created_at", agents: "hired_on" } as Record<string, string>;
+  const range = { from: "2024-01-01", to: "2024-02-29" };
+  const applyDate = (table: string) => [{ col: perTable[table], kind: "daterange" as const, value: range }];
+
+  const agentsTable = { id: "t1", kind: "table", title: "Agents", table: "agents",
+    columns: [{ col: "name" }, { col: "status" }] };
+  let trows = await run(buildWidgetSql(agentsTable, applyDate("agents")));
+  assert.equal(trows.length, 1, "table widget on the second table is date-filtered via ITS column");
+  assert.equal(trows[0][Object.keys(trows[0])[0]], "Bo");
+
+  const agentsChart = { id: "c2", kind: "pie", title: "By status", table: "agents",
+    x: { col: "status" }, series: [{ col: "", agg: "count" }] };
+  const unfiltered = await run(buildWidgetSql(agentsChart, []));
+  assert.equal(unfiltered.length, 2, "unfiltered pie shows both statuses");
+  const filtered = await run(buildWidgetSql(agentsChart, applyDate("agents")));
+  assert.equal(filtered.length, 1, "date-filtered pie collapses");
+  assert.equal(filtered[0].x, "active");
+
   console.log("filters: executed numbers on DuckDB ✅");
 })();
 

@@ -103,6 +103,10 @@ export interface CompiledGlobalFilter extends GlobalFilter {
   /** Tables (among the rendered widgets') that have this column — the filter
    *  applies to a widget iff its table is in this list. */
   tables: string[];
+  /** daterange only: which column to filter PER TABLE. A date range applies to
+   *  every table that has ANY temporal column, using that table's own best
+   *  date column — tables don't have to share the anchor column's name. */
+  cols?: Record<string, string>;
   /** select/multiselect: the choices, from profile topValues (capped). */
   options?: string[];
   /** daterange: ISO date bounds (YYYY-MM-DD) from the profile min/max. */
