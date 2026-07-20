@@ -22,6 +22,7 @@ import { COLO_PROJECT_ID, COLO_LABEL, coloAvailable, coloProfiles, coloQuery } f
 import { isWorkbenchProject, listWorkbenchSources, wbQuery, removeWorkbenchSource } from "./sources/workbench-store";
 import { handleSqlConnect, handleSqlSchema, handleSqlChat, handleSqlExtract, handleSqlExtractDb, handleSqlStageGet, handleSqlStageDiscard, handleSourceChat, handleCombineSources, liveQuery, LIVE_PREFIX } from "./text2sql/handler";
 import { handleDashboardBuild } from "./dashboard/handler";
+import { buildWidgetSql } from "./dashboard/filters";
 import { handleDeckBuild, handleDeckEdit } from "./deck/handler";
 import { loadRows } from "./deck/local-data";
 import { parseDocument } from "./deck/doc-parse";
@@ -541,6 +542,31 @@ export async function handleQuery(
 }
 
 
+/** Pure handler for POST /api/dashboard/query — the A1 filtered-widget path.
+ *  The sandbox sends a typed widget + filter VALUES (never SQL). The widget is
+ *  rebuilt by whitelist (sanitizeWidget), the values become escaped WHERE
+ *  conditions (filterConditions), and the SAME deterministic compiler produces
+ *  the SQL, which then rides handleQuery's routing (guards, caps, timeouts). */
+export async function handleDashboardQuery(
+  body: unknown,
+  tenantId: string,
+  storage: TenantStorageEngine = getStorage(),
+): Promise<{ status: number; body: any }> {
+  const b = body as any;
+  if (!b || typeof b !== "object") return { status: 400, body: { error: "body must be a JSON object" } };
+  const { projectId, widget, filters } = b;
+  if (typeof projectId !== "string" || !PROJECT_ID_RE.test(projectId)) {
+    return { status: 400, body: { error: "projectId must match " + PROJECT_ID_RE.source } };
+  }
+  let sql: string;
+  try {
+    sql = buildWidgetSql(widget, filters);
+  } catch (err: any) {
+    return { status: 400, body: { error: err?.message ?? "invalid widget or filters" } };
+  }
+  return handleQuery({ projectId, sql }, tenantId, storage);
+}
+
 /** Pure handler for POST /api/summary — Feature Inspector summaries. */
 export async function handleSummary(
   body: unknown,
@@ -834,6 +860,13 @@ export function createServer() {
 
   app.post("/api/query", async (req, res) => {
     const { status, body } = await handleQuery(req.body, req.tenantId ?? DEV_TENANT);
+    res.status(status).json(body);
+  });
+
+  // A1: filtered widget queries — the client sends a typed widget + filter
+  // values; the server rebuilds the SQL (never trusts client SQL for filters).
+  app.post("/api/dashboard/query", async (req, res) => {
+    const { status, body } = await handleDashboardQuery(req.body, req.tenantId ?? DEV_TENANT);
     res.status(status).json(body);
   });
 

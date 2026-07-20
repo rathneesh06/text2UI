@@ -52,9 +52,13 @@ function oneFilter(f: Filter): string {
     default: return "1=1";
   }
 }
-export function whereClause(filters?: Filter[]): string {
-  if (!filters || !filters.length) return "";
-  return " WHERE " + filters.map(oneFilter).join(" AND ");
+/** WHERE from widget filters plus optional EXTRA pre-built conditions (A1:
+ *  global-filter conditions, built server-side by filters.ts with the same
+ *  qid/lit escaping — never client-supplied SQL). */
+export function whereClause(filters?: Filter[], extra?: string[]): string {
+  const parts = [...(filters ?? []).map(oneFilter), ...(extra ?? [])].filter(Boolean);
+  if (!parts.length) return "";
+  return " WHERE " + parts.join(" AND ");
 }
 
 /** A safe, unique result alias for a series. */
@@ -66,11 +70,11 @@ export function seriesKey(m: Metric, i: number): string {
 
 // ---- builders --------------------------------------------------------------
 
-export function buildKpiSql(w: KpiWidget): string {
-  return `SELECT ${aggExpr(w.metric.agg, w.metric.col)} AS value FROM ${qid(w.table)}${whereClause(w.filters)}`;
+export function buildKpiSql(w: KpiWidget, extraWhere?: string[]): string {
+  return `SELECT ${aggExpr(w.metric.agg, w.metric.col)} AS value FROM ${qid(w.table)}${whereClause(w.filters, extraWhere)}`;
 }
 
-export function buildChartSql(w: ChartWidget): { sql: string; seriesKeys: { key: string; label: string }[] } {
+export function buildChartSql(w: ChartWidget, extraWhere?: string[]): { sql: string; seriesKeys: { key: string; label: string }[] } {
   const isPie = w.kind === "pie" || w.kind === "donut";
   const series = isPie ? w.series.slice(0, 1) : w.series;
   const keys = series.map((m, i) => ({ key: seriesKey(m, i), label: m.label || `${m.agg}(${m.col})` }));
@@ -83,12 +87,12 @@ export function buildChartSql(w: ChartWidget): { sql: string; seriesKeys: { key:
 
   const limit = w.limit && w.limit > 0 ? ` LIMIT ${Math.floor(w.limit)}` : (isPie || !w.x.timeGrain ? " LIMIT 50" : "");
   const sql =
-    `SELECT ${dimExpr(w.x)} AS x, ${selectSeries} FROM ${qid(w.table)}${whereClause(w.filters)} ` +
+    `SELECT ${dimExpr(w.x)} AS x, ${selectSeries} FROM ${qid(w.table)}${whereClause(w.filters, extraWhere)} ` +
     `GROUP BY 1 ${orderBy}${limit}`;
   return { sql, seriesKeys: keys };
 }
 
-export function buildTableSql(w: TableWidget): { sql: string; cols: { key: string; label: string }[] } {
+export function buildTableSql(w: TableWidget, extraWhere?: string[]): { sql: string; cols: { key: string; label: string }[] } {
   const grouped = (w.groupBy?.length ?? 0) > 0;
   const selects: string[] = [];
   const cols: { key: string; label: string }[] = [];
@@ -105,7 +109,7 @@ export function buildTableSql(w: TableWidget): { sql: string; cols: { key: strin
     cols.push({ key, label: c.label || c.col });
   });
 
-  let sql = `SELECT ${selects.join(", ")} FROM ${qid(w.table)}${whereClause(w.filters)}`;
+  let sql = `SELECT ${selects.join(", ")} FROM ${qid(w.table)}${whereClause(w.filters, extraWhere)}`;
   if (grouped) sql += ` GROUP BY ${(w.groupBy ?? []).map((_, i) => i + 1).join(", ")}`;
   if (w.sort) {
     const found = cols.find((c) => c.label === w.sort!.by || c.key.startsWith(w.sort!.by.toLowerCase()));

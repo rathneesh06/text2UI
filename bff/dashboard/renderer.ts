@@ -11,8 +11,9 @@ import type { RenderPlan } from "../../shared/dashboard-spec";
 // can live inside this template string; the only injection point is ${planJson}.
 export function renderPlanToApp(plan: RenderPlan): GeneratedApp {
   const planJson = JSON.stringify(plan);
-  const content = `import React, { useState, useEffect } from "react";
+  const content = `import React, { useState, useEffect, useContext } from "react";
 import { ResponsiveContainer, LineChart, Line, BarChart, Bar, AreaChart, Area, PieChart, Pie, Cell, XAxis, YAxis, CartesianGrid, Tooltip, Legend } from "recharts";
+import * as DATA from "./data";
 import { query } from "./data";
 import { selectFeature } from "./selection";
 
@@ -38,6 +39,32 @@ const KPI_TXT = COMPACT ? " text-xl" : " text-2xl";
 const CARD_CLS = (DARK ? " bg-slate-900 rounded-xl border border-slate-800 shadow-sm" : " bg-white rounded-xl border border-slate-200 shadow-sm") + PAD;
 const TICK = DARK ? "#94a3b8" : "#64748b";
 const GRID = DARK ? "#334155" : "#e2e8f0";
+// GLOBAL FILTERS (A1): the compiled plan carries the filter bar (columns,
+// options, temporal bounds, per-table applicability). Filtered queries go
+// through DATA.queryWidget (widget + VALUES -> server rebuilds the SQL); if
+// the data layer predates queryWidget, the bar is hidden and every widget
+// keeps running its pre-compiled SQL unchanged.
+const QW = DATA.queryWidget;
+const FILTERS = QW && Array.isArray(PLAN.filters) ? PLAN.filters : [];
+const FilterCtx = React.createContext({});
+const INPUT_CLS = (DARK ? "bg-slate-900 border-slate-700 text-slate-200" : "bg-white border-slate-200 text-slate-700") + " text-xs rounded-lg border px-2 py-1 outline-none";
+
+function activeFor(table, fv) {
+  const out = [];
+  for (let i = 0; i < FILTERS.length; i++) {
+    const f = FILTERS[i];
+    if (!f.tables || f.tables.indexOf(table) < 0) continue;
+    const v = fv[f.id];
+    if (f.kind === "daterange") {
+      if (v && ((v.from && v.from.length) || (v.to && v.to.length))) {
+        out.push({ col: f.col, kind: f.kind, value: { from: v.from || "", to: v.to || "" } });
+      }
+    } else if (v && v.length) {
+      out.push({ col: f.col, kind: f.kind, value: v });
+    }
+  }
+  return out;
+}
 
 function fmt(v, format) {
   if (v === null || v === undefined) return "\u2014";
@@ -68,15 +95,19 @@ function widthClass(w) {
   const map = { quarter: "md:col-span-3", third: "md:col-span-4", half: "md:col-span-6", full: "md:col-span-12" };
   return "col-span-12 " + (map[w] || "md:col-span-6");
 }
-function useRows(sql) {
+function useRows(sql, widget) {
+  const fv = useContext(FilterCtx);
+  const active = widget ? activeFor(widget.table, fv) : [];
+  const key = sql + "|" + JSON.stringify(active);
   const [state, setState] = useState({ rows: null, loading: true, error: null });
   useEffect(function () {
     let alive = true;
     setState({ rows: null, loading: true, error: null });
-    query(sql).then(function (rows) { if (alive) setState({ rows: rows, loading: false, error: null }); })
+    const p = active.length && QW ? QW(widget, active) : query(sql);
+    p.then(function (rows) { if (alive) setState({ rows: rows, loading: false, error: null }); })
       .catch(function (e) { if (alive) setState({ rows: null, loading: false, error: (e && e.message) || "query failed" }); });
     return function () { alive = false; };
-  }, [sql]);
+  }, [key]);
   return state;
 }
 function Loading() { return <div className={(COMPACT ? "h-28" : "h-40") + " animate-pulse rounded-lg bg-slate-100"} />; }
@@ -103,7 +134,7 @@ function kpiGlyph(w) {
 }
 function Kpi(props) {
   const w = props.w;
-  const s = useRows(props.sql);
+  const s = useRows(props.sql, w);
   const value = s.rows && s.rows[0] ? s.rows[0].value : null;
   const chip = COLORS[(props.idx || 0) % COLORS.length];
   return (
@@ -124,7 +155,7 @@ function Kpi(props) {
 function Chart(props) {
   const w = props.w;
   const keys = props.seriesKeys || [];
-  const s = useRows(props.sql);
+  const s = useRows(props.sql, w);
   const data = (s.rows || []).map(function (r) {
     const o = { x: fmtX(r.x) };
     keys.forEach(function (k) { o[k.key] = (r[k.key] === null || r[k.key] === undefined) ? 0 : Number(r[k.key]); });
@@ -197,7 +228,7 @@ function Chart(props) {
 }
 function DataTable(props) {
   const w = props.w;
-  const s = useRows(props.sql);
+  const s = useRows(props.sql, w);
   const rows = s.rows || [];
   const headers = rows.length ? Object.keys(rows[0]) : [];
   return (
@@ -231,6 +262,52 @@ function DataTable(props) {
     </Card>
   );
 }
+function FilterBar(props) {
+  const fv = props.values;
+  const set = props.onChange;
+  if (!FILTERS.length) return null;
+  const dirty = FILTERS.some(function (f) {
+    const v = fv[f.id];
+    if (f.kind === "daterange") return !!(v && ((v.from && v.from.length) || (v.to && v.to.length)));
+    return !!(v && v.length);
+  });
+  return (
+    <div className={"mt-3 flex flex-wrap items-center gap-x-4 gap-y-2 rounded-xl px-3 py-2 border " + (DARK ? "bg-slate-900 border-slate-800" : "bg-white border-slate-200")}>
+      <span className={"text-[11px] font-semibold uppercase tracking-wider " + (DARK ? "text-slate-400" : "text-slate-500")}>Filters</span>
+      {FILTERS.map(function (f) {
+        if (f.kind === "daterange") {
+          const v = fv[f.id] || {};
+          return (
+            <div key={f.id} className="flex items-center gap-1.5">
+              <span className="text-xs font-medium text-slate-500">{f.label}</span>
+              <input type="date" value={v.from || ""} min={f.min} max={f.max} className={INPUT_CLS}
+                     onChange={function (e) { set(f.id, { from: e.target.value, to: v.to || "" }); }} />
+              <span className="text-xs text-slate-400">to</span>
+              <input type="date" value={v.to || ""} min={f.min} max={f.max} className={INPUT_CLS}
+                     onChange={function (e) { set(f.id, { from: v.from || "", to: e.target.value }); }} />
+            </div>
+          );
+        }
+        const isMulti = f.kind === "multiselect";
+        const cur = isMulti ? ((fv[f.id] && fv[f.id][0]) || "") : (fv[f.id] || "");
+        return (
+          <div key={f.id} className="flex items-center gap-1.5">
+            <span className="text-xs font-medium text-slate-500">{f.label}</span>
+            <select value={cur} className={INPUT_CLS}
+                    onChange={function (e) { set(f.id, isMulti ? (e.target.value ? [e.target.value] : []) : e.target.value); }}>
+              <option value="">All</option>
+              {(f.options || []).map(function (o) { return <option key={o} value={o}>{o}</option>; })}
+            </select>
+          </div>
+        );
+      })}
+      {dirty ? (
+        <button className={"text-xs font-medium rounded-lg px-2 py-1 " + (DARK ? "text-slate-300 hover:bg-slate-800" : "text-slate-500 hover:bg-slate-100")}
+                onClick={props.onReset}>Reset</button>
+      ) : null}
+    </div>
+  );
+}
 function Widget(props) {
   const w = props.cw.widget;
   if (w.kind === "kpi") return <Kpi w={w} sql={props.cw.sql} idx={props.idx} />;
@@ -238,6 +315,9 @@ function Widget(props) {
   return <Chart w={w} sql={props.cw.sql} seriesKeys={props.cw.seriesKeys} />;
 }
 export default function App() {
+  const [fv, setFv] = useState({});
+  function setFilter(id, v) { setFv(function (prev) { const n = Object.assign({}, prev); n[id] = v; return n; }); }
+  function resetFilters() { setFv({}); }
   return (
     <div className={"min-h-screen font-sans " + (DARK ? "bg-slate-950 text-slate-100" : "bg-slate-50 text-slate-900")}>
       <div className="mx-auto p-3 md:p-4" style={{ maxWidth: "1600px" }}>
@@ -250,6 +330,8 @@ export default function App() {
             <span>{PLAN.meta.insight}</span>
           </div>
         ) : null}
+        <FilterBar values={fv} onChange={setFilter} onReset={resetFilters} />
+        <FilterCtx.Provider value={fv}>
         {PLAN.sections.map(function (sec) {
           return (
             <div key={sec.id} className={SECTION_MT}>
@@ -260,6 +342,7 @@ export default function App() {
             </div>
           );
         })}
+        </FilterCtx.Provider>
       </div>
     </div>
   );

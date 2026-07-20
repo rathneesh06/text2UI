@@ -79,6 +79,47 @@ export interface TableWidget {
 
 export type Widget = KpiWidget | ChartWidget | TableWidget;
 
+// ---- Global filters (Phase A1) ---------------------------------------------
+// Dashboard-level filters rendered as a filter bar. They are DERIVED
+// deterministically from the data profile at compile time (temporal min/max →
+// date range, low-cardinality categoricals → selects) and persisted on the
+// spec so edit turns see them. The client only ever sends filter VALUES; the
+// server rebuilds the WHERE clause (bff/dashboard/filters.ts) — no SQL, and
+// no SQL fragments, ever cross the wire from the sandbox for filtered queries.
+export type GlobalFilterKind = "daterange" | "select" | "multiselect";
+
+export interface GlobalFilter {
+  id: string;
+  col: string;
+  kind: GlobalFilterKind;
+  label: string;
+  /** Optional anchor table (informational; applicability is computed per compile). */
+  table?: string;
+}
+
+/** Compile-time enrichment of a GlobalFilter: everything the renderer needs to
+ *  draw the control without another round trip. */
+export interface CompiledGlobalFilter extends GlobalFilter {
+  /** Tables (among the rendered widgets') that have this column — the filter
+   *  applies to a widget iff its table is in this list. */
+  tables: string[];
+  /** select/multiselect: the choices, from profile topValues (capped). */
+  options?: string[];
+  /** daterange: ISO date bounds (YYYY-MM-DD) from the profile min/max. */
+  min?: string;
+  max?: string;
+}
+
+/** A filter VALUE as sent by the client at query time. Self-describing so the
+ *  server can rebuild WHERE without session state. Every field is re-validated
+ *  and escaped server-side (bff/dashboard/filters.ts) before touching SQL. */
+export interface AppliedFilter {
+  col: string;
+  kind: GlobalFilterKind;
+  /** select: string · multiselect: string[] · daterange: { from?, to? } (ISO dates). */
+  value: string | string[] | { from?: string; to?: string };
+}
+
 export interface Section {
   id: string;
   title?: string;
@@ -102,6 +143,9 @@ export interface DashboardSpec {
   version: 1;
   meta: DashboardMeta;
   sections: Section[];
+  /** Global filter bar. undefined → compile derives from the profile;
+   *  [] → explicitly no filters (an edit removed them all). */
+  filters?: GlobalFilter[];
 }
 
 // ---- Compiled form (server output → renderer input) ------------------------
@@ -124,6 +168,8 @@ export interface RenderPlan {
   meta: DashboardMeta;
   sections: CompiledSection[];
   warnings: string[];
+  /** A1: the filter bar, fully resolved (options, bounds, applicability). */
+  filters?: CompiledGlobalFilter[];
   /** al5: the spec AFTER validation/repair — what actually renders. The handler
    *  returns THIS to the client (persisted as currentSpec), so the next edit
    *  turn reasons about widgets that exist on screen, and the change summary

@@ -56,7 +56,11 @@ function useQueryBridge(remote?: RemoteDataConfig) {
     if (!remote) return;
     const onMsg = async (e: MessageEvent) => {
       const d = e.data as any;
-      if (!d || d.type !== "t2ui.query" || typeof d.id !== "string" || typeof d.sql !== "string") return;
+      const isSql = d && d.type === "t2ui.query" && typeof d.sql === "string";
+      // A1: filtered widget queries — the sandbox sends a typed widget + filter
+      // VALUES; the host forwards them and the SERVER rebuilds the SQL.
+      const isWidget = d && d.type === "t2ui.widgetQuery" && d.widget && typeof d.widget === "object";
+      if (!d || (!isSql && !isWidget) || typeof d.id !== "string") return;
       const source = e.source as Window | null;
       if (!source) return;
       // Only answer iframes embedded in this document. That blocks external
@@ -69,11 +73,17 @@ function useQueryBridge(remote?: RemoteDataConfig) {
         try { source.postMessage({ type: "t2ui.queryResult", id: d.id, ...body }, e.origin); } catch { /* frame gone */ }
       };
       try {
-        const res = await fetch(`${remote.bffUrl}/api/query`, {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ projectId: remote.projectId, sql: d.sql }),
-        });
+        const res = isWidget
+          ? await fetch(`${remote.bffUrl}/api/dashboard/query`, {
+              method: "POST",
+              headers: { "Content-Type": "application/json" },
+              body: JSON.stringify({ projectId: remote.projectId, widget: d.widget, filters: Array.isArray(d.filters) ? d.filters : [] }),
+            })
+          : await fetch(`${remote.bffUrl}/api/query`, {
+              method: "POST",
+              headers: { "Content-Type": "application/json" },
+              body: JSON.stringify({ projectId: remote.projectId, sql: d.sql }),
+            });
         const json: any = await res.json().catch(() => ({}));
         if (!res.ok) return reply({ ok: false, error: json.error || `query failed: HTTP ${res.status}` });
         if (json.truncated) console.warn("[sandbox] query result truncated by the server row cap");
