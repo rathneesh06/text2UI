@@ -27,9 +27,9 @@ const WIDGET_FIELDS = {
   properties: {
     kind: { type: "string", enum: ["kpi", "line", "bar", "area", "pie", "donut", "table"] },
     title: { type: "string" }, subtitle: { type: "string" }, table: { type: "string" },
-    metric: { type: "object", properties: { col: { type: "string" }, agg: { type: "string" }, label: { type: "string" }, format: { type: "string" } } },
+    metric: { type: "object", properties: { col: { type: "string" }, agg: { type: "string" }, label: { type: "string" }, format: { type: "string" }, expr: { type: "object", properties: { op: { type: "string", enum: ["ratio", "pct", "diff"] }, num: { type: "object", properties: { col: { type: "string" }, agg: { type: "string" } } }, den: { type: "object", properties: { col: { type: "string" }, agg: { type: "string" } } } } } } },
     x: { type: "object", properties: { col: { type: "string" }, timeGrain: { type: "string" }, label: { type: "string" } } },
-    series: { type: "array", items: { type: "object", properties: { col: { type: "string" }, agg: { type: "string" }, label: { type: "string" }, format: { type: "string" } } } },
+    series: { type: "array", items: { type: "object", properties: { col: { type: "string" }, agg: { type: "string" }, label: { type: "string" }, format: { type: "string" }, expr: { type: "object", properties: { op: { type: "string", enum: ["ratio", "pct", "diff"] }, num: { type: "object", properties: { col: { type: "string" }, agg: { type: "string" } } }, den: { type: "object", properties: { col: { type: "string" }, agg: { type: "string" } } } } } } } },
     columns: { type: "array", items: { type: "object", properties: { col: { type: "string" }, label: { type: "string" }, agg: { type: "string" } } } },
     groupBy: { type: "array", items: { type: "object", properties: { col: { type: "string" }, timeGrain: { type: "string" } } } },
     limit: { type: "integer" }, width: { type: "string", enum: ["quarter", "third", "half", "full"] },

@@ -29,6 +29,21 @@ export function aggExpr(agg: Agg, col: string): string {
   }
 }
 
+/** A2: the full metric expression — plain aggregate OR the closed derived AST.
+ *  Ratios always divide through nullif(den, 0): a zero denominator yields NULL
+ *  ("—" in the renderer), and the fake-percent class (sum(col) dressed up as a
+ *  percentage) is impossible to express — pct/ratio REQUIRE a real division. */
+export function metricExpr(m: Metric): string {
+  if (m.expr) {
+    const n = aggExpr(m.expr.num.agg, m.expr.num.col);
+    const d = aggExpr(m.expr.den.agg, m.expr.den.col);
+    if (m.expr.op === "diff") return `(${n} - ${d})`;
+    const scale = m.expr.op === "pct" ? "100.0" : "1.0";
+    return `(${n} * ${scale} / nullif(${d}, 0))`;
+  }
+  return aggExpr(m.agg, m.col);
+}
+
 /** DuckDB date_trunc — NEVER to_char. Returns a real temporal value the renderer formats. */
 const GRAINS: Record<TimeGrain, string> = {
   day: "day", week: "week", month: "month", quarter: "quarter", year: "year",
@@ -71,14 +86,14 @@ export function seriesKey(m: Metric, i: number): string {
 // ---- builders --------------------------------------------------------------
 
 export function buildKpiSql(w: KpiWidget, extraWhere?: string[]): string {
-  return `SELECT ${aggExpr(w.metric.agg, w.metric.col)} AS value FROM ${qid(w.table)}${whereClause(w.filters, extraWhere)}`;
+  return `SELECT ${metricExpr(w.metric)} AS value FROM ${qid(w.table)}${whereClause(w.filters, extraWhere)}`;
 }
 
 export function buildChartSql(w: ChartWidget, extraWhere?: string[]): { sql: string; seriesKeys: { key: string; label: string }[] } {
   const isPie = w.kind === "pie" || w.kind === "donut";
   const series = isPie ? w.series.slice(0, 1) : w.series;
   const keys = series.map((m, i) => ({ key: seriesKey(m, i), label: m.label || `${m.agg}(${m.col})` }));
-  const selectSeries = series.map((m, i) => `${aggExpr(m.agg, m.col)} AS ${qid(keys[i].key)}`).join(", ");
+  const selectSeries = series.map((m, i) => `${metricExpr(m)} AS ${qid(keys[i].key)}`).join(", ");
 
   // Ordering: time axes ascend by x; categorical charts default to the first series desc.
   let orderBy = "ORDER BY x ASC";

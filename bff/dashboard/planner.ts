@@ -14,6 +14,11 @@ const PLAN_TIMEOUT_MS = Number(process.env.DASHBOARD_PLANNER_TIMEOUT_MS ?? 20000
 
 // Compact OpenAPI-subset schema. Widgets are a single permissive object (Gemini does
 // not handle discriminated unions well); we normalize/validate in code afterwards.
+const BASE_METRIC = {
+  type: "object",
+  properties: { col: { type: "string" }, agg: { type: "string", enum: ["count", "count_distinct", "sum", "avg", "min", "max", "median"] } },
+  required: ["col", "agg"],
+};
 const METRIC = {
   type: "object",
   properties: {
@@ -21,6 +26,7 @@ const METRIC = {
     agg: { type: "string", enum: ["count", "count_distinct", "sum", "avg", "min", "max", "median"] },
     label: { type: "string" },
     format: { type: "string", enum: ["number", "compact", "percent", "currency", "hours", "days"] },
+    expr: { type: "object", description: "derived metric: ratio=num/den, pct=num/den*100, diff=num-den — use for rates and percentages; never format a plain sum as percent", properties: { op: { type: "string", enum: ["ratio", "pct", "diff"] }, num: BASE_METRIC, den: BASE_METRIC }, required: ["op", "num", "den"] },
   },
   required: ["col", "agg"],
 };

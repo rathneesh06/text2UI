@@ -280,6 +280,8 @@ function scalar(v: unknown, what: string): string | number | boolean {
   return str(v, what, MAX_VALUE_LEN);
 }
 
+const EXPR_OPS = new Set(["ratio", "pct", "diff"]);
+
 function sanMetric(m: any, what: string): Metric {
   if (!m || typeof m !== "object") badValue(`${what} must be an object`);
   const agg = m.agg as Agg;
@@ -288,6 +290,17 @@ function sanMetric(m: any, what: string): Metric {
   const out: Metric = { col, agg };
   const label = optStr(m.label, `${what}.label`); if (label) out.label = label;
   if (m.format !== undefined) { if (!FORMATS.has(m.format)) badValue(`${what}.format invalid`); out.format = m.format; }
+  // A2: derived expression — a closed AST; both sides re-validated, op whitelisted.
+  if (m.expr !== undefined && m.expr !== null) {
+    const e = m.expr;
+    if (!e || typeof e !== "object" || !EXPR_OPS.has(e.op)) badValue(`${what}.expr.op invalid`);
+    const side = (b: any, name: string) => {
+      if (!b || typeof b !== "object" || !AGGS.has(b.agg)) badValue(`${what}.expr.${name} invalid`);
+      const c = b.agg === "count" ? String(b.col ?? "") : str(b.col, `${what}.expr.${name}.col`);
+      return { col: c, agg: b.agg as Agg };
+    };
+    out.expr = { op: e.op, num: side(e.num, "num"), den: side(e.den, "den") };
+  }
   return out;
 }
 function sanDim(d: any, what: string): Dimension {

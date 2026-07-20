@@ -30,6 +30,39 @@ export function validateSpec(spec: DashboardSpec, profiles: Dataset[]): Validati
 
   // Coerce a metric to something the data supports; returns null if unfixable.
   const fixMetric = (cols: ColMap, table: string, m: Metric, where: string): Metric | null => {
+    // A2: derived expressions — validate BOTH sides with the same rules; a bad
+    // side drops the whole metric (an honest gap beats a silently-wrong ratio).
+    if (m.expr) {
+      const ops = ["ratio", "pct", "diff"];
+      if (!ops.includes(m.expr.op) || !m.expr.num || !m.expr.den) {
+        warn(`${where}: malformed expr — dropped`); return null;
+      }
+      const side = (b: { col: string; agg: Agg }, name: string): { col: string; agg: Agg } | null => {
+        if (b.agg === "count") return { col: b.col ?? "", agg: "count" };
+        if (!NUMERIC_AGGS.includes(b.agg) && b.agg !== "count_distinct") { warn(`${where}: expr.${name} agg "${b.agg}" invalid — dropped`); return null; }
+        if (!cols.has(b.col)) { warn(`${where}: expr.${name} column "${b.col}" not in ${table} — dropped`); return null; }
+        if (NUMERIC_AGGS.includes(b.agg) && !NUMERIC.has(cols.get(b.col)!)) {
+          warn(`${where}: expr.${name} ${b.agg}("${b.col}") needs a numeric column — using count`);
+          return { col: b.col, agg: "count" };
+        }
+        return { col: b.col, agg: b.agg };
+      };
+      const num = side(m.expr.num, "num");
+      const den = side(m.expr.den, "den");
+      if (!num || !den) return null;
+      const out: Metric = { ...m, expr: { op: m.expr.op, num, den } };
+      // pct means "this IS a percentage" — make the display format agree.
+      if (m.expr.op === "pct" && !out.format) out.format = "percent";
+      if (m.expr.op === "ratio" && out.format === "percent") out.format = "number";
+      return out;
+    }
+    // A2 guard: the fake-percent class ("5559.0%") = an additive aggregate
+    // dressed up as a percentage. Percent display requires a real ratio (expr)
+    // or an average/median of an already-percent column — never sum/count.
+    if (m.format === "percent" && (m.agg === "sum" || m.agg === "count" || m.agg === "count_distinct")) {
+      warn(`${where}: percent format on ${m.agg}() is not a rate — use expr {op:"pct"} for real percentages; showing as number`);
+      m = { ...m, format: "number" };
+    }
     if (m.agg === "count") return m; // count(*) needs no column
     if (!cols.has(m.col)) { warn(`${where}: column "${m.col}" not in ${table} — dropped`); return null; }
     const t = cols.get(m.col)!;

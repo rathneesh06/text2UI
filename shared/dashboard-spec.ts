@@ -23,7 +23,19 @@ export interface Metric {
   agg: Agg;
   label?: string;
   format?: ValueFormat;
+  /** A2: derived metric — a CLOSED expression AST, never free SQL. When
+   *  present, col/agg are ignored and the value is computed from num/den:
+   *    ratio → num*1.0/nullif(den,0)
+   *    pct   → num*100.0/nullif(den,0)   (format "percent" auto-applies)
+   *    diff  → num - den
+   *  Division by zero yields NULL (renders as "—"), never garbage. */
+  expr?: MetricExpr;
 }
+
+export type ExprOp = "ratio" | "pct" | "diff";
+/** One side of a derived expression: a plain aggregate, no nesting. */
+export interface BaseMetric { col: string; agg: Agg }
+export interface MetricExpr { op: ExprOp; num: BaseMetric; den: BaseMetric }
 
 /** A grouping dimension; timeGrain buckets a date/timestamp column. */
 export interface Dimension {

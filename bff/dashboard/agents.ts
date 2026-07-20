@@ -28,7 +28,9 @@ const AGENT_TIMEOUT_MS = Number(process.env.DASHBOARD_AGENT_TIMEOUT_MS ?? 15000)
 // ---------------------------------------------------------------------------
 const AGG = { type: "string", enum: ["count", "count_distinct", "sum", "avg", "min", "max", "median"] };
 const FORMAT = { type: "string", enum: ["number", "compact", "percent", "currency", "hours", "days"] };
-const METRIC = { type: "object", properties: { col: { type: "string" }, agg: AGG, label: { type: "string" }, format: FORMAT }, required: ["col", "agg"] };
+const BASE_METRIC = { type: "object", properties: { col: { type: "string" }, agg: AGG }, required: ["col", "agg"] };
+const METRIC_EXPR = { type: "object", description: "derived metric: ratio=num/den, pct=num/den*100, diff=num-den. Use for rates, percentages, per-X averages. NEVER label a plain sum as a percent.", properties: { op: { type: "string", enum: ["ratio", "pct", "diff"] }, num: BASE_METRIC, den: BASE_METRIC }, required: ["op", "num", "den"] };
+const METRIC = { type: "object", properties: { col: { type: "string" }, agg: AGG, label: { type: "string" }, format: FORMAT, expr: METRIC_EXPR }, required: ["col", "agg"] };
 const DIMENSION = { type: "object", properties: { col: { type: "string" }, timeGrain: { type: "string", enum: ["day", "week", "month", "quarter", "year"] }, label: { type: "string" } }, required: ["col"] };
 
 const wrap = (item: unknown) => ({ type: "object", properties: { widgets: { type: "array", items: item } }, required: ["widgets"] });
@@ -80,10 +82,19 @@ function stripFences(t: string): string {
 let seq = 0;
 const wid = (p: string) => `${p}${++seq}_${Math.random().toString(36).slice(2, 6)}`;
 
+// A2: carry a well-formed derived expression through; drop malformed ones
+// (validation re-checks columns against the profile later).
+function coerceExpr(e: any): { expr?: import("../../shared/dashboard-spec").MetricExpr } {
+  const ok = e && typeof e === "object" && ["ratio", "pct", "diff"].includes(e.op)
+    && e.num?.agg && e.den?.agg;
+  if (!ok) return {};
+  return { expr: { op: e.op, num: { col: String(e.num.col ?? ""), agg: e.num.agg }, den: { col: String(e.den.col ?? ""), agg: e.den.agg } } };
+}
+
 function coerceKpis(parsed: any): KpiWidget[] {
   const arr = Array.isArray(parsed?.widgets) ? parsed.widgets : [];
   return arr.filter((w: any) => w?.title && w?.table && w?.metric?.col && w?.metric?.agg)
-    .map((w: any): KpiWidget => ({ id: wid("kpi"), kind: "kpi", title: String(w.title), ...(w.subtitle ? { subtitle: String(w.subtitle) } : {}), table: String(w.table), metric: { col: String(w.metric.col), agg: w.metric.agg, label: w.metric.label, format: w.metric.format }, width: "quarter" }));
+    .map((w: any): KpiWidget => ({ id: wid("kpi"), kind: "kpi", title: String(w.title), ...(w.subtitle ? { subtitle: String(w.subtitle) } : {}), table: String(w.table), metric: { col: String(w.metric.col), agg: w.metric.agg, label: w.metric.label, format: w.metric.format, ...coerceExpr(w.metric.expr) }, width: "quarter" }));
 }
 
 function coerceCharts(parsed: any, kinds: ChartWidget["kind"][], fallbackKind: ChartWidget["kind"]): ChartWidget[] {
@@ -93,7 +104,7 @@ function coerceCharts(parsed: any, kinds: ChartWidget["kind"][], fallbackKind: C
       id: wid(fallbackKind), kind: kinds.includes(w.kind) ? w.kind : fallbackKind,
       title: String(w.title), ...(w.subtitle ? { subtitle: String(w.subtitle) } : {}), table: String(w.table),
       x: { col: String(w.x.col), ...(w.x.timeGrain ? { timeGrain: w.x.timeGrain } : {}), ...(w.x.label ? { label: String(w.x.label) } : {}) },
-      series: w.series.filter((m: any) => m?.col && m?.agg).map((m: any) => ({ col: String(m.col), agg: m.agg, label: m.label, format: m.format })),
+      series: w.series.filter((m: any) => m?.col && m?.agg).map((m: any) => ({ col: String(m.col), agg: m.agg, label: m.label, format: m.format, ...coerceExpr(m.expr) })),
       ...(Number.isInteger(w.limit) && w.limit > 0 ? { limit: Math.min(w.limit, 50) } : {}),
       width: "half",
     }))
@@ -192,7 +203,7 @@ interface AgentDef<T extends Widget> {
 
 const KPI_AGENT: AgentDef<KpiWidget> = {
   name: "kpi",
-  system: `${COMMON} You are the KPI-card agent of a dashboard generator. Choose the 3-6 headline aggregates that best summarize this data for the user's request. Each KPI is one metric: pick the column, the aggregation, a short human title, and a display format (currency for money, compact for large counts, percent for rates).`,
+  system: `${COMMON} You are the KPI-card agent of a dashboard generator. Choose the 3-6 headline aggregates that best summarize this data for the user's request. Each KPI is one metric: pick the column, the aggregation, a short human title, and a display format (currency for money, compact for large counts, percent for rates). For RATES, PERCENTAGES, and PER-X ratios, set metric.expr: {op:"pct"|"ratio"|"diff", num:{col,agg}, den:{col,agg}} — e.g. SLA attainment = pct with num sum(sla_met_flag) over den count(*) (0/1 indicator columns sum to a numerator), tickets per agent = ratio of count(*) over count_distinct(agent). Both sides are plain aggregates over the SAME table and row set. NEVER present a plain sum/count as a percent; percent display without a real division is rejected.`,
   ask: "Return {\"widgets\":[...]} with 3-6 KPI candidates.",
   schema: wrap(KPI_ITEM),
   coerce: coerceKpis,
