@@ -32,11 +32,19 @@ export function aggExpr(agg: Agg, col: string): string {
 /** A2: the full metric expression — plain aggregate OR the closed derived AST.
  *  Ratios always divide through nullif(den, 0): a zero denominator yields NULL
  *  ("—" in the renderer), and the fake-percent class (sum(col) dressed up as a
- *  percentage) is impossible to express — pct/ratio REQUIRE a real division. */
+ *  percentage) is impossible to express — pct/ratio REQUIRE a real division.
+ *  Sides with `where` compile to `agg(...) FILTER (WHERE ...)` using the SAME
+ *  oneFilter grammar (qid/lit escaping) as widget filters. */
+function sideExpr(b: { col: string; agg: Agg; where?: Filter[] }): string {
+  const base = aggExpr(b.agg, b.col);
+  if (!b.where || !b.where.length) return base;
+  return `${base} FILTER (WHERE ${b.where.map(oneFilter).join(" AND ")})`;
+}
+
 export function metricExpr(m: Metric): string {
   if (m.expr) {
-    const n = aggExpr(m.expr.num.agg, m.expr.num.col);
-    const d = aggExpr(m.expr.den.agg, m.expr.den.col);
+    const n = sideExpr(m.expr.num);
+    const d = sideExpr(m.expr.den);
     if (m.expr.op === "diff") return `(${n} - ${d})`;
     const scale = m.expr.op === "pct" ? "100.0" : "1.0";
     return `(${n} * ${scale} / nullif(${d}, 0))`;

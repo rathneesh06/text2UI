@@ -230,4 +230,81 @@ await (async () => {
   console.log("derived: add_widget repair (the incomplete-widget incident) ✅");
 })();
 
+// ---- 7. A2.3 — CONDITIONAL SIDES + THE DEGENERATE-RATIO GUARD. Reproduces
+// the live incident: the colo sla table marks attainment in a CATEGORICAL
+// sla_status column, the model couldn't express "count where met / count(*)"
+// and emitted count(*)/count(*) — a structural 100%. Now (a) that tautology
+// is dropped by validation, (b) the real rate IS expressible via a
+// conditional numerator, compiled as FILTER (WHERE ...) and executed. -------
+await (async () => {
+  const SLA: Dataset = {
+    tableName: "sla",
+    profile: { source: { filename: "sla.csv", format: "csv" }, rowCount: 5, columns: [
+      col("sla_status", "string", 3, { topValues: [{ value: "met", count: 3 }, { value: "breached", count: 2 }] }),
+      col("actual_tat_hours", "number", 5),
+    ], sampleRows: [] },
+  };
+  const mkSpec = (metric: Metric): DashboardSpec => ({
+    version: 1, meta: { title: "T" },
+    sections: [{ id: "s", widgets: [{ id: "k1", kind: "kpi", title: "SLA", table: "sla", metric }] }],
+  });
+
+  // (a) The live incident: identical sides → dropped with the degenerate warning.
+  const degenerate: Metric = { col: "", agg: "count",
+    expr: { op: "pct", num: { col: "", agg: "count" }, den: { col: "", agg: "count" } } };
+  let r = validateSpec(mkSpec(degenerate), [SLA]);
+  assert.equal(r.spec.sections.length, 0, "count(*)/count(*) pct is dropped");
+  assert.ok(r.warnings.some((w) => w.includes("degenerate")), "warned as degenerate: " + r.warnings.join(" | "));
+
+  // (b) The real rate: conditional numerator survives validation…
+  const real: Metric = { col: "", agg: "count", expr: { op: "pct",
+    num: { col: "", agg: "count", where: [{ col: "sla_status", op: "=", value: "met" }] },
+    den: { col: "", agg: "count" } } };
+  r = validateSpec(mkSpec(real), [SLA]);
+  assert.equal(r.spec.sections.length, 1, "conditional-numerator pct survives");
+  assert.equal((r.spec.sections[0].widgets[0] as KpiWidget).metric.format, "percent", "auto percent");
+
+  // …compiles to FILTER (WHERE …) with escaped literals…
+  const sql = metricExpr(real);
+  assert.equal(sql, `(count(*) FILTER (WHERE "sla_status" = 'met') * 100.0 / nullif(count(*), 0))`, sql);
+
+  // …a condition on a ghost column drops the metric…
+  const ghost: Metric = { col: "", agg: "count", expr: { op: "pct",
+    num: { col: "", agg: "count", where: [{ col: "ghost", op: "=", value: "met" }] },
+    den: { col: "", agg: "count" } } };
+  r = validateSpec(mkSpec(ghost), [SLA]);
+  assert.equal(r.spec.sections.length, 0, "condition on a missing column drops the metric");
+
+  // …the runtime sanitizer accepts where and neutralizes injection in it…
+  const w = sanitizeWidget({ id: "k", kind: "kpi", title: "SLA", table: "sla",
+    metric: { col: "", agg: "count", expr: { op: "pct",
+      num: { col: "", agg: "count", where: [{ col: "sla_status", op: "=", value: "met' OR '1'='1" }] },
+      den: { col: "", agg: "count" } } } }) as KpiWidget;
+  const injSql = buildWidgetSql(w, []);
+  assert.ok(injSql.includes(`'met'' OR ''1''=''1'`), "where value quotes doubled: " + injSql);
+  try {
+    sanitizeWidget({ id: "k", kind: "kpi", title: "S", table: "t",
+      metric: { col: "", agg: "count", expr: { op: "pct",
+        num: { col: "", agg: "count", where: [{ col: "s", op: "LIKE; DROP", value: "x" }] },
+        den: { col: "", agg: "count" } } } });
+    assert.fail("bad where op should throw");
+  } catch (e: any) { assert.equal(e.status, 400, "where op outside the whitelist rejected"); }
+
+  // …and the EXECUTED number is the hand-computed truth: 3 of 5 met = 60%.
+  const { DuckDBInstance } = await import("@duckdb/node-api");
+  const inst = await DuckDBInstance.create(":memory:");
+  const conn = await inst.connect();
+  await conn.run(`CREATE TABLE sla (sla_status VARCHAR, actual_tat_hours DOUBLE)`);
+  await conn.run(`INSERT INTO sla VALUES ('met',1),('met',2),('met',3),('breached',9),('breached',8)`);
+  const res = await conn.run(buildWidgetSql({ id: "k1", kind: "kpi", title: "SLA attainment", table: "sla", metric: real }, []));
+  const rows = await res.getRowObjects();
+  assert.equal(Number((rows[0] as any).value), 60, "categorical-status SLA attainment executes: 60%");
+  // Composes with global filters: restrict to breached rows → attainment 0%.
+  const res2 = await conn.run(buildWidgetSql({ id: "k1", kind: "kpi", title: "SLA", table: "sla", metric: real },
+    [{ col: "sla_status", kind: "multiselect", value: ["breached"] }]));
+  const rows2 = await res2.getRowObjects();
+  assert.equal(Number((rows2[0] as any).value), 0, "filtered to breached rows → attainment 0%");
+  console.log("derived: conditional sides + degenerate guard (the 100% incident) ✅");
+})();
+
 console.log("derived.test.ts: all assertions passed ✅");

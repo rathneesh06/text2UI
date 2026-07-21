@@ -33,8 +33,12 @@ export interface Metric {
 }
 
 export type ExprOp = "ratio" | "pct" | "diff";
-/** One side of a derived expression: a plain aggregate, no nesting. */
-export interface BaseMetric { col: string; agg: Agg }
+/** One side of a derived expression: a plain aggregate, no nesting. `where`
+ *  makes the side CONDITIONAL (compiles to `agg(...) FILTER (WHERE ...)`) —
+ *  this is what makes real rates expressible when attainment lives in a
+ *  categorical column: SLA attainment = pct of count WHERE sla_status='met'
+ *  over count(*). Same closed Filter grammar as widget filters. */
+export interface BaseMetric { col: string; agg: Agg; where?: Filter[] }
 export interface MetricExpr { op: ExprOp; num: BaseMetric; den: BaseMetric }
 
 /** A grouping dimension; timeGrain buckets a date/timestamp column. */

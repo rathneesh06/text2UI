@@ -4,7 +4,7 @@
 // timeGrain from a non-temporal axis, keep one series for pie). Whatever can't be
 // repaired is dropped with a warning, so a single bad node can never blank the board.
 import type { Dataset } from "../../shared/types";
-import type { DashboardSpec, Section, Widget, Metric, Agg } from "../../shared/dashboard-spec";
+import type { DashboardSpec, Section, Widget, Metric, Agg, BaseMetric } from "../../shared/dashboard-spec";
 
 type ColMap = Map<string, string>; // colName -> profile type (integer|number|boolean|date|string)
 const NUMERIC = new Set(["integer", "number"]);
@@ -37,19 +37,44 @@ export function validateSpec(spec: DashboardSpec, profiles: Dataset[]): Validati
       if (!ops.includes(m.expr.op) || !m.expr.num || !m.expr.den) {
         warn(`${where}: malformed expr — dropped`); return null;
       }
-      const side = (b: { col: string; agg: Agg }, name: string): { col: string; agg: Agg } | null => {
-        if (b.agg === "count") return { col: b.col ?? "", agg: "count" };
-        if (!NUMERIC_AGGS.includes(b.agg) && b.agg !== "count_distinct") { warn(`${where}: expr.${name} agg "${b.agg}" invalid — dropped`); return null; }
-        if (!cols.has(b.col)) { warn(`${where}: expr.${name} column "${b.col}" not in ${table} — dropped`); return null; }
-        if (NUMERIC_AGGS.includes(b.agg) && !NUMERIC.has(cols.get(b.col)!)) {
+      const OPS = ["=", "!=", ">", ">=", "<", "<=", "in", "not_null", "is_null"];
+      const side = (b: BaseMetric, name: string): BaseMetric | null => {
+        let out: BaseMetric;
+        if (b.agg === "count") out = { col: b.col ?? "", agg: "count" };
+        else if (!NUMERIC_AGGS.includes(b.agg) && b.agg !== "count_distinct") { warn(`${where}: expr.${name} agg "${b.agg}" invalid — dropped`); return null; }
+        else if (!cols.has(b.col)) { warn(`${where}: expr.${name} column "${b.col}" not in ${table} — dropped`); return null; }
+        else if (NUMERIC_AGGS.includes(b.agg) && !NUMERIC.has(cols.get(b.col)!)) {
           warn(`${where}: expr.${name} ${b.agg}("${b.col}") needs a numeric column — using count`);
-          return { col: b.col, agg: "count" };
+          out = { col: b.col, agg: "count" };
+        } else out = { col: b.col, agg: b.agg };
+        // Conditional side: every where-filter must reference a real column
+        // with a known op; a bad condition drops the metric (an honest gap
+        // beats a rate over the wrong rows).
+        if (b.where !== undefined && b.where !== null) {
+          if (!Array.isArray(b.where)) { warn(`${where}: expr.${name}.where must be an array — dropped`); return null; }
+          for (const f of b.where) {
+            if (!f || !OPS.includes(f.op) || !cols.has(f.col)) {
+              warn(`${where}: expr.${name} condition on "${f?.col}" invalid — dropped`); return null;
+            }
+          }
+          if (b.where.length) out.where = b.where;
         }
-        return { col: b.col, agg: b.agg };
+        return out;
       };
       const num = side(m.expr.num, "num");
       const den = side(m.expr.den, "den");
       if (!num || !den) return null;
+      // DEGENERATE-RATIO GUARD: a ratio/pct whose numerator compiles
+      // identically to its denominator is structurally constant (always 1 /
+      // 100%) — the "SLA attainment 100.0%" class. A conditional numerator
+      // (where) is what makes the sides differ; without one, identical sides
+      // mean the model dressed up a tautology as a rate. Drop it.
+      if ((m.expr.op === "ratio" || m.expr.op === "pct")
+        && num.agg === den.agg && num.col === den.col
+        && JSON.stringify(num.where ?? []) === JSON.stringify(den.where ?? [])) {
+        warn(`${where}: degenerate ${m.expr.op} — numerator equals denominator (always ${m.expr.op === "pct" ? "100%" : "1"}). Use a conditional numerator (where) to express a real rate — dropped`);
+        return null;
+      }
       const out: Metric = { ...m, expr: { op: m.expr.op, num, den } };
       // pct means "this IS a percentage" — make the display format agree.
       if (m.expr.op === "pct" && !out.format) out.format = "percent";

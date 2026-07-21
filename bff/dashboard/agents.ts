@@ -28,8 +28,9 @@ const AGENT_TIMEOUT_MS = Number(process.env.DASHBOARD_AGENT_TIMEOUT_MS ?? 15000)
 // ---------------------------------------------------------------------------
 const AGG = { type: "string", enum: ["count", "count_distinct", "sum", "avg", "min", "max", "median"] };
 const FORMAT = { type: "string", enum: ["number", "compact", "percent", "currency", "hours", "days"] };
-const BASE_METRIC = { type: "object", properties: { col: { type: "string" }, agg: AGG }, required: ["col", "agg"] };
-const METRIC_EXPR = { type: "object", description: "derived metric: ratio=num/den, pct=num/den*100, diff=num-den. Use for rates, percentages, per-X averages. NEVER label a plain sum as a percent.", properties: { op: { type: "string", enum: ["ratio", "pct", "diff"] }, num: BASE_METRIC, den: BASE_METRIC }, required: ["op", "num", "den"] };
+const FILTER_ITEM = { type: "object", properties: { col: { type: "string" }, op: { type: "string", enum: ["=", "!=", ">", ">=", "<", "<=", "in", "not_null", "is_null"] }, value: {} }, required: ["col", "op"] };
+const BASE_METRIC = { type: "object", properties: { col: { type: "string" }, agg: AGG, where: { type: "array", description: "conditions making this side CONDITIONAL, e.g. count where sla_status='met'", items: FILTER_ITEM } }, required: ["col", "agg"] };
+const METRIC_EXPR = { type: "object", description: "derived metric: ratio=num/den, pct=num/den*100, diff=num-den. Use for rates, percentages, per-X averages. num and den MUST differ (identical sides = a meaningless constant 100%); make the numerator conditional with where when the qualifying rows are marked by a column value. NEVER label a plain sum as a percent.", properties: { op: { type: "string", enum: ["ratio", "pct", "diff"] }, num: BASE_METRIC, den: BASE_METRIC }, required: ["op", "num", "den"] };
 const METRIC = { type: "object", properties: { col: { type: "string" }, agg: AGG, label: { type: "string" }, format: FORMAT, expr: METRIC_EXPR }, required: ["col", "agg"] };
 const DIMENSION = { type: "object", properties: { col: { type: "string" }, timeGrain: { type: "string", enum: ["day", "week", "month", "quarter", "year"] }, label: { type: "string" } }, required: ["col"] };
 
@@ -234,7 +235,7 @@ interface AgentDef<T extends Widget> {
 
 const KPI_AGENT: AgentDef<KpiWidget> = {
   name: "kpi",
-  system: `${COMMON} You are the KPI-card agent of a dashboard generator. Choose the 3-6 headline aggregates that best summarize this data for the user's request. Each KPI is one metric: pick the column, the aggregation, a short human title, and a display format (currency for money, compact for large counts, percent for rates). For RATES, PERCENTAGES, and PER-X ratios, set metric.expr: {op:"pct"|"ratio"|"diff", num:{col,agg}, den:{col,agg}} — e.g. SLA attainment = pct with num sum(sla_met_flag) over den count(*) (0/1 indicator columns sum to a numerator), tickets per agent = ratio of count(*) over count_distinct(agent). Both sides are plain aggregates over the SAME table and row set. NEVER present a plain sum/count as a percent; percent display without a real division is rejected.`,
+  system: `${COMMON} You are the KPI-card agent of a dashboard generator. Choose the 3-6 headline aggregates that best summarize this data for the user's request. Each KPI is one metric: pick the column, the aggregation, a short human title, and a display format (currency for money, compact for large counts, percent for rates). For RATES, PERCENTAGES, and PER-X ratios, set metric.expr: {op:"pct"|"ratio"|"diff", num:{col,agg,where?}, den:{col,agg}}. When the qualifying rows are marked by a column VALUE (e.g. sla_status = 'met'), make the NUMERATOR conditional: num {col:"", agg:"count", where:[{col:"sla_status",op:"=",value:"met"}]} over den count(*) — that is a real attainment rate. 0/1 indicator columns can instead sum to a numerator. tickets per agent = ratio of count(*) over count_distinct(agent). num and den MUST NOT be identical (that is a constant 100%, not a rate — it will be rejected). NEVER present a plain sum/count as a percent.`,
   ask: "Return {\"widgets\":[...]} with 3-6 KPI candidates.",
   schema: wrap(KPI_ITEM),
   coerce: coerceKpis,

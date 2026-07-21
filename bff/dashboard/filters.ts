@@ -297,7 +297,10 @@ function sanMetric(m: any, what: string): Metric {
     const side = (b: any, name: string) => {
       if (!b || typeof b !== "object" || !AGGS.has(b.agg)) badValue(`${what}.expr.${name} invalid`);
       const c = b.agg === "count" ? String(b.col ?? "") : str(b.col, `${what}.expr.${name}.col`);
-      return { col: c, agg: b.agg as Agg };
+      const out: { col: string; agg: Agg; where?: Filter[] } = { col: c, agg: b.agg as Agg };
+      const w = sanFilters(b.where);
+      if (w && w.length) out.where = w;
+      return out;
     };
     out.expr = { op: e.op, num: side(e.num, "num"), den: side(e.den, "den") };
   }
