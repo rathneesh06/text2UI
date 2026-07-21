@@ -145,4 +145,50 @@ await (async () => {
   console.log("derived: executed golden numbers ✅");
 })();
 
+// ---- 5. degraded-mode visibility: the deterministic fallback emits a real
+// ratio KPI (indicator → pct; else rows-per-dimension → ratio), validates
+// cleanly, and EXECUTES. This is what renders when the model key is dead. ----
+await (async () => {
+  const { fallbackRatioKpi } = await import("./agents");
+  const { classifySchema } = await import("./enhance");
+
+  // Indicator column present → "<col> rate" pct KPI.
+  const withInd = fallbackRatioKpi([{
+    tableName: "tickets",
+    profile: { source: { filename: "t.csv", format: "csv" }, rowCount: 5, columns: [
+      col("agent", "string", 2, { topValues: [{ value: "Ada", count: 3 }, { value: "Bo", count: 2 }] }),
+      col("sla_met", "integer", 2, { min: 0, max: 1 }),
+    ], sampleRows: [] },
+  }], classifySchema([TICKETS]));
+  assert.ok(withInd, "indicator fixture yields a ratio KPI");
+  assert.equal(withInd!.metric.expr!.op, "pct");
+  assert.equal(withInd!.metric.expr!.num.col, "sla_met");
+  assert.equal(withInd!.metric.expr!.den.agg, "count");
+
+  // Survives validation and the compiled SQL carries the nullif guard.
+  const spec: DashboardSpec = { version: 1, meta: { title: "T" }, sections: [{ id: "s", widgets: [withInd!] }] };
+  const v = validateSpec(spec, [TICKETS]);
+  assert.equal(v.spec.sections.length, 1, "fallback ratio KPI survives validation");
+  const kept = (v.spec.sections[0].widgets[0] as KpiWidget).metric;
+  assert.equal(kept.format, "percent");
+  const { DuckDBInstance } = await import("@duckdb/node-api");
+  const inst2 = await DuckDBInstance.create(":memory:");
+  const c2 = await inst2.connect();
+  await c2.run(`CREATE TABLE tickets (agent VARCHAR, sla_met INT)`);
+  await c2.run(`INSERT INTO tickets VALUES ('Ada',1),('Ada',1),('Ada',0),('Bo',0),('Bo',1)`);
+  const r2 = await c2.run(buildWidgetSql({ ...withInd!, table: "tickets" }, []));
+  const rows2 = await r2.getRowObjects();
+  assert.equal(Number((rows2[0] as any).value), 60, "degraded-mode ratio KPI executes: 60%");
+
+  // No indicator → rows-per-dimension ratio.
+  const noInd: Dataset = { tableName: "orders", profile: { source: { filename: "o.csv", format: "csv" }, rowCount: 100, columns: [
+    col("region", "string", 4, { topValues: [{ value: "EU", count: 60 }, { value: "US", count: 40 }] }),
+    col("amount", "number", 90),
+  ], sampleRows: [] } };
+  const perDim = fallbackRatioKpi([noInd], classifySchema([noInd]));
+  assert.ok(perDim && perDim.metric.expr!.op === "ratio", "dimension fixture yields a per-X ratio");
+  assert.equal(perDim!.metric.expr!.den.agg, "count_distinct");
+  console.log("derived: degraded-mode fallback ratio KPI ✅");
+})();
+
 console.log("derived.test.ts: all assertions passed ✅");

@@ -175,7 +175,7 @@ export async function handleDashboardBuild(
   if (!spec) {
     // ---- Planner path: edit turns, kill-switch, or agent-harvest fallback ------
     spec = await runPlannerPath(planner, datasets, b.userPrompt, enhancement, currentSpec, chatContext, selectedWidget);
-    if (!spec) return { status: 502, body: { error: "planner could not produce a dashboard spec" } };
+    if (!spec) return { status: 502, body: { error: "planner could not produce a dashboard spec — the model call likely failed. Check the BFF logs and GEMINI_API_KEY (verify with GET /health?model=1)." } };
     // EDIT RECONCILIATION: the previous version is the truth for everything the
     // user didn't touch — heal any kept widget the model re-emitted with missing
     // required fields, BEFORE validation gets a chance to drop it. A style-only

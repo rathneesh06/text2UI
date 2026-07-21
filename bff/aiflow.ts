@@ -151,6 +151,26 @@ function rateLimitMessage(bodyText: string): string {
 }
 
 /** One call to Gemini generateContent, with backoff retries on transient errors. */
+/** One tiny, NON-RETRYING model call to verify the API key + connectivity.
+ *  Exists because an invalid GEMINI_API_KEY is otherwise nearly invisible:
+ *  builds still succeed on deterministic fallbacks, and only edits hard-fail.
+ *  Used by the startup banner and GET /health?model=1 — never on the hot path. */
+export async function checkModelHealth(): Promise<{ ok: boolean; detail: string }> {
+  if (!API_KEY) return { ok: false, detail: "GEMINI_API_KEY is not set" };
+  try {
+    const res = await fetch(API_URL, {
+      method: "POST",
+      headers: { "Content-Type": "application/json", "x-goog-api-key": API_KEY },
+      body: JSON.stringify({ contents: [{ role: "user", parts: [{ text: "ping" }] }], generationConfig: { maxOutputTokens: 1 } }),
+    });
+    if (res.ok) return { ok: true, detail: "model reachable" };
+    const text = (await res.text().catch(() => "")).replace(/\s+/g, " ").slice(0, 300);
+    return { ok: false, detail: `HTTP ${res.status}: ${text}` };
+  } catch (err: any) {
+    return { ok: false, detail: err?.message ?? "network error" };
+  }
+}
+
 export async function callGemini(systemPrompt: string, userPrompt: string, opts: GenOptions = {}, images: ImagePart[] = []): Promise<GenResult> {
   const t0 = Date.now();
   const body = JSON.stringify({

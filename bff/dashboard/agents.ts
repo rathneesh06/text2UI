@@ -145,7 +145,38 @@ export function fallbackKpis(datasets: Dataset[], roles: SchemaRoles): KpiWidget
     const m = roles.measures[0];
     out.push({ id: wid("kpi"), kind: "kpi", title: `Average ${m.col.name}`, table: m.table, metric: { col: m.col.name, agg: "avg", format: "number" }, width: "quarter" });
   }
+  // A2: one HONEST derived-ratio KPI when the data supports it — so the ratio
+  // machinery is exercised even without a model (degraded mode / offline tests).
+  const ratio = fallbackRatioKpi(datasets, roles);
+  if (ratio && out.length < 5) out.push(ratio);
   return out;
+}
+
+/** A ratio KPI derived deterministically from the profile, or null.
+ *  Preference: (1) a 0/1 indicator column → "<col> rate" as a real pct
+ *  (sum(indicator) over count(*)); (2) a low-cardinality dimension →
+ *  "<rows> per <dim>" (count(*) over count_distinct(dim)). Both compile
+ *  through the expr AST with nullif guards — never a dressed-up sum. */
+export function fallbackRatioKpi(datasets: Dataset[], roles: SchemaRoles): KpiWidget | null {
+  for (const d of datasets) {
+    const ind = d.profile.columns.find((c) =>
+      (c.type === "integer" || c.type === "boolean") &&
+      c.uniqueCount >= 1 && c.uniqueCount <= 2 &&
+      Number(c.min ?? 0) === 0 && Number(c.max ?? 1) === 1);
+    if (ind && ind.type === "integer") {
+      const pretty = ind.name.split("_").filter(Boolean).join(" ");
+      return { id: wid("kpi"), kind: "kpi", title: `${pretty.charAt(0).toUpperCase() + pretty.slice(1)} rate`, table: d.tableName,
+        metric: { col: ind.name, agg: "sum", format: "percent",
+          expr: { op: "pct", num: { col: ind.name, agg: "sum" }, den: { col: "", agg: "count" } } }, width: "quarter" };
+    }
+  }
+  const dim = roles.dimensions.find((r) => r.col.uniqueCount >= 2 && r.col.uniqueCount <= 50);
+  if (dim) {
+    return { id: wid("kpi"), kind: "kpi", title: `${dim.table} per ${dim.col.name}`, table: dim.table,
+      metric: { col: "", agg: "count", format: "number",
+        expr: { op: "ratio", num: { col: "", agg: "count" }, den: { col: dim.col.name, agg: "count_distinct" } } }, width: "quarter" };
+  }
+  return null;
 }
 
 export function fallbackBars(datasets: Dataset[], roles: SchemaRoles): ChartWidget[] {

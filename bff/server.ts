@@ -9,7 +9,7 @@ import cors from "cors";
 import { assemble, assembleSummary, assemblePlan } from "./assembler";
 import { scoreDomain, classifyDomain, buildEnrichment } from "./domain";
 import { runWithMetrics, setPhase } from "./metrics";
-import { callGemini, generateApp, generateAppStream, planApp, BUILD_OPTS, EDIT_OPTS, type GenOptions } from "./aiflow";
+import { callGemini, checkModelHealth, generateApp, generateAppStream, planApp, BUILD_OPTS, EDIT_OPTS, type GenOptions } from "./aiflow";
 import { compileCss } from "./tailwind";
 import { DuckDBStorage } from "./storage/duckdb";
 import { PostgresStorage } from "./storage/postgres";
@@ -50,6 +50,8 @@ const STORAGE_PATH = process.env.STORAGE_PATH ?? "bff/data/text2ui.duckdb";
 const QUERY_ROW_CAP = Number(process.env.QUERY_ROW_CAP ?? 10_000);
 const QUERY_ROW_CAP_MAX = Number(process.env.QUERY_ROW_CAP_MAX ?? 200_000); // ceiling for explicit rowCap requests (project restore)
 const QUERY_TIMEOUT_MS = Number(process.env.QUERY_TIMEOUT_MS ?? 15_000);
+// Cached result of the startup Gemini key check (see the isDirectRun block).
+let modelHealth: { ok: boolean; detail: string; checkedAt: number } | null = null;
 let _rawStorage: StorageEngine | null = null;
 let _storage: TenantStorageEngine | null = null;
 function getRawStorage(): StorageEngine {
@@ -717,7 +719,12 @@ export function createServer() {
     next();
   });
 
-  app.get("/health", (_req, res) => res.json({ ok: true }));
+  app.get("/health", async (req, res) => {
+    // ?model=1: re-verify the Gemini key LIVE (one tiny call). Otherwise return
+    // the cached startup result so liveness probes stay free.
+    if (req.query.model === "1") modelHealth = { ...(await checkModelHealth()), checkedAt: Date.now() };
+    res.json({ ok: true, model: modelHealth ?? { ok: null, detail: "not checked yet — GET /health?model=1" } });
+  });
 
   app.post("/api/generate", async (req, res) => {
     const tenant = req.tenantId ?? DEV_TENANT;
@@ -1136,5 +1143,23 @@ if (isDirectRun) {
   const port = Number(process.env.PORT ?? 8787);
   applyConfigCheck(validateConfig());
   console.log(`[bff] flags: ORCHESTRATOR_ENABLED=${process.env.ORCHESTRATOR_ENABLED ?? "0"} DESIGN_RAG_ENABLED=${process.env.DESIGN_RAG_ENABLED ?? "0"} STORAGE=${process.env.STORAGE ?? "duckdb"}`);
+  // Model-key preflight: an invalid GEMINI_API_KEY is otherwise nearly
+  // invisible (builds still render via deterministic fallbacks; only edits
+  // hard-fail with a 502). Say it ONCE, loudly, at startup.
+  void checkModelHealth().then((h) => {
+    modelHealth = { ...h, checkedAt: Date.now() };
+    if (h.ok) { console.log("[bff] model check: GEMINI key OK — agents/edits/ratio-KPIs fully enabled"); return; }
+    console.warn("");
+    console.warn("############################################################");
+    console.warn("[bff] MODEL CHECK FAILED — running in DEGRADED mode");
+    console.warn(`[bff]   reason: ${h.detail}`);
+    console.warn("[bff]   builds : deterministic fallback widgets only (no model-chosen");
+    console.warn("[bff]            metrics, no derived ratio/pct KPIs from prompts)");
+    console.warn("[bff]   edits  : patch ops AND full-spec planner will fail -> 502");
+    console.warn("[bff]   fix    : set a valid GEMINI_API_KEY in .env, restart, then");
+    console.warn("[bff]            verify with GET /health?model=1");
+    console.warn("############################################################");
+    console.warn("");
+  });
   createServer().listen(port, () => console.log(`BFF listening on http://localhost:${port}`));
 }
