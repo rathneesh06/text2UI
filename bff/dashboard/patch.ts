@@ -36,6 +36,12 @@ const WIDGET_FIELDS = {
   },
 };
 
+// add_widget uses the SAME field set but with the identity fields REQUIRED —
+// this is what update's `set` must NOT have (a set is partial by design). The
+// "incomplete widget" rejection class traced to Gemini legally omitting
+// table/kind here when this was the shared, nothing-required schema.
+const ADD_WIDGET_FIELDS = { ...WIDGET_FIELDS, required: ["kind", "title", "table"] };
+
 export const EDIT_OPS_SCHEMA = {
   type: "object",
   properties: {
@@ -47,7 +53,7 @@ export const EDIT_OPS_SCHEMA = {
           op: { type: "string", enum: ["update_widget", "remove_widget", "add_widget", "update_meta"] },
           id: { type: "string", description: "target widget id (update_widget / remove_widget)" },
           set: WIDGET_FIELDS,
-          widget: WIDGET_FIELDS,
+          widget: ADD_WIDGET_FIELDS,
           sectionId: { type: "string", description: "for add_widget: section to append to" },
           meta: { type: "object", properties: {
             title: { type: "string" }, subtitle: { type: "string" }, insight: { type: "string" },
@@ -67,7 +73,7 @@ Rules:
 - Touch ONLY what the user asked about. Every widget you do not name stays exactly as it is — you cannot break it.
 - update_widget: give the id and ONLY the fields to change (e.g. {"op":"update_widget","id":"t1","set":{"limit":5}}). Never re-send unchanged fields.
 - remove_widget: only when the user clearly asked to remove/delete/hide something.
-- add_widget: a complete new widget grounded in real columns from the data profile.
+- add_widget: a complete new widget grounded in real columns from the data profile. MUST include kind, title, AND table (pick the table from the data profile — usually the one the existing widgets use). For rate/percentage KPIs use metric.expr {op:"pct", num, den} (e.g. num=sum of a 0/1 flag, den=count) — never a plain sum formatted as percent.
 - update_meta: for theme/title/subtitle/accent/palette/insight changes.
 - When a SELECTED WIDGET is given, "this"/"that"/"it" means that widget id.
 - If the request is unclear, return {"ops":[]} rather than guessing.`;
@@ -180,7 +186,34 @@ export function applyOps(current: DashboardSpec, ops: EditOp[], userPrompt: stri
     }
     if (op.op === "add_widget") {
       const w = op.widget;
-      if (!w || !w.kind || !w.title || !w.table) { rejected.push("add_widget: incomplete widget"); continue; }
+      if (!w) { rejected.push("add_widget: no widget provided"); continue; }
+      // REPAIR before rejecting — the model routinely nails the analytical
+      // content (metric/expr/series) but omits an identity field. All repairs
+      // are deterministic; anything still unresolvable rejects with a message
+      // naming the missing fields (so the audit trail is actionable).
+      if (!w.kind) {
+        if ((w as any).metric) (w as any).kind = "kpi";
+        else if ((w as any).columns?.length) (w as any).kind = "table";
+        else if ((w as any).x && (w as any).series?.length) (w as any).kind = "bar";
+      }
+      if (!w.table) {
+        // Default to the table the current board is about: the most common
+        // table among existing widgets (unambiguous in the typical case).
+        const counts = new Map<string, number>();
+        for (const s of spec.sections) for (const cw of s.widgets) counts.set(cw.table, (counts.get(cw.table) ?? 0) + 1);
+        const top = [...counts.entries()].sort((a, b) => b[1] - a[1]);
+        if (top.length && (top.length === 1 || top[0][1] > (top[1]?.[1] ?? 0))) (w as any).table = top[0][0];
+      }
+      if (!w.title) {
+        const m: any = (w as any).metric;
+        const derived = m?.label || (m?.col ? `${m.agg ?? ""} ${m.col}`.trim() : "");
+        if (derived) (w as any).title = String(derived);
+      }
+      if (!w.kind || !w.title || !w.table) {
+        const missing = [!w.kind && "kind", !w.title && "title", !w.table && "table"].filter(Boolean).join(", ");
+        rejected.push(`add_widget: incomplete widget (missing ${missing})`);
+        continue;
+      }
       const widget: Widget = { ...w, id: w.id && !findWidget(w.id) ? w.id : `w_${Date.now().toString(36)}_${++seq}` };
       const sec = spec.sections.find((s) => s.id === op.sectionId) ?? spec.sections[spec.sections.length - 1];
       if (!sec) { rejected.push("add_widget: no section to add to"); continue; }

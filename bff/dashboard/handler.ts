@@ -163,6 +163,14 @@ export async function handleDashboardBuild(
         return { status: 200, body: { app: null, spec: currentSpec, warnings: [], noChange: true, pipeline: "patch",
           summary: ["I wasn't sure what to change there — could you name the widget or describe the edit more specifically?"] } };
       }
+      if (r.applied.length === 0) {
+        // Ops were emitted but every one was rejected by the deterministic
+        // apply gates. Nothing changed — say exactly that (and why), never
+        // "Updated the dashboard" over an unchanged board.
+        audit({ turnId, conversationId, stage: "edit_ops", detail: { applied: [], rejected: r.rejected } });
+        return { status: 200, body: { app: null, spec: currentSpec, warnings: [], noChange: true, pipeline: "patch",
+          summary: ["I couldn't apply that edit: " + r.rejected.join("; ") + ". Could you rephrase or point at the widget?"] } };
+      }
       spec = r.spec;
       pipeline = "patch" as any;
       healedNotes = r.rejected;

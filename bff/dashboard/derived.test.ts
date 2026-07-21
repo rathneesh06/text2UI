@@ -191,4 +191,43 @@ await (async () => {
   console.log("derived: degraded-mode fallback ratio KPI ✅");
 })();
 
+// ---- 6. THE "incomplete widget" INCIDENT: an add_widget op with the
+// analytical content right (pct expr) but identity fields omitted — exactly
+// what the live model emitted — must be REPAIRED (kind from shape, table from
+// the board) and applied; a truly unresolvable op must reject with a message
+// naming the missing fields. -------------------------------------------------
+await (async () => {
+  const { applyOps } = await import("./patch");
+  const cur: DashboardSpec = {
+    version: 1, meta: { title: "Helpdesk" },
+    sections: [{ id: "s1", widgets: [
+      { id: "k1", kind: "kpi", title: "Tickets", table: "tickets", metric: { col: "", agg: "count" } },
+      { id: "c1", kind: "bar", title: "By status", table: "tickets", x: { col: "status" }, series: [{ col: "", agg: "count" }] },
+    ] }],
+  };
+  const incident: any = { op: "add_widget", widget: {
+    title: "SLA Attainment %",
+    metric: { col: "sla_met", agg: "sum", format: "percent",
+      expr: { op: "pct", num: { col: "sla_met", agg: "sum" }, den: { col: "", agg: "count" } } },
+  } }; // note: NO kind, NO table — as the live model emitted it
+  const r = applyOps(structuredClone(cur), [incident], "add a KPI for SLA attainment percentage");
+  assert.equal(r.rejected.length, 0, "repaired, not rejected: " + r.rejected.join("; "));
+  assert.equal(r.applied.length, 1);
+  const added: any = r.spec.sections[0].widgets[2];
+  assert.equal(added.kind, "kpi", "kind inferred from the metric shape");
+  assert.equal(added.table, "tickets", "table defaulted from the board's dominant table");
+  assert.equal(added.metric.expr.op, "pct", "the expr survived intact");
+  // And it compiles + validates like any widget.
+  const v = validateSpec(r.spec, [TICKETS]);
+  assert.equal(v.spec.sections[0].widgets.length, 3, "repaired widget survives validation");
+
+  // Unresolvable: no title derivable, no kind inferable → diagnostic rejection.
+  const bad: any = { op: "add_widget", widget: { subtitle: "??" } };
+  const r2 = applyOps(structuredClone(cur), [bad], "add something");
+  assert.equal(r2.applied.length, 0);
+  assert.ok(r2.rejected[0].includes("missing"), "rejection names the missing fields: " + r2.rejected[0]);
+  assert.ok(r2.rejected[0].includes("kind") && r2.rejected[0].includes("title"), "lists kind and title");
+  console.log("derived: add_widget repair (the incomplete-widget incident) ✅");
+})();
+
 console.log("derived.test.ts: all assertions passed ✅");
