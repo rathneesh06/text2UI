@@ -3,8 +3,8 @@
 // can (drop a missing column, coerce a numeric agg on a text column to count, strip a
 // timeGrain from a non-temporal axis, keep one series for pie). Whatever can't be
 // repaired is dropped with a warning, so a single bad node can never blank the board.
-import type { Dataset } from "../../shared/types";
-import type { DashboardSpec, Section, Widget, Metric, Agg, BaseMetric } from "../../shared/dashboard-spec";
+import type { Dataset, ColumnProfile } from "../../shared/types";
+import type { DashboardSpec, Section, Widget, Metric, Agg, BaseMetric, Filter } from "../../shared/dashboard-spec";
 
 type ColMap = Map<string, string>; // colName -> profile type (integer|number|boolean|date|string)
 const NUMERIC = new Set(["integer", "number"]);
@@ -21,12 +21,73 @@ function tableIndex(profiles: Dataset[]): Map<string, ColMap> {
   return idx;
 }
 
+/** table -> colName -> full ColumnProfile (for observed-value checks). */
+function profileIndex(profiles: Dataset[]): Map<string, Map<string, ColumnProfile>> {
+  const idx = new Map<string, Map<string, ColumnProfile>>();
+  for (const d of profiles) {
+    const m = new Map<string, ColumnProfile>();
+    for (const c of d.profile.columns) m.set(c.name, c);
+    idx.set(d.tableName, m);
+  }
+  return idx;
+}
+
 export interface ValidationResult { spec: DashboardSpec; warnings: string[] }
 
 export function validateSpec(spec: DashboardSpec, profiles: Dataset[]): ValidationResult {
   const idx = tableIndex(profiles);
+  const pidx = profileIndex(profiles);
   const warnings: string[] = [];
   const warn = (m: string) => warnings.push(m);
+
+  // A2.5 — OBSERVED-VALUE CHECK for equality conditions on categorical
+  // columns. The 0.0% incident: the model GUESSES a category literal
+  // ("met") that doesn't match the data's casing/wording ("Met") — exact
+  // string equality then matches zero rows and the rate is structurally 0%,
+  // the mirror image of the 100% tautology. The profile knows the observed
+  // values (topValues), so: exact match → fine; case/trim-insensitive match
+  // to exactly one observed value → REWRITE to the observed literal (warn);
+  // no match while topValues are EXHAUSTIVE (uniqueCount ≤ observed count)
+  // → the condition is provably empty → signal drop. Non-exhaustive columns
+  // only warn, since the value may legitimately live outside the top values.
+  const checkValues = (table: string, f: Filter, where: string): Filter | null => {
+    if (f.op !== "=" && f.op !== "in") return f;
+    const cp = pidx.get(table)?.get(f.col);
+    const observed = (cp?.topValues ?? []).map((t) => String(t.value ?? ""));
+    if (!cp || cp.type !== "string" || !observed.length) return f;
+    const exhaustive = cp.uniqueCount <= observed.length;
+    const fixOne = (v: unknown): { v: string; ok: boolean } => {
+      const s = String(v ?? "");
+      if (observed.includes(s)) return { v: s, ok: true };
+      const loose = observed.filter((o) => o.trim().toLowerCase() === s.trim().toLowerCase());
+      if (loose.length === 1) {
+        warn(`${where}: condition value "${s}" rewritten to observed value "${loose[0]}" (case/spacing)`);
+        return { v: loose[0], ok: true };
+      }
+      return { v: s, ok: false };
+    };
+    if (f.op === "=") {
+      const r = fixOne(f.value);
+      if (r.ok) return { ...f, value: r.v };
+      if (exhaustive) {
+        warn(`${where}: "${f.col}" = "${String(f.value)}" matches NO observed value (observed: ${observed.slice(0, 8).join(", ")}) — dropped to avoid a structurally-zero result`);
+        return null;
+      }
+      warn(`${where}: "${f.col}" = "${String(f.value)}" is not among the top observed values — result may be empty`);
+      return f;
+    }
+    // op === "in"
+    const arr = (Array.isArray(f.value) ? f.value : [f.value]).map(fixOne);
+    const kept = arr.filter((r) => r.ok).map((r) => r.v);
+    const missed = arr.filter((r) => !r.ok).map((r) => r.v);
+    if (missed.length && exhaustive) warn(`${where}: IN values [${missed.join(", ")}] match no observed value — removed`);
+    const final = exhaustive ? kept : [...kept, ...missed];
+    if (!final.length) {
+      warn(`${where}: IN list has no valid values (observed: ${observed.slice(0, 8).join(", ")}) — dropped`);
+      return null;
+    }
+    return { ...f, value: final as any };
+  };
 
   // Coerce a metric to something the data supports; returns null if unfixable.
   const fixMetric = (cols: ColMap, table: string, m: Metric, where: string): Metric | null => {
@@ -61,12 +122,16 @@ export function validateSpec(spec: DashboardSpec, profiles: Dataset[]): Validati
         // beats a rate over the wrong rows).
         if (b.where !== undefined && b.where !== null) {
           if (!Array.isArray(b.where)) { warn(`${where}: expr.${name}.where must be an array — dropped`); return null; }
+          const checked: Filter[] = [];
           for (const f of b.where) {
             if (!f || !OPS.includes(f.op) || !cols.has(f.col)) {
               warn(`${where}: expr.${name} condition on "${f?.col}" invalid — dropped`); return null;
             }
+            const cf = checkValues(table, f, `${where}: expr.${name}`);
+            if (cf === null) return null; // provably-empty condition → honest gap over a fake 0%
+            checked.push(cf);
           }
-          if (b.where.length) out.where = b.where;
+          if (checked.length) out.where = checked;
         }
         return out;
       };

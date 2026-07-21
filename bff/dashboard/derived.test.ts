@@ -240,7 +240,7 @@ await (async () => {
   const SLA: Dataset = {
     tableName: "sla",
     profile: { source: { filename: "sla.csv", format: "csv" }, rowCount: 5, columns: [
-      col("sla_status", "string", 3, { topValues: [{ value: "met", count: 3 }, { value: "breached", count: 2 }] }),
+      col("sla_status", "string", 2, { topValues: [{ value: "met", count: 3 }, { value: "breached", count: 2 }] }),
       col("actual_tat_hours", "number", 5),
     ], sampleRows: [] },
   };
@@ -269,6 +269,26 @@ await (async () => {
   const noNum: Metric = { col: "", agg: "count", expr: { op: "pct", den: { col: "", agg: "count" } } as any };
   r = validateSpec(mkSpec(noNum), [SLA]);
   assert.equal(r.spec.sections.length, 0, "missing num stays malformed");
+
+  // (a3) THE 0.0% INCIDENT — observed-value checking. The SLA fixture's
+  // observed values are "met"/"breached"; the model guesses casings.
+  //   guessed "Met" (case mismatch, unique observed match) → REWRITTEN + real number
+  //   guessed "achieved" (no match, exhaustive topValues)  → DROPPED, never a fake 0%
+  const guessedCase: Metric = { col: "", agg: "count", expr: { op: "pct",
+    num: { col: "", agg: "count", where: [{ col: "sla_status", op: "=", value: "MET" }] },
+    den: { col: "", agg: "count" } } };
+  r = validateSpec(mkSpec(guessedCase), [SLA]);
+  assert.equal(r.spec.sections.length, 1, "case-mismatched value survives via rewrite");
+  const rw = (r.spec.sections[0].widgets[0] as KpiWidget).metric;
+  assert.equal((rw.expr!.num.where![0] as any).value, "met", "literal rewritten to the observed casing");
+  assert.ok(r.warnings.some((w) => w.includes("rewritten to observed value")), "rewrite warned");
+
+  const guessedWrong: Metric = { col: "", agg: "count", expr: { op: "pct",
+    num: { col: "", agg: "count", where: [{ col: "sla_status", op: "=", value: "achieved" }] },
+    den: { col: "", agg: "count" } } };
+  r = validateSpec(mkSpec(guessedWrong), [SLA]);
+  assert.equal(r.spec.sections.length, 0, "provably-empty condition drops the metric (no fake 0%)");
+  assert.ok(r.warnings.some((w) => w.includes("matches NO observed value")), "drop names the reason: " + r.warnings.join(" | "));
 
   // (b) The real rate: conditional numerator survives validation…
   const real: Metric = { col: "", agg: "count", expr: { op: "pct",
