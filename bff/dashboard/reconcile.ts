@@ -10,16 +10,18 @@
 //
 //   For every widget the edit KEEPS (same id as before), any missing/empty
 //   required field is restored from the previous version of that widget.
-//   Widgets the edit REMOVES (id absent) stay removed — deliberate deletions
-//   and "simplify" asks are respected. Widgets the edit ADDS pass through
-//   untouched — validation will judge them.
+//   Widgets ABSENT from the re-emission are restored UNLESS the user's prompt
+//   contains removal words (same REMOVAL_INTENT gate as the patch path) —
+//   deliberate deletions and "simplify" asks are respected, silent gutting is
+//   not. Widgets the edit ADDS pass through untouched — validation judges them.
 import type { DashboardSpec, Widget, ChartWidget, KpiWidget, TableWidget } from "../../shared/dashboard-spec";
+import { REMOVAL_INTENT } from "./patch";
 
 const CHARTISH = new Set(["line", "bar", "area", "pie", "donut"]);
 
 export interface ReconcileResult { spec: DashboardSpec; healed: string[] }
 
-export function reconcileEdit(current: DashboardSpec, next: DashboardSpec): ReconcileResult {
+export function reconcileEdit(current: DashboardSpec, next: DashboardSpec, userPrompt = ""): ReconcileResult {
   const prevById = new Map<string, Widget>();
   for (const sec of current.sections) for (const w of sec.widgets ?? []) if (w.id) prevById.set(w.id, w);
 
@@ -32,7 +34,38 @@ export function reconcileEdit(current: DashboardSpec, next: DashboardSpec): Reco
   const meta = { ...next.meta };
   if (!meta.title?.trim() && current.meta.title) { meta.title = current.meta.title; healed.push(`title: restored "${current.meta.title}"`); }
 
-  return { spec: { ...next, meta, sections }, healed };
+  const out: DashboardSpec = { ...next, meta, sections };
+
+  // STRUCTURAL GUARD (the gutted-board incident): the full-spec planner is a
+  // re-emission of the whole dashboard, and models routinely just… forget
+  // widgets. The patch path gates removals on removal WORDS in the user's
+  // prompt; this path must apply the SAME rule. Any widget present before but
+  // absent from the re-emission is RESTORED into its original section (at its
+  // original position) unless the prompt actually asked for removals.
+  // ("format the average ticket age KPI as a percentage" must never cost you
+  // five widgets.)
+  if (!REMOVAL_INTENT.test(userPrompt)) {
+    const nextIds = new Set<string>();
+    for (const sec of out.sections) for (const w of sec.widgets ?? []) if (w.id) nextIds.add(w.id);
+    for (const [ci, csec] of current.sections.entries()) {
+      const missing = (csec.widgets ?? []).filter((w) => w.id && !nextIds.has(w.id));
+      if (!missing.length) continue;
+      const target = out.sections.find((s) => s.id === csec.id);
+      if (target) {
+        // Re-insert at the widget's original index within its section (clamped).
+        for (const w of missing) {
+          const origIdx = (csec.widgets ?? []).indexOf(w);
+          target.widgets.splice(Math.min(origIdx, target.widgets.length), 0, w);
+          healed.push(`${w.kind} "${(w as any).title ?? w.id}": restored — the edit didn't ask for a removal`);
+        }
+      } else {
+        out.sections.splice(Math.min(ci, out.sections.length), 0, { ...csec, widgets: missing });
+        for (const w of missing) healed.push(`${w.kind} "${(w as any).title ?? w.id}": restored — the edit didn't ask for a removal`);
+      }
+    }
+  }
+
+  return { spec: out, healed };
 }
 
 function healWidget(w: Widget, prev: Widget | undefined, healed: string[]): Widget {

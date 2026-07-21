@@ -189,7 +189,7 @@ export async function handleDashboardBuild(
     // required fields, BEFORE validation gets a chance to drop it. A style-only
     // edit can no longer gut the board because the model forgot the series arrays.
     if (currentSpec) {
-      const r = reconcileEdit(currentSpec, spec);
+      const r = reconcileEdit(currentSpec, spec, b.userPrompt);
       spec = r.spec;
       healedNotes = r.healed;
       if (r.healed.length) console.log(`[dashboard] edit reconciliation healed ${r.healed.length} field(s): ${r.healed.slice(0, 4).join(" | ")}${r.healed.length > 4 ? " | …" : ""}`);

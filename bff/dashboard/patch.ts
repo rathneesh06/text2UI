@@ -68,7 +68,7 @@ export const EDIT_OPS_SCHEMA = {
   required: ["ops"],
 };
 
-const SYSTEM = `You are the EDIT engine of a dashboard builder. You receive the CURRENT dashboard spec (with widget ids), the conversation, and the user's edit request. You output ONLY a JSON object {"ops":[...]} — a MINIMAL list of operations that accomplishes exactly what the user asked, nothing more.
+const SYSTEM = `You are the EDIT engine of a dashboard builder. You receive the CURRENT dashboard spec (with widget ids), the conversation, and the user's edit request. You output ONLY a JSON object {"ops":[...]} — a MINIMAL list of operations that accomplishes exactly what the user asked, nothing more. Changing how an EXISTING widget looks or is computed (format, chart kind, metric, expr, time grain, title) is ALWAYS a single update_widget op on that widget id — NEVER remove_widget + add_widget to "replace" it (removals without explicit removal words are rejected).
 Rules:
 - Touch ONLY what the user asked about. Every widget you do not name stays exactly as it is — you cannot break it.
 - update_widget: give the id and ONLY the fields to change (e.g. {"op":"update_widget","id":"t1","set":{"limit":5}}). Never re-send unchanged fields.
@@ -127,7 +127,7 @@ export async function planEditOps(input: PlanEditOpsInput, run: EditRun = callGe
 
 // ---- deterministic application ------------------------------------------------------
 
-const REMOVAL_INTENT = /\b(remove|delete|drop|get rid|hide|without|no more|only keep|keep only|just keep|simplif\w*|fewer|less charts?|too many)\b/i;
+export const REMOVAL_INTENT = /\b(remove|delete|drop|get rid|hide|without|no more|only keep|keep only|just keep|simplif\w*|fewer|less charts?|too many)\b/i;
 
 export interface ApplyResult { spec: DashboardSpec; applied: string[]; rejected: string[] }
 
@@ -176,7 +176,11 @@ export function applyOps(current: DashboardSpec, ops: EditOp[], userPrompt: stri
     if (op.op === "remove_widget") {
       const found = op.id ? findWidget(op.id) : null;
       if (!found) { rejected.push(`remove_widget: unknown id "${op.id}"`); continue; }
-      if (!removalAllowed && op.id !== selectedId) {
+      // Removal ALWAYS requires removal words in the user's own prompt. The
+      // selected widget only resolves WHICH widget ("remove this one") — it is
+      // not itself permission. (Live incident: "show the total tickets KPI as
+      // a percentage" with a lingering selection removed the KPI outright.)
+      if (!removalAllowed) {
         rejected.push(`remove_widget "${(found.sec.widgets[found.idx] as any).title ?? op.id}": the request didn't ask for a removal — kept`);
         continue;
       }

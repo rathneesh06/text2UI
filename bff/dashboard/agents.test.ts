@@ -384,16 +384,26 @@ console.log("orchestrator: respond:false no longer eats the brief ✅");
   const kindChange: any = { ...gutted, sections: [{ id: "s1", widgets: [
     { id: "c2", kind: "donut", title: "By region", table: "orders", width: "half" },
   ] }] };
-  const r2 = reconcileEdit(prev, kindChange);
-  const donut: any = (r2.spec.sections[0].widgets as any[])[0];
+  const r2 = reconcileEdit(prev, kindChange, "make the region chart a donut");
+  const donut: any = (r2.spec.sections[0].widgets as any[]).find((w: any) => w.id === "c2");
   assert.equal(donut.kind, "donut");
   assert.equal(donut.series[0].col, "revenue", "series healed across a chart-kind change");
   assert.equal(donut.x.col, "region", "x healed across a chart-kind change");
+  // The subset re-emission did NOT ask for removals → the other widgets are
+  // restored around the changed one (structural guard).
+  for (const id of ["k1", "c1", "t1"]) {
+    assert.ok((r2.spec.sections[0].widgets as any[]).some((w: any) => w.id === id), `${id} restored around the kind change`);
+  }
 
-  // Deliberate removals are respected — absence of an id is not healed back.
+  // Deliberate removals are respected WHEN the prompt asked for one; without
+  // removal words, a widget the model silently dropped is RESTORED (the
+  // "format one KPI, lose five widgets" incident).
   const removal: any = { ...gutted, sections: [{ id: "s1", widgets: gutted.sections[0].widgets.filter((w: any) => w.id !== "c1") }] };
-  const r3 = reconcileEdit(prev, removal);
-  assert.ok(!(r3.spec.sections[0].widgets as any[]).some((w: any) => w.id === "c1"), "removed widget stays removed");
+  const r3 = reconcileEdit(prev, removal, "remove the region chart");
+  assert.ok(!(r3.spec.sections[0].widgets as any[]).some((w: any) => w.id === "c1"), "removed widget stays removed when asked");
+  const r3b = reconcileEdit(prev, removal, "format the average ticket age KPI as a percentage");
+  assert.ok((r3b.spec.sections[0].widgets as any[]).some((w: any) => w.id === "c1"), "silently-dropped widget restored when nobody asked for a removal");
+  assert.ok(r3b.healed.some((h) => h.includes("restored — the edit didn\'t ask")), "restore is reported");
 
   // End-to-end through the handler: gutted planner output survives validation.
   const gutPlanner = async () => gutted;
@@ -447,9 +457,14 @@ console.log("reconcile: gutted edits healed, removals respected ✅");
   assert.equal((r3.spec.sections[0].widgets as any[]).length, 2, "requested removal applied");
   assert.equal((r3.spec.sections[0].widgets as any[]).find((w: any) => w.id === "t1").columns.length, 1, "empty array cannot wipe columns");
 
-  // The selected widget is removable without magic words ("delete this").
+  // Removal ALWAYS requires removal words — selection only targets, it never
+  // grants permission (the "show as a percentage" incident removed a KPI via a
+  // lingering selection). "this one" alone is rejected; "remove this one" works.
   const r4 = applyOps(cur, [{ op: "remove_widget", id: "c1" }], "this one", "c1");
-  assert.equal((r4.spec.sections[0].widgets as any[]).length, 2, "selected widget removal allowed");
+  assert.equal((r4.spec.sections[0].widgets as any[]).length, 3, "selection without removal words cannot remove");
+  assert.ok(r4.rejected[0].includes("didn\'t ask for a removal"), "rejection explains the gate");
+  const r4b = applyOps(cur, [{ op: "remove_widget", id: "c1" }], "remove this one", "c1");
+  assert.equal((r4b.spec.sections[0].widgets as any[]).length, 2, "removal words + selection removes");
 
   // add_widget + update_meta round out the op set.
   const r5 = applyOps(cur, [
