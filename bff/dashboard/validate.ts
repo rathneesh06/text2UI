@@ -34,9 +34,18 @@ export function validateSpec(spec: DashboardSpec, profiles: Dataset[]): Validati
     // side drops the whole metric (an honest gap beats a silently-wrong ratio).
     if (m.expr) {
       const ops = ["ratio", "pct", "diff"];
-      if (!ops.includes(m.expr.op) || !m.expr.num || !m.expr.den) {
+      // REPAIR before rejecting: a missing denominator on a ratio/pct almost
+      // always means "over all rows" — default it to count(*). (The live
+      // "malformed expr" class was the patch model omitting den.) A missing
+      // NUMERATOR is unrecoverable — we'd be inventing the metric.
+      if (m.expr.num && !m.expr.den && (m.expr.op === "ratio" || m.expr.op === "pct")) {
+        warn(`${where}: expr.den missing — defaulted to count(*)`);
+        m = { ...m, expr: { ...m.expr, den: { col: "", agg: "count" } } };
+      }
+      if (!ops.includes(m.expr!.op) || !m.expr!.num || !m.expr!.den) {
         warn(`${where}: malformed expr — dropped`); return null;
       }
+      const ex = m.expr!;
       const OPS = ["=", "!=", ">", ">=", "<", "<=", "in", "not_null", "is_null"];
       const side = (b: BaseMetric, name: string): BaseMetric | null => {
         let out: BaseMetric;
@@ -61,24 +70,24 @@ export function validateSpec(spec: DashboardSpec, profiles: Dataset[]): Validati
         }
         return out;
       };
-      const num = side(m.expr.num, "num");
-      const den = side(m.expr.den, "den");
+      const num = side(ex.num, "num");
+      const den = side(ex.den, "den");
       if (!num || !den) return null;
       // DEGENERATE-RATIO GUARD: a ratio/pct whose numerator compiles
       // identically to its denominator is structurally constant (always 1 /
       // 100%) — the "SLA attainment 100.0%" class. A conditional numerator
       // (where) is what makes the sides differ; without one, identical sides
       // mean the model dressed up a tautology as a rate. Drop it.
-      if ((m.expr.op === "ratio" || m.expr.op === "pct")
+      if ((ex.op === "ratio" || ex.op === "pct")
         && num.agg === den.agg && num.col === den.col
         && JSON.stringify(num.where ?? []) === JSON.stringify(den.where ?? [])) {
-        warn(`${where}: degenerate ${m.expr.op} — numerator equals denominator (always ${m.expr.op === "pct" ? "100%" : "1"}). Use a conditional numerator (where) to express a real rate — dropped`);
+        warn(`${where}: degenerate ${ex.op} — numerator equals denominator (always ${ex.op === "pct" ? "100%" : "1"}). Use a conditional numerator (where) to express a real rate — dropped`);
         return null;
       }
-      const out: Metric = { ...m, expr: { op: m.expr.op, num, den } };
+      const out: Metric = { ...m, expr: { op: ex.op, num, den } };
       // pct means "this IS a percentage" — make the display format agree.
-      if (m.expr.op === "pct" && !out.format) out.format = "percent";
-      if (m.expr.op === "ratio" && out.format === "percent") out.format = "number";
+      if (ex.op === "pct" && !out.format) out.format = "percent";
+      if (ex.op === "ratio" && out.format === "percent") out.format = "number";
       return out;
     }
     // A2 guard: the fake-percent class ("5559.0%") = an additive aggregate

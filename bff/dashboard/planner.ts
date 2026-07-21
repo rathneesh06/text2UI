@@ -14,7 +14,7 @@ const PLAN_TIMEOUT_MS = Number(process.env.DASHBOARD_PLANNER_TIMEOUT_MS ?? 20000
 
 // Compact OpenAPI-subset schema. Widgets are a single permissive object (Gemini does
 // not handle discriminated unions well); we normalize/validate in code afterwards.
-const FILTER_ITEM = { type: "object", properties: { col: { type: "string" }, op: { type: "string", enum: ["=", "!=", ">", ">=", "<", "<=", "in", "not_null", "is_null"] }, value: {} }, required: ["col", "op"] };
+const FILTER_ITEM = { type: "object", properties: { col: { type: "string" }, op: { type: "string", enum: ["=", "!=", ">", ">=", "<", "<=", "in", "not_null", "is_null"] }, value: { type: "string", description: "literal value; pass numbers as strings" } }, required: ["col", "op"] };
 const BASE_METRIC = {
   type: "object",
   properties: { col: { type: "string" }, agg: { type: "string", enum: ["count", "count_distinct", "sum", "avg", "min", "max", "median"] }, where: { type: "array", items: FILTER_ITEM } },

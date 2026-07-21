@@ -256,6 +256,20 @@ await (async () => {
   assert.equal(r.spec.sections.length, 0, "count(*)/count(*) pct is dropped");
   assert.ok(r.warnings.some((w) => w.includes("degenerate")), "warned as degenerate: " + r.warnings.join(" | "));
 
+  // (a2) The live edit incident: patch model omitted den entirely → REPAIRED
+  // to count(*) (not dropped), and the repaired rate executes correctly.
+  const noDen: Metric = { col: "", agg: "count", expr: { op: "pct",
+    num: { col: "", agg: "count", where: [{ col: "sla_status", op: "=", value: "met" }] } } as any };
+  r = validateSpec(mkSpec(noDen), [SLA]);
+  assert.equal(r.spec.sections.length, 1, "missing den is repaired, not dropped");
+  assert.ok(r.warnings.some((w) => w.includes("defaulted to count(*)")), "warned about the repair");
+  const repaired = (r.spec.sections[0].widgets[0] as KpiWidget).metric;
+  assert.equal(repaired.expr!.den.agg, "count", "den defaulted to count(*)");
+  // Missing NUM is unrecoverable → still dropped as malformed.
+  const noNum: Metric = { col: "", agg: "count", expr: { op: "pct", den: { col: "", agg: "count" } } as any };
+  r = validateSpec(mkSpec(noNum), [SLA]);
+  assert.equal(r.spec.sections.length, 0, "missing num stays malformed");
+
   // (b) The real rate: conditional numerator survives validation…
   const real: Metric = { col: "", agg: "count", expr: { op: "pct",
     num: { col: "", agg: "count", where: [{ col: "sla_status", op: "=", value: "met" }] },
