@@ -73,7 +73,7 @@ Rules:
 - Touch ONLY what the user asked about. Every widget you do not name stays exactly as it is — you cannot break it.
 - update_widget: give the id and ONLY the fields to change (e.g. {"op":"update_widget","id":"t1","set":{"limit":5}}). Never re-send unchanged fields.
 - remove_widget: only when the user clearly asked to remove/delete/hide something.
-- add_widget: a complete new widget grounded in real columns from the data profile. MUST include kind, title, AND table (pick the table from the data profile — usually the one the existing widgets use). For rate/percentage KPIs use metric.expr {op:"pct", num, den}; when qualifying rows are marked by a column value, give num a where (e.g. num {agg:"count", where:[{col:"sla_status",op:"=",value:"met"}]} over den count(*)). num and den must differ — identical sides are a constant 100% and are rejected. Never a plain sum formatted as percent.
+- add_widget: a complete new widget grounded in real columns from the data profile. MUST include kind, title, AND table (pick the table from the data profile — usually the one the existing widgets use). For rate/percentage KPIs use metric.expr {op:"pct", num, den}; when qualifying rows are marked by a column value, give num a where (e.g. num {agg:"count", where:[{col:"sla_status",op:"=",value:"met"}]} over den count(*)). num and den must differ — identical sides are a constant 100% and are rejected. Never a plain sum formatted as percent. If a request would misrepresent a number (formatting an average of hours as a percentage, retitling a count as a rate), output {"ops":[]} instead of distorting the metric.
 - update_meta: for theme/title/subtitle/accent/palette/insight changes.
 - When a SELECTED WIDGET is given, "this"/"that"/"it" means that widget id.
 - If the request is unclear, return {"ops":[]} rather than guessing.`;
@@ -162,7 +162,33 @@ export function applyOps(current: DashboardSpec, ops: EditOp[], userPrompt: stri
       const found = op.id ? findWidget(op.id) : null;
       if (!found) { rejected.push(`update_widget: unknown id "${op.id}"`); continue; }
       const target: any = found.sec.widgets[found.idx];
-      const set = op.set ?? {};
+      const set: any = { ...(op.set ?? {}) }; // never mutate the caller's op
+      // METRIC IDENTITY GUARD (the "avg age became 1,785" incident): changing a
+      // KPI's agg or column changes WHAT THE NUMBER MEANS. A model asked to
+      // change the FORMAT routinely re-emits the whole metric with a different
+      // agg (avg -> count). Rule: the new agg/col must be named in the user's
+      // own words; otherwise keep the current agg/col and merge only the
+      // display fields (label/format/expr). Deterministic, prompt-anchored.
+      if (set.metric && target.metric && typeof set.metric === "object") {
+        const cur = target.metric;
+        let nm: any = { ...set.metric };
+        const p = userPrompt.toLowerCase();
+        const aggWords: Record<string, RegExp> = {
+          count: /\b(count|how many|number of|volume)\b/, count_distinct: /\b(distinct|unique)\b/,
+          sum: /\b(sum|total)\b/, avg: /\b(average|avg|mean)\b/, median: /\bmedian\b/,
+          min: /\b(min|minimum|lowest|smallest)\b/, max: /\b(max|maximum|highest|largest)\b/,
+        };
+        const aggChanged = nm.agg !== undefined && nm.agg !== cur.agg;
+        const colChanged = nm.col !== undefined && nm.col !== cur.col && String(nm.col).length > 0;
+        const aggNamed = aggChanged && aggWords[nm.agg]?.test(p);
+        const colNamed = colChanged && (p.includes(String(nm.col).toLowerCase().split("_").join(" ")) || p.includes(String(nm.col).toLowerCase()));
+        if ((aggChanged && !aggNamed) || (colChanged && !colNamed)) {
+          nm = { ...nm, col: cur.col, agg: cur.agg };
+          applied.push(`kept "${target.title ?? op.id}" measuring ${cur.agg}(${cur.col || "*"}) — the request didn't ask to change the metric`);
+        }
+        // Metric merges FIELD-WISE: unspecified fields survive.
+        set.metric = { ...cur, ...nm };
+      }
       // Partial merge: only provided fields change; arrays/objects replace wholesale
       // when provided NON-EMPTY (an empty series/columns can never wipe a widget).
       for (const [k, v] of Object.entries(set)) {

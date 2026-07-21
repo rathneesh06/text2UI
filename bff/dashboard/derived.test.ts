@@ -24,7 +24,7 @@ const TICKETS: Dataset = {
       col("agent", "string", 2, { topValues: [{ value: "Ada", count: 3 }, { value: "Bo", count: 2 }] }),
       col("status", "string", 2, { topValues: [{ value: "open", count: 2 }, { value: "closed", count: 3 }] }),
       col("sla_met", "integer", 2),
-      col("hours", "number", 5),
+      col("hours", "number", 5, { min: 0, max: 100 }), // 0..100 range: avg+percent legitimately allowed
     ],
     sampleRows: [],
   },
@@ -78,7 +78,7 @@ const TICKETS: Dataset = {
   assert.ok(r.warnings.some((w) => w.includes("percent")), "warned about the fake percent");
   r = one(mkSpec({ col: "hours", agg: "avg", format: "percent" }));
   m = (r.spec.sections[0].widgets[0] as KpiWidget).metric;
-  assert.equal(m.format, "percent", "avg + percent stays (avg of a 0-100 column is a legit rate)");
+  assert.equal(m.format, "percent", "avg + percent stays when the observed range fits 0..100");
   console.log("derived: validation + fake-percent guard ✅");
 }
 
@@ -339,6 +339,69 @@ await (async () => {
   const rows2 = await res2.getRowObjects();
   assert.equal(Number((rows2[0] as any).value), 0, "filtered to breached rows → attainment 0%");
   console.log("derived: conditional sides + degenerate guard (the 100% incident) ✅");
+})();
+
+// ---- 8. KPI HONESTY — the three live-screen incidents. ---------------------
+const SLA_HONESTY: Dataset = {
+  tableName: "sla",
+  profile: { source: { filename: "sla.csv", format: "csv" }, rowCount: 7888, columns: [
+    col("sla_status", "string", 2, { topValues: [{ value: "met", count: 6000 }, { value: "breached", count: 1888 }] }),
+    col("age_hours", "number", 5000, { min: -50000, max: 90000 }),
+    col("csat_pct", "number", 90, { min: 0, max: 100 }),
+  ], sampleRows: [] },
+};
+// (i) "SLA BREACH RATE: 7,888" twins: two count(*) KPIs with different junk
+//     col strings must share one dedupe signature; and a rate-TITLED plain
+//     count must be dropped by validation (mislabeled number).
+// (ii) "-26919.5%": avg of an HOURS column may not wear percent — the profile
+//     range must fit 0..100 for avg/median+percent to stand.
+// (iii) "avg age became 1,785": a format edit may not silently swap the
+//     metric to count — agg/col changes require the user's own words.
+await (async () => {
+  const { widgetSignature } = await import("./merge");
+  const { applyOps } = await import("./patch");
+
+  // (i) signature: count normalizes its ignored column.
+  const k = (col: string): any => ({ id: "x", kind: "kpi", title: "T", table: "sla", metric: { col, agg: "count" } });
+  assert.equal(widgetSignature(k("")), widgetSignature(k("sla_status")), "count twins collide regardless of junk col");
+  const withExpr: any = { ...k(""), metric: { col: "", agg: "count", expr: { op: "pct", num: { col: "", agg: "count", where: [{ col: "sla_status", op: "=", value: "met" }] }, den: { col: "", agg: "count" } } } };
+  assert.notEqual(widgetSignature(k("")), widgetSignature(withExpr), "an expr KPI is a different question than a plain count");
+
+  // (i) title honesty: rate-titled count drops; the same title with a real expr lives.
+  const mk = (title: string, metric: Metric): DashboardSpec => ({ version: 1, meta: { title: "T" },
+    sections: [{ id: "s", widgets: [{ id: "k1", kind: "kpi", title, table: "sla", metric }] }] });
+  let r = validateSpec(mk("SLA Breach Rate", { col: "", agg: "count" }), [SLA_HONESTY]);
+  assert.equal(r.spec.sections.length, 0, "rate-titled count is dropped");
+  assert.ok(r.warnings.some((w) => w.includes("titled as a rate")), "warning names the mismatch");
+  r = validateSpec(mk("SLA Attainment Rate", { col: "", agg: "count", expr: { op: "pct",
+    num: { col: "", agg: "count", where: [{ col: "sla_status", op: "=", value: "met" }] }, den: { col: "", agg: "count" } } }), [SLA_HONESTY]);
+  assert.equal(r.spec.sections.length, 1, "rate-titled real ratio lives");
+  r = validateSpec(mk("Total SLA records", { col: "", agg: "count" }), [SLA_HONESTY]);
+  assert.equal(r.spec.sections.length, 1, "honestly-titled count lives");
+
+  // (ii) avg+percent needs an observed 0..100 range.
+  r = validateSpec(mk("Average age", { col: "age_hours", agg: "avg", format: "percent" }), [SLA_HONESTY]);
+  let m2 = (r.spec.sections[0].widgets[0] as KpiWidget).metric;
+  assert.equal(m2.format, "number", "avg(hours) cannot wear percent");
+  assert.ok(r.warnings.some((w) => w.includes("not 0..100")), "range named in the warning");
+  r = validateSpec(mk("Average CSAT", { col: "csat_pct", agg: "avg", format: "percent" }), [SLA_HONESTY]);
+  m2 = (r.spec.sections[0].widgets[0] as KpiWidget).metric;
+  assert.equal(m2.format, "percent", "avg of a genuine 0..100 column keeps percent");
+
+  // (iii) metric identity guard on format edits.
+  const cur: DashboardSpec = { version: 1, meta: { title: "T" }, sections: [{ id: "s1", widgets: [
+    { id: "k1", kind: "kpi", title: "Average Ticket Age", table: "tickets", metric: { col: "age_hours", agg: "avg" } },
+  ] }] };
+  const swap: any = [{ op: "update_widget", id: "k1", set: { metric: { col: "", agg: "count", format: "percent" } } }];
+  const rr = applyOps(structuredClone(cur), swap, "format the average ticket age KPI as a percentage");
+  const kept: any = rr.spec.sections[0].widgets[0];
+  assert.equal(kept.metric.agg, "avg", "agg preserved — the request didn't name count");
+  assert.equal(kept.metric.col, "age_hours", "column preserved");
+  assert.equal(kept.metric.format, "percent", "the display field the user DID ask about is applied");
+  assert.ok(rr.applied.some((a) => a.includes("kept")), "guard is reported");
+  const rr2 = applyOps(structuredClone(cur), structuredClone(swap), "show it as a count of tickets instead");
+  assert.equal((rr2.spec.sections[0].widgets[0] as any).metric.agg, "count", "naming the new agg allows the change");
+  console.log("derived: KPI honesty (twins, fake %, metric swap) ✅");
 })();
 
 console.log("derived.test.ts: all assertions passed ✅");

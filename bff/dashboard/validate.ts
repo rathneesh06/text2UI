@@ -157,10 +157,21 @@ export function validateSpec(spec: DashboardSpec, profiles: Dataset[]): Validati
     }
     // A2 guard: the fake-percent class ("5559.0%") = an additive aggregate
     // dressed up as a percentage. Percent display requires a real ratio (expr)
-    // or an average/median of an already-percent column — never sum/count.
+    // or an average/median of a GENUINELY percent-scaled column — the profile
+    // must show the column's observed range fitting 0..100 (the "-26919.5%"
+    // incident: avg of an HOURS column formatted as percent).
     if (m.format === "percent" && (m.agg === "sum" || m.agg === "count" || m.agg === "count_distinct")) {
       warn(`${where}: percent format on ${m.agg}() is not a rate — use expr {op:"pct"} for real percentages; showing as number`);
       m = { ...m, format: "number" };
+    }
+    if (m.format === "percent" && (m.agg === "avg" || m.agg === "median")) {
+      const cp = pidx.get(table)?.get(m.col);
+      const lo = Number(cp?.min), hi = Number(cp?.max);
+      const looksPercent = Number.isFinite(lo) && Number.isFinite(hi) && lo >= 0 && hi <= 100;
+      if (!looksPercent) {
+        warn(`${where}: percent format on ${m.agg}("${m.col}") — the column's observed range (${cp?.min ?? "?"}..${cp?.max ?? "?"}) is not 0..100, so this is not a percentage; showing as number`);
+        m = { ...m, format: "number" };
+      }
     }
     if (m.agg === "count") return m; // count(*) needs no column
     if (!cols.has(m.col)) { warn(`${where}: column "${m.col}" not in ${table} — dropped`); return null; }
@@ -179,7 +190,19 @@ export function validateSpec(spec: DashboardSpec, profiles: Dataset[]): Validati
     if (w.kind === "kpi") {
       if (!w.metric) { warn(`kpi "${w.id}": no metric — dropped`); return null; }
       const m = fixMetric(cols, w.table, w.metric, `kpi "${w.id}"`);
-      return m ? { ...w, metric: m } : null;
+      if (!m) return null;
+      // TITLE HONESTY (the "SLA BREACH RATE: 7,888" incident): a KPI titled as
+      // a rate/percentage/share whose metric is a plain additive aggregate is a
+      // mislabeled count — the number on screen would not be what the title
+      // claims. Percent-formatted averages pass (they ARE rates); everything
+      // else needs a real expr ratio or a different title. Drop, don't lie.
+      const RATEISH = /\b(rate|percentage|percent|share|ratio|attainment|compliance)\b|%/i;
+      const additive = m.agg === "count" || m.agg === "count_distinct" || m.agg === "sum";
+      if (!m.expr && additive && RATEISH.test(String(w.title ?? ""))) {
+        warn(`kpi "${w.id}" ("${w.title}"): titled as a rate but computes ${m.agg}(${m.col || "*"}) — a plain ${m.agg === "sum" ? "sum" : "count"}, not a rate. Use expr {op:"pct"|"ratio"} with a conditional numerator, or retitle — dropped`);
+        return null;
+      }
+      return { ...w, metric: m };
     }
 
     if (w.kind === "table") {

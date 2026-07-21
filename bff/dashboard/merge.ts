@@ -16,14 +16,24 @@ export const DEFAULT_PALETTE = ["#7c3aed", "#06b6d4", "#f59e0b", "#10b981", "#f4
 /** A widget's analytical signature — two widgets with the same signature answer the
  *  same question, so only the first survives the merge. */
 export function widgetSignature(w: Widget): string {
-  if (w.kind === "kpi") return `kpi|${w.table}|${w.metric.agg}|${w.metric.col}`;
+  // count(*) ignores its column — normalize it so two count KPIs with
+  // different junk col strings (identical compiled SQL) collide. Derived
+  // expressions ARE the analytical identity when present.
+  const msig = (m: { agg: string; col: string; expr?: any }): string => {
+    if (m.expr) {
+      const side = (b: any) => `${b.agg}:${b.agg === "count" ? "" : b.col}:${JSON.stringify(b.where ?? [])}`;
+      return `${m.expr.op}(${side(m.expr.num)}/${side(m.expr.den)})`;
+    }
+    return `${m.agg}:${m.agg === "count" ? "" : m.col}`;
+  };
+  if (w.kind === "kpi") return `kpi|${w.table}|${msig(w.metric)}`;
   if (w.kind === "table") return `table|${w.table}|${(w.groupBy ?? []).map((g) => g.col).join(",")}|${w.columns.map((c) => `${c.agg ?? "raw"}:${c.col}`).join(",")}`;
   const c = w as ChartWidget;
   // The FAMILY is part of the question: a bar (ranking) and a donut (composition)
   // over the same aggregate are two different reads, so both may live; two bars
   // over the same aggregate are one question asked twice, so one dies.
   const family = c.kind === "line" || c.kind === "area" ? "trend" : c.kind === "bar" ? "rank" : "composition";
-  return `chart|${family}|${c.table}|${c.x.col}|${c.x.timeGrain ?? ""}|${c.series.map((s) => `${s.agg}:${s.col}`).join(",")}`;
+  return `chart|${family}|${c.table}|${c.x.col}|${c.x.timeGrain ?? ""}|${c.series.map(msig).join(",")}`;
 }
 
 function dedupe<T extends Widget>(widgets: T[], seen: Set<string>): T[] {
