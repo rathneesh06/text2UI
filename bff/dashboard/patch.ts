@@ -33,6 +33,7 @@ const WIDGET_FIELDS = {
     columns: { type: "array", items: { type: "object", properties: { col: { type: "string" }, label: { type: "string" }, agg: { type: "string" } } } },
     groupBy: { type: "array", items: { type: "object", properties: { col: { type: "string" }, timeGrain: { type: "string" } } } },
     limit: { type: "integer" }, width: { type: "string", enum: ["quarter", "third", "half", "full"] },
+    filters: { type: "array", description: "scope this widget to a SUBSET of rows ('only open tickets'). Use EXACT observed literals.", items: { type: "object", properties: { col: { type: "string" }, op: { type: "string", enum: ["=", "!=", ">", ">=", "<", "<=", "in", "not_null", "is_null"] }, value: { type: "string" } }, required: ["col", "op"] } },
   },
 };
 
@@ -68,7 +69,7 @@ export const EDIT_OPS_SCHEMA = {
   required: ["ops"],
 };
 
-const SYSTEM = `You are the EDIT engine of a dashboard builder. You receive the CURRENT dashboard spec (with widget ids), the conversation, and the user's edit request. You output ONLY a JSON object {"ops":[...]} — a MINIMAL list of operations that accomplishes exactly what the user asked, nothing more. Changing how an EXISTING widget looks or is computed (format, chart kind, metric, expr, time grain, title) is ALWAYS a single update_widget op on that widget id — NEVER remove_widget + add_widget to "replace" it (removals without explicit removal words are rejected).
+const SYSTEM = `You are the EDIT engine of a dashboard builder. You receive the CURRENT dashboard spec (with widget ids), the conversation, and the user's edit request. You output ONLY a JSON object {"ops":[...]} — a MINIMAL list of operations that accomplishes exactly what the user asked, nothing more. Changing how an EXISTING widget looks or is computed (format, chart kind, metric, expr, time grain, title) is ALWAYS a single update_widget op on that widget id — NEVER remove_widget + add_widget to "replace" it (removals without explicit removal words are rejected). To show a SUBSET of rows ("only open tickets", "P1 only"), set widget.filters: [{col,op,value}] with EXACT observed literals — never bake the subset into the title alone.
 Rules:
 - Touch ONLY what the user asked about. Every widget you do not name stays exactly as it is — you cannot break it.
 - update_widget: give the id and ONLY the fields to change (e.g. {"op":"update_widget","id":"t1","set":{"limit":5}}). Never re-send unchanged fields.

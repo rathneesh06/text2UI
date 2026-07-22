@@ -15,7 +15,7 @@
 //   pie    → pie/donut charts (composition on low-cardinality categories)
 //   table  → detail / grouped tables
 import type { Dataset } from "../../shared/types";
-import type { KpiWidget, ChartWidget, TableWidget, Widget } from "../../shared/dashboard-spec";
+import type { KpiWidget, ChartWidget, TableWidget, Widget, Filter } from "../../shared/dashboard-spec";
 import { callGemini, ORCHESTRATE_OPTS, type GenResult, type GenOptions } from "../aiflow";
 import { classifySchema, type SchemaRoles } from "./enhance";
 import { tasksForAgent, taskDirective, type AnalysisTask } from "./decompose";
@@ -36,9 +36,9 @@ const DIMENSION = { type: "object", properties: { col: { type: "string" }, timeG
 
 const wrap = (item: unknown) => ({ type: "object", properties: { widgets: { type: "array", items: item } }, required: ["widgets"] });
 
-const KPI_ITEM = { type: "object", properties: { title: { type: "string" }, subtitle: { type: "string", description: "short context line, e.g. 'All historical records'" }, table: { type: "string" }, metric: METRIC }, required: ["title", "table", "metric"] };
-const CHART_ITEM = { type: "object", properties: { title: { type: "string" }, subtitle: { type: "string", description: "one line explaining what the chart shows" }, table: { type: "string" }, x: DIMENSION, series: { type: "array", items: METRIC }, limit: { type: "integer" }, kind: { type: "string", enum: ["line", "bar", "area", "pie", "donut"] } }, required: ["title", "table", "x", "series"] };
-const TABLE_ITEM = { type: "object", properties: { title: { type: "string" }, subtitle: { type: "string" }, table: { type: "string" }, columns: { type: "array", items: { type: "object", properties: { col: { type: "string" }, label: { type: "string" }, agg: AGG }, required: ["col"] } }, groupBy: { type: "array", items: DIMENSION }, limit: { type: "integer" } }, required: ["title", "table", "columns"] };
+const KPI_ITEM = { type: "object", properties: { title: { type: "string" }, subtitle: { type: "string", description: "short context line, e.g. 'All historical records'" }, table: { type: "string" }, metric: METRIC, filters: { type: "array", description: "scope this widget to a SUBSET of rows ('only open tickets'). Use EXACT observed literals.", items: FILTER_ITEM } }, required: ["title", "table", "metric"] };
+const CHART_ITEM = { type: "object", properties: { title: { type: "string" }, subtitle: { type: "string", description: "one line explaining what the chart shows" }, table: { type: "string" }, x: DIMENSION, series: { type: "array", items: METRIC }, limit: { type: "integer" }, kind: { type: "string", enum: ["line", "bar", "area", "pie", "donut"] }, filters: { type: "array", description: "scope this widget to a SUBSET of rows ('only open tickets'). Use EXACT observed literals.", items: FILTER_ITEM } }, required: ["title", "table", "x", "series"] };
+const TABLE_ITEM = { type: "object", properties: { title: { type: "string" }, subtitle: { type: "string" }, table: { type: "string" }, columns: { type: "array", items: { type: "object", properties: { col: { type: "string" }, label: { type: "string" }, agg: AGG }, required: ["col"] } }, groupBy: { type: "array", items: DIMENSION }, limit: { type: "integer" }, filters: { type: "array", description: "scope this widget to a SUBSET of rows ('only open tickets'). Use EXACT observed literals.", items: FILTER_ITEM } }, required: ["title", "table", "columns"] };
 
 // ---------------------------------------------------------------------------
 // Prompt plumbing
@@ -50,7 +50,7 @@ function schemaText(datasets: Dataset[]): string {
   }).join("\n");
 }
 
-const COMMON = `Give every widget a human title and a one-line subtitle that explains what it shows. You output ONLY the requested JSON. Ground every choice in columns that exist in the data profile — never invent a column or table. Follow the baseline instructions and analytical directive when given.`;
+const COMMON = `Give every widget a human title and a one-line subtitle that explains what it shows. You output ONLY the requested JSON. Ground every choice in columns that exist in the data profile — never invent a column or table. Follow the baseline instructions and analytical directive when given. To show a SUBSET of rows ("only open tickets", "P1 only"), set widget.filters: [{col,op,value}] with EXACT observed literals — never bake the subset into the title alone.`;
 
 export interface AgentInput {
   datasets: Dataset[];
@@ -84,18 +84,37 @@ let seq = 0;
 const wid = (p: string) => `${p}${++seq}_${Math.random().toString(36).slice(2, 6)}`;
 
 // A2: carry a well-formed derived expression through; drop malformed ones
-// (validation re-checks columns against the profile later).
+// deterministically (validation would also catch them, but dropping here keeps
+// the merge stage clean). CRITICAL: `where` must survive — stripping it
+// collapses a conditional rate (count FILTER (WHERE status='met') / count) into
+// the degenerate count/count, which the guard then rightly kills. That exact
+// strip is why builds kept losing their SLA KPI.
+const COERCE_OPS = new Set(["=", "!=", ">", ">=", "<", "<=", "in", "not_null", "is_null"]);
+function coerceWhere(w: any): { where?: Filter[] } {
+  if (!Array.isArray(w)) return {};
+  const kept = w
+    .filter((f: any) => f && typeof f.col === "string" && f.col && COERCE_OPS.has(f.op))
+    .map((f: any): Filter => ({ col: String(f.col), op: f.op, ...(f.value !== undefined ? { value: f.value } : {}) }));
+  return kept.length ? { where: kept } : {};
+}
 function coerceExpr(e: any): { expr?: import("../../shared/dashboard-spec").MetricExpr } {
-  const ok = e && typeof e === "object" && ["ratio", "pct", "diff"].includes(e.op)
-    && e.num?.agg && e.den?.agg;
-  if (!ok) return {};
-  return { expr: { op: e.op, num: { col: String(e.num.col ?? ""), agg: e.num.agg }, den: { col: String(e.den.col ?? ""), agg: e.den.agg } } };
+  if (!e || typeof e !== "object") return {};
+  if (!["ratio", "pct", "diff"].includes(e.op) || !e.num?.agg || !e.den?.agg) return {};
+  return { expr: { op: e.op,
+    num: { col: String(e.num.col ?? ""), agg: e.num.agg, ...coerceWhere(e.num.where) },
+    den: { col: String(e.den.col ?? ""), agg: e.den.agg, ...coerceWhere(e.den.where) } } };
+}
+// (validation re-checks columns against the profile later).
+/** Widget-level filters survive coercion (same strip-class bug as expr.where). */
+function coerceWidgetFilters(w: any): { filters?: Filter[] } {
+  const r = coerceWhere(w?.filters);
+  return r.where ? { filters: r.where } : {};
 }
 
 function coerceKpis(parsed: any): KpiWidget[] {
   const arr = Array.isArray(parsed?.widgets) ? parsed.widgets : [];
   return arr.filter((w: any) => w?.title && w?.table && w?.metric?.col && w?.metric?.agg)
-    .map((w: any): KpiWidget => ({ id: wid("kpi"), kind: "kpi", title: String(w.title), ...(w.subtitle ? { subtitle: String(w.subtitle) } : {}), table: String(w.table), metric: { col: String(w.metric.col), agg: w.metric.agg, label: w.metric.label, format: w.metric.format, ...coerceExpr(w.metric.expr) }, width: "quarter" }));
+    .map((w: any): KpiWidget => ({ id: wid("kpi"), kind: "kpi", title: String(w.title), ...(w.subtitle ? { subtitle: String(w.subtitle) } : {}), table: String(w.table), metric: { col: String(w.metric.col), agg: w.metric.agg, label: w.metric.label, format: w.metric.format, ...coerceExpr(w.metric.expr) }, ...coerceWidgetFilters(w), width: "quarter" }));
 }
 
 function coerceCharts(parsed: any, kinds: ChartWidget["kind"][], fallbackKind: ChartWidget["kind"]): ChartWidget[] {
@@ -107,6 +126,7 @@ function coerceCharts(parsed: any, kinds: ChartWidget["kind"][], fallbackKind: C
       x: { col: String(w.x.col), ...(w.x.timeGrain ? { timeGrain: w.x.timeGrain } : {}), ...(w.x.label ? { label: String(w.x.label) } : {}) },
       series: w.series.filter((m: any) => m?.col && m?.agg).map((m: any) => ({ col: String(m.col), agg: m.agg, label: m.label, format: m.format, ...coerceExpr(m.expr) })),
       ...(Number.isInteger(w.limit) && w.limit > 0 ? { limit: Math.min(w.limit, 50) } : {}),
+      ...coerceWidgetFilters(w),
       width: "half",
     }))
     .filter((w: ChartWidget) => w.series.length);
@@ -120,6 +140,7 @@ function coerceTables(parsed: any): TableWidget[] {
       columns: w.columns.filter((c: any) => c?.col).map((c: any) => ({ col: String(c.col), ...(c.label ? { label: String(c.label) } : {}), ...(c.agg ? { agg: c.agg } : {}) })),
       ...(Array.isArray(w.groupBy) ? { groupBy: w.groupBy.filter((g: any) => g?.col).map((g: any) => ({ col: String(g.col), ...(g.timeGrain ? { timeGrain: g.timeGrain } : {}) })) } : {}),
       limit: Number.isInteger(w.limit) && w.limit > 0 ? Math.min(w.limit, 100) : 25,
+      ...coerceWidgetFilters(w),
       width: "full",
     }))
     .filter((w: TableWidget) => w.columns.length);

@@ -10,6 +10,7 @@ type ColMap = Map<string, string>; // colName -> profile type (integer|number|bo
 const NUMERIC = new Set(["integer", "number"]);
 const TEMPORAL = new Set(["date"]);
 const NUMERIC_AGGS: Agg[] = ["sum", "avg", "min", "max", "median"];
+const OPS = ["=", "!=", ">", ">=", "<", "<=", "in", "not_null", "is_null"];
 
 function tableIndex(profiles: Dataset[]): Map<string, ColMap> {
   const idx = new Map<string, ColMap>();
@@ -107,7 +108,6 @@ export function validateSpec(spec: DashboardSpec, profiles: Dataset[]): Validati
         warn(`${where}: malformed expr — dropped`); return null;
       }
       const ex = m.expr!;
-      const OPS = ["=", "!=", ">", ">=", "<", "<=", "in", "not_null", "is_null"];
       const side = (b: BaseMetric, name: string): BaseMetric | null => {
         let out: BaseMetric;
         if (b.agg === "count") out = { col: b.col ?? "", agg: "count" };
@@ -183,9 +183,42 @@ export function validateSpec(spec: DashboardSpec, profiles: Dataset[]): Validati
     return m;
   };
 
-  const fixWidget = (w: Widget): Widget | null => {
-    const cols = idx.get(w.table);
-    if (!cols) { warn(`widget "${w.id}": table "${w.table}" not found — dropped`); return null; }
+  // WIDGET-LEVEL FILTERS — closing a half-pipeline: `widget.filters` was
+  // declared in the spec and compiled into SQL, but never validated. The same
+  // honesty rules as expr conditions apply: a filter on a nonexistent column
+  // or a provably-empty value would show a WRONG subset (or crash the query),
+  // so the widget drops with a warning rather than rendering a lie; a
+  // case-mismatched literal is rewritten to the observed spelling.
+  const fixWidgetFilters = <W extends Widget>(w: W, cols: ColMap): W | null => {
+    const wf = (w as any).filters;
+    if (wf === undefined || wf === null) return w;
+    if (!Array.isArray(wf)) {
+      warn(`${w.kind} "${w.id}": filters must be an array — dropped`);
+      return null;
+    }
+    if (!wf.length) { const { filters: _f, ...rest } = w as any; return rest as W; }
+    const checked: Filter[] = [];
+    for (const f of wf) {
+      if (!f || typeof f.col !== "string" || !OPS.includes(f.op)) {
+        warn(`${w.kind} "${w.id}": malformed filter — dropped`); return null;
+      }
+      if (!cols.has(f.col)) {
+        warn(`${w.kind} "${w.id}": filter column "${f.col}" not in ${w.table} — dropped`); return null;
+      }
+      const cf = checkValues(w.table, f, `${w.kind} "${w.id}" filter`);
+      if (cf === null) return null; // provably-empty subset → honest gap
+      checked.push(cf);
+    }
+    return { ...(w as any), filters: checked } as W;
+  };
+
+  const fixWidget = (w0: Widget): Widget | null => {
+    const cols0 = idx.get(w0.table);
+    if (!cols0) { warn(`widget "${w0.id}": table "${w0.table}" not found — dropped`); return null; }
+    const wf = fixWidgetFilters(w0, cols0);
+    if (!wf) return null;
+    const w = wf;
+    const cols = cols0;
 
     if (w.kind === "kpi") {
       if (!w.metric) { warn(`kpi "${w.id}": no metric — dropped`); return null; }
