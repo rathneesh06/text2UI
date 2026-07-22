@@ -26,14 +26,15 @@ export function widgetSignature(w: Widget): string {
     }
     return `${m.agg}:${m.agg === "count" ? "" : m.col}`;
   };
-  if (w.kind === "kpi") return `kpi|${w.table}|${msig(w.metric)}`;
-  if (w.kind === "table") return `table|${w.table}|${(w.groupBy ?? []).map((g) => g.col).join(",")}|${w.columns.map((c) => `${c.agg ?? "raw"}:${c.col}`).join(",")}`;
+  const jsig = (w as any).join ? `|join:${(w as any).join.table}:${(w as any).join.on.join(">")}` : "";
+  if (w.kind === "kpi") return `kpi|${w.table}|${msig(w.metric)}${jsig}`;
+  if (w.kind === "table") return `table|${w.table}${jsig}|${(w.groupBy ?? []).map((g) => g.col).join(",")}|${w.columns.map((c) => `${c.agg ?? "raw"}:${c.col}`).join(",")}`;
   const c = w as ChartWidget;
   // The FAMILY is part of the question: a bar (ranking) and a donut (composition)
   // over the same aggregate are two different reads, so both may live; two bars
   // over the same aggregate are one question asked twice, so one dies.
   const family = c.kind === "line" || c.kind === "area" ? "trend" : c.kind === "bar" ? "rank" : "composition";
-  return `chart|${family}|${c.table}|${c.x.col}|${c.x.timeGrain ?? ""}|${c.series.map(msig).join(",")}`;
+  return `chart|${family}|${c.table}${jsig}|${c.x.col}|${c.x.timeGrain ?? ""}|${c.series.map(msig).join(",")}`;
 }
 
 function dedupe<T extends Widget>(widgets: T[], seen: Set<string>): T[] {

@@ -48,6 +48,17 @@ export interface Dimension {
   label?: string;
 }
 
+/** A3 — one verified lookup join per widget. `on` = [baseCol, refCol]; the
+ *  edge (base.on[0] → table.on[1]) must exist in the base table's verified
+ *  foreignKeys or validation drops the widget. `cols` is FILLED BY VALIDATION:
+ *  the referenced columns that live only on the joined table — compile
+ *  qualifies those with the join alias and everything else with the base. */
+export interface WidgetJoin {
+  table: string;
+  on: [string, string];
+  cols?: string[];
+}
+
 export interface KpiWidget {
   id: string;
   kind: "kpi";
@@ -56,6 +67,7 @@ export interface KpiWidget {
   table: string;
   metric: Metric;
   filters?: Filter[];
+  join?: WidgetJoin;
   width?: WidgetWidth;        // default "quarter"
 }
 
@@ -68,6 +80,7 @@ export interface ChartWidget {
   x: Dimension;
   series: Metric[];           // pie/donut use the first series only
   filters?: Filter[];
+  join?: WidgetJoin;
   sort?: { by: "x" | "y"; dir: "asc" | "desc" };
   limit?: number;
   width?: WidgetWidth;        // default "half"
@@ -89,6 +102,7 @@ export interface TableWidget {
   columns: TableColumn[];
   groupBy?: Dimension[];
   filters?: Filter[];
+  join?: WidgetJoin;
   sort?: { by: string; dir: "asc" | "desc" };  // by = a column label or col
   limit?: number;
   width?: WidgetWidth;        // default "full"

@@ -36,9 +36,9 @@ const DIMENSION = { type: "object", properties: { col: { type: "string" }, timeG
 
 const wrap = (item: unknown) => ({ type: "object", properties: { widgets: { type: "array", items: item } }, required: ["widgets"] });
 
-const KPI_ITEM = { type: "object", properties: { title: { type: "string" }, subtitle: { type: "string", description: "short context line, e.g. 'All historical records'" }, table: { type: "string" }, metric: METRIC, filters: { type: "array", description: "scope this widget to a SUBSET of rows ('only open tickets'). Use EXACT observed literals.", items: FILTER_ITEM } }, required: ["title", "table", "metric"] };
-const CHART_ITEM = { type: "object", properties: { title: { type: "string" }, subtitle: { type: "string", description: "one line explaining what the chart shows" }, table: { type: "string" }, x: DIMENSION, series: { type: "array", items: METRIC }, limit: { type: "integer" }, kind: { type: "string", enum: ["line", "bar", "area", "pie", "donut"] }, sort: { type: "object", description: "explicit ordering when the user asks for it (charts: by is x or y)", properties: { by: { type: "string", enum: ["x", "y"] } , dir: { type: "string", enum: ["asc", "desc"] } }, required: ["by", "dir"] }, filters: { type: "array", description: "scope this widget to a SUBSET of rows ('only open tickets'). Use EXACT observed literals.", items: FILTER_ITEM } }, required: ["title", "table", "x", "series"] };
-const TABLE_ITEM = { type: "object", properties: { title: { type: "string" }, subtitle: { type: "string" }, table: { type: "string" }, columns: { type: "array", items: { type: "object", properties: { col: { type: "string" }, label: { type: "string" }, agg: AGG, format: { type: "string", enum: ["number", "percent", "currency", "hours", "days", "compact"] } }, required: ["col"] } }, groupBy: { type: "array", items: DIMENSION }, limit: { type: "integer" }, sort: { type: "object", description: "explicit ordering when the user asks for it", properties: { by: { type: "string" }, dir: { type: "string", enum: ["asc", "desc"] } }, required: ["by", "dir"] }, filters: { type: "array", description: "scope this widget to a SUBSET of rows ('only open tickets'). Use EXACT observed literals.", items: FILTER_ITEM } }, required: ["title", "table", "columns"] };
+const KPI_ITEM = { type: "object", properties: { title: { type: "string" }, subtitle: { type: "string", description: "short context line, e.g. 'All historical records'" }, table: { type: "string" }, metric: METRIC, join: { type: "object", description: "ONE lookup join to a related table — allowed ONLY for relationships listed as VERIFIED in the profile digest. on = [baseColumn, referencedColumn].", properties: { table: { type: "string" }, on: { type: "array", items: { type: "string" } } }, required: ["table", "on"] }, filters: { type: "array", description: "scope this widget to a SUBSET of rows ('only open tickets'). Use EXACT observed literals.", items: FILTER_ITEM } }, required: ["title", "table", "metric"] };
+const CHART_ITEM = { type: "object", properties: { title: { type: "string" }, subtitle: { type: "string", description: "one line explaining what the chart shows" }, table: { type: "string" }, x: DIMENSION, series: { type: "array", items: METRIC }, limit: { type: "integer" }, join: { type: "object", description: "ONE lookup join to a related table — allowed ONLY for relationships listed as VERIFIED in the profile digest. on = [baseColumn, referencedColumn].", properties: { table: { type: "string" }, on: { type: "array", items: { type: "string" } } }, required: ["table", "on"] }, kind: { type: "string", enum: ["line", "bar", "area", "pie", "donut"] }, sort: { type: "object", description: "explicit ordering when the user asks for it (charts: by is x or y)", properties: { by: { type: "string", enum: ["x", "y"] } , dir: { type: "string", enum: ["asc", "desc"] } }, required: ["by", "dir"] }, filters: { type: "array", description: "scope this widget to a SUBSET of rows ('only open tickets'). Use EXACT observed literals.", items: FILTER_ITEM } }, required: ["title", "table", "x", "series"] };
+const TABLE_ITEM = { type: "object", properties: { title: { type: "string" }, subtitle: { type: "string" }, table: { type: "string" }, columns: { type: "array", items: { type: "object", properties: { col: { type: "string" }, label: { type: "string" }, agg: AGG, format: { type: "string", enum: ["number", "percent", "currency", "hours", "days", "compact"] } }, required: ["col"] } }, join: { type: "object", description: "ONE lookup join to a related table — allowed ONLY for relationships listed as VERIFIED in the profile digest. on = [baseColumn, referencedColumn].", properties: { table: { type: "string" }, on: { type: "array", items: { type: "string" } } }, required: ["table", "on"] }, groupBy: { type: "array", items: DIMENSION }, limit: { type: "integer" }, sort: { type: "object", description: "explicit ordering when the user asks for it", properties: { by: { type: "string" }, dir: { type: "string", enum: ["asc", "desc"] } }, required: ["by", "dir"] }, filters: { type: "array", description: "scope this widget to a SUBSET of rows ('only open tickets'). Use EXACT observed literals.", items: FILTER_ITEM } }, required: ["title", "table", "columns"] };
 
 // ---------------------------------------------------------------------------
 // Prompt plumbing
@@ -50,7 +50,7 @@ function schemaText(datasets: Dataset[]): string {
   }).join("\n");
 }
 
-const COMMON = `Give every widget a human title and a one-line subtitle that explains what it shows. You output ONLY the requested JSON. Ground every choice in columns that exist in the data profile — never invent a column or table. Follow the baseline instructions and analytical directive when given. To show a SUBSET of rows ("only open tickets", "P1 only"), set widget.filters: [{col,op,value}] with EXACT observed literals — never bake the subset into the title alone.`;
+const COMMON = `Give every widget a human title and a one-line subtitle that explains what it shows. You output ONLY the requested JSON. Ground every choice in columns that exist in the data profile — never invent a column or table. Follow the baseline instructions and analytical directive when given. To show a SUBSET of rows ("only open tickets", "P1 only"), set widget.filters: [{col,op,value}] with EXACT observed literals — never bake the subset into the title alone. To show a column from a RELATED table (e.g. tickets by status NAME when tickets only carries status_id), set widget.join = {table, on:[baseCol, refCol]} — allowed ONLY for relationships the digest lists as VERIFIED; any other join is rejected.`;
 
 export interface AgentInput {
   datasets: Dataset[];
@@ -105,6 +105,14 @@ function coerceExpr(e: any): { expr?: import("../../shared/dashboard-spec").Metr
     den: { col: String(e.den.col ?? ""), agg: e.den.agg, ...coerceWhere(e.den.where) } } };
 }
 // (validation re-checks columns against the profile later).
+/** join survives coercion; validation verifies the edge. */
+function coerceJoin(w: any): { join?: import("../../shared/dashboard-spec").WidgetJoin } {
+  const j = w?.join;
+  if (!j || typeof j !== "object" || typeof j.table !== "string" || !j.table) return {};
+  if (!Array.isArray(j.on) || j.on.length !== 2 || !j.on[0] || !j.on[1]) return {};
+  return { join: { table: String(j.table), on: [String(j.on[0]), String(j.on[1])] } };
+}
+
 /** Widget-level filters survive coercion (same strip-class bug as expr.where). */
 function coerceWidgetFilters(w: any): { filters?: Filter[] } {
   const r = coerceWhere(w?.filters);
@@ -114,7 +122,7 @@ function coerceWidgetFilters(w: any): { filters?: Filter[] } {
 function coerceKpis(parsed: any): KpiWidget[] {
   const arr = Array.isArray(parsed?.widgets) ? parsed.widgets : [];
   return arr.filter((w: any) => w?.title && w?.table && w?.metric?.col && w?.metric?.agg)
-    .map((w: any): KpiWidget => ({ id: wid("kpi"), kind: "kpi", title: String(w.title), ...(w.subtitle ? { subtitle: String(w.subtitle) } : {}), table: String(w.table), metric: { col: String(w.metric.col), agg: w.metric.agg, label: w.metric.label, format: w.metric.format, ...coerceExpr(w.metric.expr) }, ...coerceWidgetFilters(w), width: "quarter" }));
+    .map((w: any): KpiWidget => ({ id: wid("kpi"), kind: "kpi", title: String(w.title), ...(w.subtitle ? { subtitle: String(w.subtitle) } : {}), table: String(w.table), metric: { col: String(w.metric.col), agg: w.metric.agg, label: w.metric.label, format: w.metric.format, ...coerceExpr(w.metric.expr) }, ...coerceWidgetFilters(w), ...coerceJoin(w), width: "quarter" }));
 }
 
 function coerceCharts(parsed: any, kinds: ChartWidget["kind"][], fallbackKind: ChartWidget["kind"]): ChartWidget[] {
@@ -127,7 +135,7 @@ function coerceCharts(parsed: any, kinds: ChartWidget["kind"][], fallbackKind: C
       series: w.series.filter((m: any) => m?.col && m?.agg).map((m: any) => ({ col: String(m.col), agg: m.agg, label: m.label, format: m.format, ...coerceExpr(m.expr) })),
       ...(Number.isInteger(w.limit) && w.limit > 0 ? { limit: Math.min(w.limit, 50) } : {}),
       ...((w.sort?.by === "x" || w.sort?.by === "y") && (w.sort.dir === "asc" || w.sort.dir === "desc") ? { sort: { by: w.sort.by, dir: w.sort.dir } } : {}),
-      ...coerceWidgetFilters(w),
+      ...coerceWidgetFilters(w), ...coerceJoin(w),
       width: "half",
     }))
     .filter((w: ChartWidget) => w.series.length);
@@ -142,7 +150,7 @@ function coerceTables(parsed: any): TableWidget[] {
       ...(Array.isArray(w.groupBy) ? { groupBy: w.groupBy.filter((g: any) => g?.col).map((g: any) => ({ col: String(g.col), ...(g.timeGrain ? { timeGrain: g.timeGrain } : {}) })) } : {}),
       limit: Number.isInteger(w.limit) && w.limit > 0 ? Math.min(w.limit, 100) : 25,
       ...(w.sort?.by && (w.sort.dir === "asc" || w.sort.dir === "desc") ? { sort: { by: String(w.sort.by), dir: w.sort.dir } } : {}),
-      ...coerceWidgetFilters(w),
+      ...coerceWidgetFilters(w), ...coerceJoin(w),
       width: "full",
     }))
     .filter((w: TableWidget) => w.columns.length);

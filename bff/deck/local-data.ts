@@ -10,6 +10,7 @@ import { join } from "path";
 import type { Dataset, DataProfile, ColumnProfile, ColumnType } from "../../shared/types";
 import { enrichColumns } from "../../shared/profile-enrich";
 import { exactColumnStats } from "../sources/exact-stats";
+import { attachMeasuredForeignKeys } from "../sources/relationships";
 
 const qid = (s: string) => `"${String(s).replace(/"/g, '""')}"`;
 const qstr = (s: string) => `'${String(s).replace(/'/g, "''")}'`;
@@ -84,6 +85,8 @@ export async function loadCsvFiles(files: { tableName: string; path: string }[])
     await conn.run(`CREATE TABLE ${qid(f.tableName)} AS SELECT * FROM read_csv_auto(${qstr(f.path)}, header=true, sample_size=-1)`);
     datasets.push(await profileTable(conn, f.tableName, "csv"));
   }
+  // A3: measured relationship edges across the uploaded tables.
+  try { await attachMeasuredForeignKeys(async (q) => readRows(conn, q), datasets); } catch { /* no edges */ }
   return makeHandle(inst, conn, datasets);
 }
 
@@ -103,5 +106,6 @@ export async function loadRows(tables: { tableName: string; rows: Record<string,
   } finally {
     rmSync(dir, { recursive: true, force: true });
   }
+  try { await attachMeasuredForeignKeys(async (q) => readRows(conn, q), datasets); } catch { /* no edges */ }
   return makeHandle(inst, conn, datasets);
 }

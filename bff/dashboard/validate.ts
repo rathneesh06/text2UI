@@ -39,6 +39,7 @@ export interface ValidationResult { spec: DashboardSpec; warnings: string[] }
 export function validateSpec(spec: DashboardSpec, profiles: Dataset[]): ValidationResult {
   const idx = tableIndex(profiles);
   const pidx = profileIndex(profiles);
+  const fkIndex = new Map(profiles.map((d) => [d.tableName, d.profile.foreignKeys ?? []]));
   const warnings: string[] = [];
   const warn = (m: string) => warnings.push(m);
 
@@ -222,13 +223,53 @@ export function validateSpec(spec: DashboardSpec, profiles: Dataset[]): Validati
     return { ...(w as any), filters: checked } as W;
   };
 
+  // A3 — WIDGET JOIN: verified-edge enforcement + column resolution.
+  // The edge (base.on[0] -> join.table.on[1]) must exist in the base table's
+  // verified foreignKeys (constraint or measured) — a name-plausible but
+  // unproven join is dropped with the available relationships named. On
+  // success, the widget's column universe becomes base ∪ joined, and
+  // join.cols records which referenced columns live ONLY on the joined table
+  // so compile can qualify deterministically (base wins ties).
+  const fixJoin = <W extends Widget>(w: W): { w: W; cols: ColMap } | null => {
+    const base = idx.get(w.table)!;
+    const j = (w as any).join;
+    if (j === undefined || j === null) return { w, cols: base };
+    if (!j.table || !Array.isArray(j.on) || j.on.length !== 2) {
+      warn(`${w.kind} "${w.id}": malformed join — dropped`); return null;
+    }
+    const jcols = idx.get(String(j.table));
+    if (!jcols) { warn(`${w.kind} "${w.id}": join table "${j.table}" not found — dropped`); return null; }
+    const [lc, rc] = [String(j.on[0]), String(j.on[1])];
+    if (!base.has(lc)) { warn(`${w.kind} "${w.id}": join column "${lc}" not in ${w.table} — dropped`); return null; }
+    if (!jcols.has(rc)) { warn(`${w.kind} "${w.id}": join column "${rc}" not in ${j.table} — dropped`); return null; }
+    const edges = fkIndex.get(w.table) ?? [];
+    const verified = edges.some((e) => e.col === lc && e.refTable === String(j.table) && e.refCol === rc);
+    if (!verified) {
+      const avail = edges.length
+        ? `verified relationships from ${w.table}: ${edges.map((e) => `${e.col} -> ${e.refTable}.${e.refCol}`).join(", ")}`
+        : `no verified relationships exist from ${w.table}`;
+      warn(`${w.kind} "${w.id}": join ${w.table}.${lc} -> ${j.table}.${rc} is not a VERIFIED relationship (${avail}) — dropped`);
+      return null;
+    }
+    // Union column map + record join-only columns for the compiler.
+    const union: ColMap = new Map(base);
+    const joinOnly: string[] = [];
+    for (const [name, type] of jcols) {
+      if (!union.has(name)) { union.set(name, type); joinOnly.push(name); }
+    }
+    const jw = { ...(w as any), join: { table: String(j.table), on: [lc, rc] as [string, string], cols: joinOnly } } as W;
+    return { w: jw, cols: union };
+  };
+
   const fixWidget = (w0: Widget): Widget | null => {
     const cols0 = idx.get(w0.table);
     if (!cols0) { warn(`widget "${w0.id}": table "${w0.table}" not found — dropped`); return null; }
-    const wf = fixWidgetFilters(w0, cols0);
+    const joined = fixJoin(w0);
+    if (!joined) return null;
+    const wf = fixWidgetFilters(joined.w, joined.cols);
     if (!wf) return null;
     const w = wf;
-    const cols = cols0;
+    const cols = joined.cols;
 
     if (w.kind === "kpi") {
       if (!w.metric) { warn(`kpi "${w.id}": no metric — dropped`); return null; }

@@ -56,6 +56,7 @@ const WIDGET = {
     groupBy: { type: "array", items: DIMENSION },
     limit: { type: "integer" },
     sort: { type: "object", properties: { by: { type: "string" }, dir: { type: "string", enum: ["asc", "desc"] } } },
+    join: { type: "object", description: "ONE lookup join to a related table — allowed ONLY for relationships listed as VERIFIED in the profile digest. on = [baseColumn, referencedColumn].", properties: { table: { type: "string" }, on: { type: "array", items: { type: "string" } } }, required: ["table", "on"] },
     filters: { type: "array", description: "scope this widget to a SUBSET of rows ('only open tickets'). Use EXACT observed literals.", items: FILTER_ITEM },
   },
   required: ["id", "kind", "title", "table"],
@@ -133,7 +134,7 @@ Rules:
 
 On an EDIT turn you are given the CURRENT spec. Return the FULL updated spec, changing as little as possible: keep existing widget ids and untouched widgets exactly, and apply only what the user asked.
 CONVERSATION AWARENESS (edit turns): when a CONVERSATION section is provided, resolve references through it — "the chart we added", "like before", "the same color as earlier", "no, the OTHER one" all point at things said or done in prior turns. When a SELECTED WIDGET is provided, that is the user's "this"/"that"/"it": apply the edit to that exact widget (match its id) unless the user clearly names a different one. Never reinterpret the whole dashboard because of a reference you cannot resolve — leave unclear things unchanged.
-To show a SUBSET of rows ("only open tickets", "P1 only"), set widget.filters: [{col,op,value}] with EXACT observed literals — never bake the subset into the title alone.
+To show a SUBSET of rows ("only open tickets", "P1 only"), set widget.filters: [{col,op,value}] with EXACT observed literals — never bake the subset into the title alone. To show a column from a RELATED table (e.g. tickets by status NAME when tickets only carries status_id), set widget.join = {table, on:[baseCol, refCol]} — allowed ONLY for relationships the digest lists as VERIFIED; any other join is rejected.
 `;
 
 function schemaText(datasets: Dataset[]): string {

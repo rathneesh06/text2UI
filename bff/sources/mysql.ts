@@ -17,6 +17,7 @@ import { DuckDBInstance, type DuckDBConnection } from "@duckdb/node-api";
 import type { Dataset, ColumnProfile, ColumnType } from "../../shared/types";
 import { enrichColumns } from "../../shared/profile-enrich";
 import { exactColumnStats } from "./exact-stats";
+import { attachMeasuredForeignKeys, mysqlConstraintEdges, attachConstraintEdges } from "./relationships";
 
 export interface MysqlConn {
   host: string;
@@ -366,6 +367,16 @@ export async function introspectMysql(conn: MysqlConn, opts: IntrospectOptions =
       });
     }
 
+    // A3: verified edges — MySQL catalog constraints first, then measure the
+    // remaining candidates through the attached connection (DuckDB-side SQL).
+    try {
+      const edges = await mysqlConstraintEdges(
+        (q, l) => readAll(`SELECT * FROM mysql_query('src', ${qstr(q)})`, l), conn.database);
+      attachConstraintEdges(datasets, edges);
+      await attachMeasuredForeignKeys((q, l) => readAll(q, l ?? "fk"), datasets, {
+        tableRef: (n) => `src.${qid(conn.database)}.${qid(n)}`,
+      });
+    } catch { /* no edges */ }
     return { datasets, allTables, warnings };
   } finally {
     h.close();

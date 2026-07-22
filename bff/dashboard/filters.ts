@@ -215,7 +215,7 @@ function checkString(v: unknown, what: string): string {
  *  THROWS (status 400) on anything malformed — a filter request is a security
  *  surface, so strictness beats silent repair here. Column names are quoted
  *  (qid) and values escaped (esc); a wrong column simply fails the query. */
-export function filterConditions(applied: unknown): string[] {
+export function filterConditions(applied: unknown, qcol: (c: string) => string = qid): string[] {
   if (applied === undefined || applied === null) return [];
   if (!Array.isArray(applied)) badValue("filters must be an array");
   if (applied.length > MAX_APPLIED) badValue(`too many filters (max ${MAX_APPLIED})`);
@@ -225,7 +225,7 @@ export function filterConditions(applied: unknown): string[] {
     const col = checkString(raw.col, "filter.col");
     if (col.length > 200) badValue("filter.col too long");
     const kind = raw.kind as GlobalFilterKind;
-    const c = qid(col);
+    const c = qcol(col);
     if (kind === "daterange") {
       const v = raw.value;
       if (!v || typeof v !== "object" || Array.isArray(v)) badValue("daterange value must be { from?, to? }");
@@ -281,6 +281,25 @@ function scalar(v: unknown, what: string): string | number | boolean {
 }
 
 const EXPR_OPS = new Set(["ratio", "pct", "diff"]);
+
+/** A3: join shape sanitation for the query path. The verified-edge check ran
+ *  at validation time (it needs profiles); here we enforce the closed GRAMMAR
+ *  — table + on pair + cols as plain strings — so no other structure can ride
+ *  the bridge. A bogus join yields an honest per-widget query error, never
+ *  silent data. */
+function sanJoin(j: any): { join?: { table: string; on: [string, string]; cols?: string[] } } {
+  if (j === undefined || j === null) return {};
+  if (typeof j !== "object") badValue("widget.join must be an object");
+  const table = str(j.table, "join.table");
+  if (!Array.isArray(j.on) || j.on.length !== 2) badValue("join.on must be [baseCol, refCol]");
+  const on: [string, string] = [str(j.on[0], "join.on[0]"), str(j.on[1], "join.on[1]")];
+  const out: { table: string; on: [string, string]; cols?: string[] } = { table, on };
+  if (j.cols !== undefined) {
+    if (!Array.isArray(j.cols) || j.cols.length > 100) badValue("join.cols invalid");
+    out.cols = j.cols.map((c: any, i: number) => str(c, `join.cols[${i}]`));
+  }
+  return { join: out };
+}
 
 function sanMetric(m: any, what: string): Metric {
   if (!m || typeof m !== "object") badValue(`${what} must be an object`);
@@ -360,6 +379,7 @@ export function sanitizeWidget(raw: unknown): Widget {
     title: optStr(w.title, "widget.title", 300) ?? "",
     table: str(w.table, "widget.table"),
     filters: sanFilters(w.filters),
+    ...sanJoin(w.join),
   };
   if (w.kind === "kpi") {
     const out: KpiWidget = { ...base, kind: "kpi", metric: sanMetric(w.metric, "metric") };
@@ -407,7 +427,9 @@ export function sanitizeWidget(raw: unknown): Widget {
  *  the SAME deterministic builders the build turn uses. */
 export function buildWidgetSql(rawWidget: unknown, appliedFilters: unknown): string {
   const w = sanitizeWidget(rawWidget);
-  const extra = filterConditions(appliedFilters);
+  // A3: on a joined widget, global-filter columns must resolve to the BASE
+  // alias — an unqualified column shared by both tables would be ambiguous.
+  const extra = filterConditions(appliedFilters, (w as any).join ? (c: string) => `b.${qid(c)}` : undefined);
   if (w.kind === "kpi") return buildKpiSql(w, extra);
   if (w.kind === "table") return buildTableSql(w, extra).sql;
   return buildChartSql(w, extra).sql;

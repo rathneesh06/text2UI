@@ -19,11 +19,23 @@ export interface ColumnProfile {
                                                   // the exhaustiveness guard may hard-drop only then
 }
 
+/** A verified table relationship — the ONLY thing widget.join may compile
+ *  against. "constraint" = declared in the source database; "measured" =
+ *  proven by executed uniqueness + containment checks on the actual data.
+ *  Name-heuristic candidates (semantic layer) are advisory and never compile. */
+export interface ForeignKeyEdge {
+  col: string;        // column on THIS table (the many side)
+  refTable: string;   // referenced table (the one side)
+  refCol: string;     // referenced column (unique on refTable)
+  verified: "constraint" | "measured";
+}
+
 export interface DataProfile {
   source: { filename: string; format: "csv" | "xlsx" | "json"; sheetName?: string };
   rowCount: number;
   columns: ColumnProfile[];
   sampleRows: Record<string, unknown>[];
+  foreignKeys?: ForeignKeyEdge[]; // verified outgoing edges (A3)
 }
 
 // Produced in the browser by ingest(). `rows` stays client-side (feeds the

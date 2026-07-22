@@ -139,6 +139,18 @@ export function baselineInstructions(datasets: Dataset[], userPrompt: string, cu
     }
     if (valueLines.length >= 14) break;
   }
+  // A3: VERIFIED relationships — the ONLY joins the compiler will accept.
+  const relLines: string[] = [];
+  for (const d of datasets) {
+    for (const fk of d.profile.foreignKeys ?? []) {
+      relLines.push(`${d.tableName}.${fk.col} -> ${fk.refTable}.${fk.refCol} (${fk.verified})`);
+      if (relLines.length >= 12) break;
+    }
+    if (relLines.length >= 12) break;
+  }
+  if (relLines.length) {
+    parts.push(`VERIFIED RELATIONSHIPS (the ONLY allowed widget.join targets; join = {table: <right side's table>, on: [<left col>, <right col>]}): ${relLines.join("; ")}.`);
+  }
   if (valueLines.length) {
     parts.push(`OBSERVED CATEGORY VALUES — conditions and expr numerators MUST use these exact literals (equality is case-sensitive; a guessed spelling matches zero rows): ${valueLines.join("; ")}.`);
   }

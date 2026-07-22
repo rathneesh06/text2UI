@@ -4,7 +4,7 @@
 // by construction: the model picks columns/aggregations as data; the SQL grammar is
 // fixed and always valid DuckDB.
 import type {
-  Agg, Dimension, Filter, KpiWidget, ChartWidget, TableWidget, Metric, TimeGrain, ValueFormat } from "../../shared/dashboard-spec";
+  Agg, Dimension, Filter, KpiWidget, ChartWidget, TableWidget, Metric, TimeGrain, ValueFormat, WidgetJoin } from "../../shared/dashboard-spec";
 
 /** Quote an identifier for DuckDB. */
 export const qid = (s: string) => `"${String(s).replace(/"/g, '""')}"`;
@@ -18,12 +18,30 @@ function lit(v: unknown): string {
 }
 
 /** Aggregate expression. `count` -> count(*); everything else uses the column. */
+// A3 — column qualification for joined widgets. The builders are fully
+// synchronous, so a scoped set/reset qualifier is safe: inside withJoin(),
+// columns recorded by validation as join-only resolve to the join alias and
+// everything else to the base alias; outside, plain quoting.
+let COLQ: (col: string) => string = qid;
+const qcol = (col: string) => COLQ(col);
+function withJoin<T>(w: { join?: WidgetJoin }, fn: () => T): T {
+  if (!w.join) return fn();
+  const joinOnly = new Set(w.join.cols ?? []);
+  COLQ = (c) => (joinOnly.has(c) ? `j.${qid(c)}` : `b.${qid(c)}`);
+  try { return fn(); } finally { COLQ = qid; }
+}
+/** FROM clause: plain table, or base LEFT JOIN ref on the verified edge. */
+export function fromClause(w: { table: string; join?: WidgetJoin }): string {
+  if (!w.join) return qid(w.table);
+  return `${qid(w.table)} b LEFT JOIN ${qid(w.join.table)} j ON b.${qid(w.join.on[0])} = j.${qid(w.join.on[1])}`;
+}
+
 export function aggExpr(agg: Agg, col: string): string {
   switch (agg) {
     case "count": return "count(*)";
-    case "count_distinct": return `count(DISTINCT ${qid(col)})`;
-    case "median": return `median(${qid(col)})`;
-    case "sum": case "avg": case "min": case "max": return `${agg}(${qid(col)})`;
+    case "count_distinct": return `count(DISTINCT ${qcol(col)})`;
+    case "median": return `median(${qcol(col)})`;
+    case "sum": case "avg": case "min": case "max": return `${agg}(${qcol(col)})`;
     default: return "count(*)";
   }
 }
@@ -56,12 +74,12 @@ const GRAINS: Record<TimeGrain, string> = {
   day: "day", week: "week", month: "month", quarter: "quarter", year: "year",
 };
 export function dimExpr(d: Dimension): string {
-  if (d.timeGrain && GRAINS[d.timeGrain]) return `date_trunc('${GRAINS[d.timeGrain]}', ${qid(d.col)})`;
-  return qid(d.col);
+  if (d.timeGrain && GRAINS[d.timeGrain]) return `date_trunc('${GRAINS[d.timeGrain]}', ${qcol(d.col)})`;
+  return qcol(d.col);
 }
 
 function oneFilter(f: Filter): string {
-  const c = qid(f.col);
+  const c = qcol(f.col);
   switch (f.op) {
     case "is_null": return `${c} IS NULL`;
     case "not_null": return `${c} IS NOT NULL`;
@@ -93,14 +111,13 @@ export function seriesKey(m: Metric, i: number): string {
 // ---- builders --------------------------------------------------------------
 
 export function buildKpiSql(w: KpiWidget, extraWhere?: string[]): string {
-  return `SELECT ${metricExpr(w.metric)} AS value FROM ${qid(w.table)}${whereClause(w.filters, extraWhere)}`;
+  return withJoin(w, () => `SELECT ${metricExpr(w.metric)} AS value FROM ${fromClause(w)}${whereClause(w.filters, extraWhere)}`);
 }
 
 export function buildChartSql(w: ChartWidget, extraWhere?: string[]): { sql: string; seriesKeys: { key: string; label: string }[] } {
   const isPie = w.kind === "pie" || w.kind === "donut";
   const series = isPie ? w.series.slice(0, 1) : w.series;
   const keys = series.map((m, i) => ({ key: seriesKey(m, i), label: m.label || `${m.agg}(${m.col})` }));
-  const selectSeries = series.map((m, i) => `${metricExpr(m)} AS ${qid(keys[i].key)}`).join(", ");
 
   // Ordering: time axes ascend by x; categorical charts default to the first series desc.
   let orderBy = "ORDER BY x ASC";
@@ -108,13 +125,16 @@ export function buildChartSql(w: ChartWidget, extraWhere?: string[]): { sql: str
   else if (!w.x.timeGrain) orderBy = `ORDER BY ${qid(keys[0].key)} DESC`;
 
   const limit = w.limit && w.limit > 0 ? ` LIMIT ${Math.floor(w.limit)}` : (isPie || !w.x.timeGrain ? " LIMIT 50" : "");
-  const sql =
-    `SELECT ${dimExpr(w.x)} AS x, ${selectSeries} FROM ${qid(w.table)}${whereClause(w.filters, extraWhere)} ` +
-    `GROUP BY 1 ${orderBy}${limit}`;
+  const sql = withJoin(w, () =>
+    `SELECT ${dimExpr(w.x)} AS x, ${series.map((m, i) => `${metricExpr(m)} AS ${qid(keys[i].key)}`).join(", ")} FROM ${fromClause(w)}${whereClause(w.filters, extraWhere)} ` +
+    `GROUP BY 1 ${orderBy}${limit}`);
   return { sql, seriesKeys: keys };
 }
 
 export function buildTableSql(w: TableWidget, extraWhere?: string[]): { sql: string; cols: { key: string; label: string; format?: ValueFormat }[] } {
+  return withJoin(w, () => buildTableSqlInner(w, extraWhere));
+}
+function buildTableSqlInner(w: TableWidget, extraWhere?: string[]): { sql: string; cols: { key: string; label: string; format?: ValueFormat }[] } {
   const grouped = (w.groupBy?.length ?? 0) > 0;
   const selects: string[] = [];
   const cols: { key: string; label: string; format?: ValueFormat }[] = [];
@@ -126,12 +146,12 @@ export function buildTableSql(w: TableWidget, extraWhere?: string[]): { sql: str
   }
   w.columns.forEach((c, i) => {
     const key = (c.label || c.col).toLowerCase().replace(/[^a-z0-9]+/g, "_") + `_${i}`;
-    const expr = grouped && c.agg ? aggExpr(c.agg, c.col) : qid(c.col);
+    const expr = grouped && c.agg ? aggExpr(c.agg, c.col) : qcol(c.col);
     selects.push(`${expr} AS ${qid(key)}`);
     cols.push({ key, label: c.label || c.col, ...(c.format ? { format: c.format } : {}) });
   });
 
-  let sql = `SELECT ${selects.join(", ")} FROM ${qid(w.table)}${whereClause(w.filters, extraWhere)}`;
+  let sql = `SELECT ${selects.join(", ")} FROM ${fromClause(w)}${whereClause(w.filters, extraWhere)}`;
   if (grouped) sql += ` GROUP BY ${(w.groupBy ?? []).map((_, i) => i + 1).join(", ")}`;
   if (w.sort) {
     const found = cols.find((c) => c.label === w.sort!.by || c.key.startsWith(w.sort!.by.toLowerCase()));

@@ -14,6 +14,7 @@ import { attachMysql, qstr, qid, duckTypeToColumnType, type MysqlConn } from "./
 import type { Dataset, ColumnProfile } from "../../shared/types";
 import { enrichColumns } from "../../shared/profile-enrich";
 import { exactColumnStats } from "./exact-stats";
+import { attachMeasuredForeignKeys } from "./relationships";
 
 const bt = (s: string) => "`" + String(s).replace(/`/g, "``") + "`"; // MySQL identifier
 
@@ -228,6 +229,8 @@ export async function snapshotMysql(conn: MysqlConn, opts: SnapshotOptions): Pro
       });
     }
 
+    // A3: measured relationship edges across the snapshotted tables.
+    try { await attachMeasuredForeignKeys((q, l) => readAll(q, l ?? "fk"), snapshots.map((sn) => sn.dataset).filter((d): d is NonNullable<typeof d> => !!d)); } catch { /* no edges */ }
     try { await c.run("CHECKPOINT"); } catch { /* best-effort */ }
     return { dbPath, snapshots, warnings };
   } finally {

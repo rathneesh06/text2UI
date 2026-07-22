@@ -11,6 +11,7 @@ import { qid, duckTypeToColumnType } from "./mysql";
 import type { Dataset, ColumnProfile } from "../../shared/types";
 import { enrichColumns } from "../../shared/profile-enrich";
 import { exactColumnStats } from "./exact-stats";
+import { attachMeasuredForeignKeys } from "./relationships";
 
 /** Each view is defensive: source tables may be absent if you snapshotted a
  *  subset, so creation failures are recorded as warnings, not fatal. */
@@ -153,6 +154,9 @@ export async function applyModelOn(c: DuckDBConnection, opts: { onPhase?: (m: st
       profile: { source: { filename: `view:${name}`, format: "json" }, rowCount: Number((cnt[0] as any).n ?? 0), columns, sampleRows: sample.slice(0, 5) },
     });
   }
+  // A3: prove name-heuristic join candidates against the actual data —
+  // only measured/constraint edges may ever compile a widget.join.
+  try { await attachMeasuredForeignKeys(readAll, datasets); } catch { /* no edges */ }
 
   try { await c.run("CHECKPOINT"); } catch { /* best-effort */ }
   return { datasets, created, warnings };

@@ -21,6 +21,7 @@ export type { AttachHandle } from "./mysql"; // engine-agnostic façade re-expor
 import type { ColumnProfile, Dataset } from "../../shared/types";
 import { enrichColumns } from "../../shared/profile-enrich";
 import { exactColumnStats } from "./exact-stats";
+import { attachMeasuredForeignKeys, postgresConstraintEdges, attachConstraintEdges } from "./relationships";
 
 export type Dialect = "mysql" | "postgres";
 
@@ -384,6 +385,21 @@ async function introspectPostgres(conn: DbConn, opts: IntrospectOptions = {}): P
       });
     }
 
+    // A3: verified relationship edges. Constraints from the PG catalog first;
+    // then measure any remaining name-heuristic candidates against the
+    // attached data. Both run through the same DuckDB-side readAll.
+    try {
+      const schemas = [...new Set(toProfile.map((t) => t.schema))];
+      const nameBySource = new Map(toProfile.map((t) => [t.table, t.name] as [string, string]));
+      for (const sc of schemas) {
+        const edges = await postgresConstraintEdges(
+          (q, l) => readAll(`SELECT * FROM postgres_query('src', ${qstr(q)})`, l ?? "fk"), sc);
+        attachConstraintEdges(datasets, edges, (t) => nameBySource.get(t) ?? t);
+      }
+      await attachMeasuredForeignKeys((q, l) => readAll(q, l ?? "fk"), datasets, {
+        tableRef: (n) => toProfile.find((x) => x.name === n)?.ref ?? `"${n.replace(/"/g, '""')}"`,
+      });
+    } catch { /* no edges */ }
     return { datasets, allTables, warnings };
   } finally {
     h.close();
@@ -498,5 +514,7 @@ export async function snapshotFromHandle(
       },
     });
   }
+  // A3: measured relationship edges against the full local snapshot.
+  try { await attachMeasuredForeignKeys((q, l) => readAll(q, l ?? "fk"), datasets); } catch { /* no edges */ }
   return { dbPath: opts.dbPath, datasets, warnings, skipped };
 }
