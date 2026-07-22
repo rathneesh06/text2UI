@@ -57,7 +57,7 @@ function tablesWithCol(profiles: Dataset[], col: string, types: Set<string>): st
 /** Derive the filter bar from the profile. Deterministic; safe on any data:
  *  no temporal column → no date range; no low-cardinality categorical → no
  *  selects; both absent → empty bar (renderer hides it). */
-export function deriveGlobalFilters(profiles: Dataset[]): CompiledGlobalFilter[] {
+export function deriveGlobalFilters(profiles: Dataset[], usedTables?: Map<string, number>): CompiledGlobalFilter[] {
   const filters: CompiledGlobalFilter[] = [];
   if (!profiles.length) return filters;
 
@@ -101,10 +101,18 @@ export function deriveGlobalFilters(profiles: Dataset[]): CompiledGlobalFilter[]
   // not id-like (distincts must not approach the row count). Ranked by how
   // much of the table the topValues cover (a real status/category column
   // covers ~everything; a free-text column doesn't).
-  type Cand = { col: ColumnProfile; table: string; rowCount: number; coverage: number };
+  type Cand = { col: ColumnProfile; table: string; rowCount: number; coverage: number; governs: number };
   const seen = new Set<string>(Object.values(dateColByTable).map((c) => c.name));
   const cands: Cand[] = [];
   for (const d of byRows) {
+    // A select filter the board can't feel is broken UX: when the widget set
+    // is known (usedTables), only tables that actually host widgets may
+    // contribute select filters, and columns are ranked by how many widgets
+    // they govern. (The live incident: "Sla Status" derived from the sla
+    // table while every visible widget sat on tickets — the dropdown
+    // controlled nothing.)
+    const governs = usedTables ? (usedTables.get(d.tableName) ?? 0) : 1;
+    if (usedTables && governs === 0) continue;
     for (const c of d.profile.columns) {
       if (c.type !== "string" || seen.has(c.name)) continue;
       if (!Array.isArray(c.topValues) || !c.topValues.length) continue;
@@ -112,11 +120,11 @@ export function deriveGlobalFilters(profiles: Dataset[]): CompiledGlobalFilter[]
       if (d.profile.rowCount > 0 && c.uniqueCount > d.profile.rowCount * 0.5) continue; // id-like
       const covered = c.topValues.reduce((n, t) => n + (typeof t.count === "number" ? t.count : 0), 0);
       const coverage = d.profile.rowCount > 0 ? covered / d.profile.rowCount : 0;
-      cands.push({ col: c, table: d.tableName, rowCount: d.profile.rowCount, coverage });
+      cands.push({ col: c, table: d.tableName, rowCount: d.profile.rowCount, coverage, governs });
       seen.add(c.name); // one filter per column name across tables
     }
   }
-  cands.sort((a, b) => b.coverage - a.coverage || b.rowCount - a.rowCount || a.col.name.localeCompare(b.col.name));
+  cands.sort((a, b) => b.governs - a.governs || b.coverage - a.coverage || b.rowCount - a.rowCount || a.col.name.localeCompare(b.col.name));
   for (const cand of cands.slice(0, MAX_SELECT_FILTERS)) {
     const options = (cand.col.topValues ?? [])
       .map((t) => String(t.value ?? ""))
@@ -142,7 +150,13 @@ export function deriveGlobalFilters(profiles: Dataset[]): CompiledGlobalFilter[]
  *  profile, prune filters whose column no longer exists or that touch none of
  *  the rendered widgets' tables. */
 export function resolveGlobalFilters(spec: DashboardSpec, profiles: Dataset[]): CompiledGlobalFilter[] {
-  const derived = deriveGlobalFilters(profiles);
+  const usedTables = new Map<string, number>();
+  for (const sec of spec.sections ?? []) for (const w of sec.widgets ?? []) {
+    if (w.table) usedTables.set(w.table, (usedTables.get(w.table) ?? 0) + 1);
+    const jt = (w as any).join?.table;
+    if (jt) usedTables.set(jt, (usedTables.get(jt) ?? 0) + 1);
+  }
+  const derived = deriveGlobalFilters(profiles, usedTables);
   let resolved: CompiledGlobalFilter[];
   if (Array.isArray(spec.filters)) {
     // Explicit list (possibly empty — user removed them). Enrich each from the

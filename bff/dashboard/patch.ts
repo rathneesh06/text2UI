@@ -229,6 +229,13 @@ export function applyOps(current: DashboardSpec, ops: EditOp[], userPrompt: stri
         if ((w as any).metric) (w as any).kind = "kpi";
         else if ((w as any).columns?.length) (w as any).kind = "table";
         else if ((w as any).x && (w as any).series?.length) (w as any).kind = "bar";
+        else if ((w as any).filters?.length) (w as any).kind = "kpi"; // a filtered count is still a KPI
+      }
+      // "add a KPI counting only open tickets" → the model emits filters and
+      // forgets the metric. A missing metric on a KPI whose intent is a
+      // filtered COUNT has exactly one honest default: count(*).
+      if ((w as any).kind === "kpi" && !(w as any).metric) {
+        (w as any).metric = { col: "", agg: "count" };
       }
       if (!w.table) {
         // Default to the table the current board is about: the most common

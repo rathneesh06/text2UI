@@ -245,6 +245,15 @@ export async function handleDashboardBuild(
   const dropped = allWidgets(spec).length - allWidgets(rendered).length;
   if (dropped > 0) console.log(`[dashboard] validation dropped ${dropped} widget(s): ${plan.warnings.join(" | ")}`);
   const warnings = [...healedNotes, ...degradedNotes, ...plan.warnings];
+  // POST-VALIDATION NET-ZERO (the "Updated the dashboard / no metric —
+  // dropped" incident): applyOps added something, validation dropped it, the
+  // board is byte-identical to before — say exactly that, with the drop
+  // reasons, never a success message.
+  if (currentSpec && JSON.stringify(rendered) === JSON.stringify(currentSpec)) {
+    audit({ turnId, conversationId, stage: "render", detail: { pipeline, netZeroAfterValidation: true, warnings: plan.warnings.slice(0, 6) } });
+    return { status: 200, body: { app: null, spec: currentSpec, warnings, noChange: true, pipeline,
+      summary: ["That edit didn't land" + (warnings.length ? ": " + warnings.slice(0, 3).join("; ") : ".") + " Try naming the metric or column explicitly."] } };
+  }
   const summary = summarizeSpecChange(currentSpec, rendered);
   audit({ turnId, conversationId, stage: "render", detail: { pipeline, widgets: allWidgets(rendered).length, dropped, warnings: plan.warnings.slice(0, 6), sql: plan.sections.flatMap((sc: any) => sc.widgets.map((cw: any) => cw.sql)).slice(0, 30) } });
   // Diff History: every accepted version enters the conversation's undo stack.

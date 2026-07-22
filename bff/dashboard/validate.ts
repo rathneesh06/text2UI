@@ -166,6 +166,21 @@ export function validateSpec(spec: DashboardSpec, profiles: Dataset[]): Validati
       if (ex.op === "ratio" && out.format === "percent") out.format = "number";
       return out;
     }
+    // A3.1 guard (the "itilticketid over time" incident): summing or
+    // averaging an ID-LIKE column is semantically meaningless — sum(ticket_id)
+    // rendered a 1M-scale line that survived a retitle to "Average Ticket
+    // Age". Id-likeness: the name says id, or distincts approach the row
+    // count on an integer column. Honest gap over a garbage number.
+    if (NUMERIC_AGGS.includes(m.agg) && m.col) {
+      const cp2 = pidx.get(table)?.get(m.col);
+      const rows = profiles.find((d) => d.tableName === table)?.profile.rowCount ?? 0;
+      const idName = /(^|_)id$/i.test(m.col);
+      const idCard = cp2 && rows > 20 && cp2.type === "integer" && cp2.uniqueCount >= rows * 0.9;
+      if (cp2 && (idName || idCard)) {
+        warn(`${where}: ${m.agg}("${m.col}") aggregates an id-like column — the result is meaningless. Use count/count_distinct, or a real measure — dropped`);
+        return null;
+      }
+    }
     // A2 guard: the fake-percent class ("5559.0%") = an additive aggregate
     // dressed up as a percentage. Percent display requires a real ratio (expr)
     // or an average/median of a GENUINELY percent-scaled column — the profile

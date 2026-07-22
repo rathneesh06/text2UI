@@ -227,4 +227,43 @@ await (async () => {
   console.log("pipeline: model auto-resolution policy ✅");
 })();
 
+// ---- 10. A3.1 LIVE-INCIDENT PINS -------------------------------------------
+await (async () => {
+  const { deriveGlobalFilters } = await import("./filters");
+  const { applyOps } = await import("./patch");
+  // (a) Board-governed selects: a category column on an unused table derives
+  // NO select filter (the "Sla Status controlled nothing" incident).
+  const TICKETS_D: Dataset = { tableName: "tickets", profile: { source: { filename: "t", format: "csv" }, rowCount: 100, columns: [
+    col("status", "string", 3, { topValues: [{ value: "Open", count: 60 }, { value: "Closed", count: 40 }], statsExact: true }),
+  ], sampleRows: [] } };
+  const SLA_D: Dataset = { tableName: "sla", profile: { source: { filename: "s", format: "csv" }, rowCount: 100, columns: [
+    col("sla_status", "string", 2, { topValues: [{ value: "met", count: 70 }, { value: "breached", count: 30 }], statsExact: true }),
+  ], sampleRows: [] } };
+  const used = new Map([["tickets", 5]]); // the board only uses tickets
+  const fs2 = deriveGlobalFilters([TICKETS_D, SLA_D], used);
+  assert.ok(fs2.some((f) => f.col === "status"), "governing table's category derives a select");
+  assert.ok(!fs2.some((f) => f.col === "sla_status"), "unused table's category derives NOTHING");
+  // (b) Filtered-count KPI repair: add_widget with filters, no metric → count(*).
+  const cur: DashboardSpec = { version: 1, meta: { title: "T" }, sections: [{ id: "s1", widgets: [
+    { id: "k0", kind: "kpi", title: "Total", table: "tickets", metric: { col: "", agg: "count" } } as KpiWidget ] }] };
+  const r = applyOps(structuredClone(cur), [{ op: "add_widget", widget: { title: "Open tickets", table: "tickets",
+    filters: [{ col: "status", op: "=", value: "Open" }] } } as any], "add a KPI counting only open tickets");
+  const added: any = r.spec.sections.flatMap((sc) => sc.widgets).find((w: any) => w.title === "Open tickets");
+  assert.ok(added, "widget added: " + r.rejected.join("|"));
+  assert.equal(added.kind, "kpi", "kind inferred from filters");
+  assert.deepEqual(added.metric, { col: "", agg: "count" }, "metric defaulted to count(*)");
+  // (c) Id-like aggregation guard: sum(ticket_id) over time is dropped.
+  const IDS: Dataset = { tableName: "tickets", profile: { source: { filename: "t", format: "csv" }, rowCount: 1000, columns: [
+    col("itilticketid", "integer", 1000), col("created_at", "date", 300, { min: "2026-01-01", max: "2026-06-01" }),
+  ], sampleRows: [] } };
+  const badSpec: DashboardSpec = { version: 1, meta: { title: "T" }, sections: [{ id: "s", widgets: [{
+    id: "c1", kind: "line", title: "itilticketid over time", table: "tickets",
+    x: { col: "created_at", timeGrain: "month" }, series: [{ col: "itilticketid", agg: "sum" }],
+  } as any] }] };
+  const rv = validateSpec(badSpec, [IDS]);
+  assert.equal(rv.spec.sections.length, 0, "sum of an id-like column is dropped");
+  assert.ok(rv.warnings.some((w) => w.includes("id-like")), "warning names the class");
+  console.log("pipeline: A3.1 live-incident pins (filters/repair/id-like) ✅");
+})();
+
 console.log("pipeline.test.ts: all assertions passed ✅");
