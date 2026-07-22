@@ -26,8 +26,10 @@ export function compileSpec(spec: DashboardSpec, profiles: Dataset[]): RenderPla
         return { widget: w, sql: buildKpiSql(w) };
       }
       if (w.kind === "table") {
-        const { sql } = buildTableSql(w);
-        return { widget: w, sql };
+        const { sql, cols } = buildTableSql(w);
+        // Column metadata (labels + per-column format) must reach the
+        // renderer — deriving headers from row keys loses formats (C2).
+        return { widget: w, sql, columns: cols };
       }
       const { sql, seriesKeys } = buildChartSql(w);
       return {

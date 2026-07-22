@@ -78,6 +78,9 @@ function profileColumn(name: string, column: unknown[]): ColumnProfile {
       .sort((x, y) => y[1] - x[1] || x[0].localeCompare(y[0]))
       .slice(0, 25)
       .map(([value, count]) => ({ value, count }));
+    // Uploads profile the FULL parsed file — these stats are exact, so the
+    // exhaustiveness guard may trust uniqueCount here.
+    if (counts.size <= 25) profile.statsExact = true;
   }
   if (type === "integer" || type === "number") {
     const nums = Array.from(distinct.values()).map(toNumber).filter(Number.isFinite);

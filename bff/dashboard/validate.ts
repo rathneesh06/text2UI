@@ -11,6 +11,7 @@ const NUMERIC = new Set(["integer", "number"]);
 const TEMPORAL = new Set(["date"]);
 const NUMERIC_AGGS: Agg[] = ["sum", "avg", "min", "max", "median"];
 const OPS = ["=", "!=", ">", ">=", "<", "<=", "in", "not_null", "is_null"];
+const VALUE_FORMATS = new Set(["number", "percent", "currency", "hours", "days", "compact"]);
 
 function tableIndex(profiles: Dataset[]): Map<string, ColMap> {
   const idx = new Map<string, ColMap>();
@@ -56,7 +57,12 @@ export function validateSpec(spec: DashboardSpec, profiles: Dataset[]): Validati
     const cp = pidx.get(table)?.get(f.col);
     const observed = (cp?.topValues ?? []).map((t) => String(t.value ?? ""));
     if (!cp || cp.type !== "string" || !observed.length) return f;
-    const exhaustive = cp.uniqueCount <= observed.length;
+    // Exhaustiveness is UNFORGEABLE: only a full-pass producer (exact SQL
+    // stats or full in-memory data) may set statsExact, and only then may a
+    // no-match literal be declared provably empty and dropped. A sample-floor
+    // profile (uniqueCount from 5 rows) would otherwise "prove" emptiness it
+    // never observed — the A2.8 class one layer deeper. Floors only warn.
+    const exhaustive = cp.statsExact === true && cp.uniqueCount <= observed.length;
     const fixOne = (v: unknown): { v: string; ok: boolean } => {
       const s = String(v ?? "");
       if (observed.includes(s)) return { v: s, ok: true };
@@ -95,14 +101,18 @@ export function validateSpec(spec: DashboardSpec, profiles: Dataset[]): Validati
     // A2: derived expressions — validate BOTH sides with the same rules; a bad
     // side drops the whole metric (an honest gap beats a silently-wrong ratio).
     if (m.expr) {
+      // Self-consistency: compile ignores top-level agg/col on expr metrics —
+      // backfill them so every downstream consumer (sanitizer, merge
+      // signature, patch merges) sees a well-formed metric.
+      if (!m.agg || (!NUMERIC_AGGS.includes(m.agg) && m.agg !== "count" && m.agg !== "count_distinct")) m = { ...m, agg: "count", col: m.col ?? "", expr: m.expr };
       const ops = ["ratio", "pct", "diff"];
       // REPAIR before rejecting: a missing denominator on a ratio/pct almost
       // always means "over all rows" — default it to count(*). (The live
       // "malformed expr" class was the patch model omitting den.) A missing
       // NUMERATOR is unrecoverable — we'd be inventing the metric.
-      if (m.expr.num && !m.expr.den && (m.expr.op === "ratio" || m.expr.op === "pct")) {
+      if (m.expr!.num && !m.expr!.den && (m.expr!.op === "ratio" || m.expr!.op === "pct")) {
         warn(`${where}: expr.den missing — defaulted to count(*)`);
-        m = { ...m, expr: { ...m.expr, den: { col: "", agg: "count" } } };
+        m = { ...m, expr: { ...m.expr!, den: { col: "", agg: "count" } } };
       }
       if (!ops.includes(m.expr!.op) || !m.expr!.num || !m.expr!.den) {
         warn(`${where}: malformed expr — dropped`); return null;
@@ -240,11 +250,15 @@ export function validateSpec(spec: DashboardSpec, profiles: Dataset[]): Validati
 
     if (w.kind === "table") {
       if (!Array.isArray(w.columns) || !w.columns.length) { warn(`table "${w.id}": no columns — dropped`); return null; }
-      const columns = w.columns.filter((c) => c.col && (c.agg === "count" || cols.has(c.col)));
-      if (columns.length !== w.columns.length) warn(`table "${w.id}": dropped column(s) not in ${w.table}`);
-      const groupBy = (w.groupBy ?? []).filter((g) => cols.has(g.col));
+      const columns = w.columns
+        .filter((c) => c.col && (c.agg === "count" || cols.has(c.col)))
+        .map((c) => (c.format && !VALUE_FORMATS.has(c.format) ? { ...c, format: undefined } : c))
+        .slice(0, 30); // D5b: same cap the query sanitizer enforces
+      if (columns.length !== w.columns.length && w.columns.length <= 30) warn(`table "${w.id}": dropped column(s) not in ${w.table}`);
+      const groupBy = (w.groupBy ?? []).filter((g) => cols.has(g.col)).slice(0, 5);
       if (!columns.length) { warn(`table "${w.id}": no valid columns — dropped`); return null; }
-      return { ...w, columns, groupBy };
+      const limit = Number.isInteger((w as any).limit) && (w as any).limit > 0 ? Math.min((w as any).limit, 10000) : (w as any).limit;
+      return { ...w, columns, groupBy, ...(limit !== undefined ? { limit } : {}) };
     }
 
     // chart kinds: line|bar|area|pie|donut

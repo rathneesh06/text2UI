@@ -16,6 +16,7 @@
 import { DuckDBInstance, type DuckDBConnection } from "@duckdb/node-api";
 import type { Dataset, ColumnProfile, ColumnType } from "../../shared/types";
 import { enrichColumns } from "../../shared/profile-enrich";
+import { exactColumnStats } from "./exact-stats";
 
 export interface MysqlConn {
   host: string;
@@ -349,6 +350,10 @@ export async function introspectMysql(conn: MysqlConn, opts: IntrospectOptions =
       });
 
       columns = enrichColumns(columns, sample);
+      // Full-table exact stats through the attached MySQL (DuckDB-side SQL) —
+      // without them uniqueCount is a 5-row floor and the exhaustiveness guard
+      // must stay soft; with them "provably empty" is provable (statsExact).
+      try { columns = await exactColumnStats((q2, l) => readAll(q2, l ?? "stats"), ref, columns); } catch { /* floor stands */ }
 
       datasets.push({
         tableName: name,

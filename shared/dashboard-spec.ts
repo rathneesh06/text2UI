@@ -52,6 +52,7 @@ export interface KpiWidget {
   id: string;
   kind: "kpi";
   title: string;
+  subtitle?: string;
   table: string;
   metric: Metric;
   filters?: Filter[];
@@ -176,6 +177,8 @@ export interface CompiledWidget {
   sql: string;
   /** stable result-column keys for chart series (alias → label), for the renderer. */
   seriesKeys?: { key: string; label: string; format?: ValueFormat }[];
+  /** table result columns (alias → label + per-column format), for the renderer. */
+  columns?: { key: string; label: string; format?: ValueFormat }[];
 }
 
 export interface CompiledSection {

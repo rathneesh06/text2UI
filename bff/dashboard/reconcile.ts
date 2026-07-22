@@ -31,10 +31,26 @@ export function reconcileEdit(current: DashboardSpec, next: DashboardSpec, userP
     widgets: (sec.widgets ?? []).map((w) => healWidget(w, prevById.get(w.id ?? ""), healed)),
   }));
 
-  const meta = { ...next.meta };
-  if (!meta.title?.trim() && current.meta.title) { meta.title = current.meta.title; healed.push(`title: restored "${current.meta.title}"`); }
+  // META PARITY WITH PATCH (D3): the patch path merges meta over the current
+  // meta so unmentioned fields survive; the planner re-emission must get the
+  // same protection — a model that forgets accent/insight/subtitle on a
+  // "format one KPI" edit must not reset them to defaults. Base = current
+  // meta; overlay ONLY keys the re-emission actually provided non-empty.
+  const meta = { ...current.meta } as unknown as Record<string, unknown>;
+  const nm = (next.meta ?? {}) as unknown as Record<string, unknown>;
+  for (const k of ["title", "subtitle", "insight", "theme", "accent", "chartPalette", "audience"]) {
+    const v = nm[k];
+    const provided = Array.isArray(v) ? v.length > 0 : typeof v === "string" ? v.trim().length > 0 : v !== undefined && v !== null;
+    if (provided) meta[k] = v;
+    else if ((current.meta as unknown as Record<string, unknown>)[k] !== undefined && v !== undefined) {
+      healed.push(`meta.${k}: restored from the previous version`);
+    }
+  }
 
-  const out: DashboardSpec = { ...next, meta, sections };
+  const out: DashboardSpec = { ...next, meta: meta as unknown as DashboardSpec["meta"], sections };
+  // Filters are re-derived at compile time; carrying the current set forward
+  // just keeps intermediate states consistent if compile is skipped.
+  if (!out.filters && current.filters) out.filters = current.filters;
 
   // STRUCTURAL GUARD (the gutted-board incident): the full-spec planner is a
   // re-emission of the whole dashboard, and models routinely just… forget

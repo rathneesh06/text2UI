@@ -52,7 +52,7 @@ const WIDGET = {
     metric: METRIC,
     x: DIMENSION,
     series: { type: "array", items: METRIC },
-    columns: { type: "array", items: { type: "object", properties: { col: { type: "string" }, label: { type: "string" }, agg: { type: "string", enum: ["count", "count_distinct", "sum", "avg", "min", "max", "median"] } }, required: ["col"] } },
+    columns: { type: "array", items: { type: "object", properties: { col: { type: "string" }, label: { type: "string" }, agg: { type: "string", enum: ["count", "count_distinct", "sum", "avg", "min", "max", "median"] }, format: { type: "string", enum: ["number", "percent", "currency", "hours", "days", "compact"] } }, required: ["col"] } },
     groupBy: { type: "array", items: DIMENSION },
     limit: { type: "integer" },
     sort: { type: "object", properties: { by: { type: "string" }, dir: { type: "string", enum: ["asc", "desc"] } } },

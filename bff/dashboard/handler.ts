@@ -80,6 +80,7 @@ export async function handleDashboardBuild(
   // A bare "undo"/"redo" NEVER goes to a model — the session's version stack is
   // the truth, and re-rendering a stored spec cannot drift.
   const historyIntent = currentSpec && conversationId ? detectHistoryIntent(b.userPrompt) : null;
+  const turnId = newTurnId();
   if (historyIntent) {
     const v = historyIntent === "undo" ? undo(conversationId) : redo(conversationId);
     if (!v) {
@@ -87,10 +88,14 @@ export async function handleDashboardBuild(
         summary: [historyIntent === "undo" ? "Nothing to undo — this is the earliest version I have." : "Nothing to redo — you are on the latest version."] } };
     }
     const plan = compileSpec(v.spec, datasets);
-    if (!plan.sections.length) return { status: 422, body: { error: "stored version no longer valid for this data", warnings: plan.warnings } };
+    if (!plan.sections.length) {
+      audit({ turnId, conversationId, stage: "history", detail: { intent: historyIntent, outcome: "stale-version-422", warnings: plan.warnings.slice(0, 6) } });
+      return { status: 422, body: { error: "stored version no longer valid for this data", warnings: plan.warnings } };
+    }
     const app = renderPlanToApp(plan);
     const n = cursorIndex(conversationId) + 1;
     console.log(`[dashboard] ${historyIntent} -> version ${n} ("${v.spec.meta.title}")`);
+    audit({ turnId, conversationId, stage: "history", detail: { intent: historyIntent, version: n, title: v.spec.meta.title } });
     return { status: 200, body: { app, spec: plan.spec, warnings: plan.warnings, pipeline: "history",
       summary: [`${historyIntent === "undo" ? "Reverted to" : "Restored"} version ${n} — the one from "${v.prompt.slice(0, 60)}".`] } };
   }
@@ -98,7 +103,6 @@ export async function handleDashboardBuild(
   // ---- Context Manager: the conversation reaches the edit planner -------------
   const chatContext = buildChatContext(b.history, conversationId);
 
-  const turnId = newTurnId();
   audit({ turnId, conversationId, stage: "prompt", detail: { userPrompt: String(b.userPrompt).slice(0, 500), edit: !!currentSpec, tables: datasets.map((d) => d.tableName) } });
 
   // ---- Semantic model: deterministic business abstraction over the profiles ---
@@ -122,6 +126,7 @@ export async function handleDashboardBuild(
 
   let spec: DashboardSpec | null = null;
   let pipeline: "agents" | "planner" | "patch" = "planner";
+  const degradedNotes: string[] = []; // E1: model-failure fallbacks are user-facing facts
 
   if (!currentSpec && AGENTS_ENABLED && !legacyPlannerInjected) {
     // ---- Stage 2 (builds): parallel specialist agents + deterministic merge ----
@@ -135,6 +140,13 @@ export async function handleDashboardBuild(
       deps.agentRun,
     );
     audit({ turnId, conversationId, stage: "agents", detail: { reports: harvest.reports } });
+    // E1: a fallback caused by MODEL FAILURE (error/timeout) — as opposed to
+    // an agent being inapplicable to this schema — degrades quality and must
+    // be said out loud, not buried in the audit file.
+    const failed = harvest.reports.filter((r) => r.modelFailed);
+    if (failed.length) {
+      degradedNotes.push(`AI planning was unavailable for ${failed.map((r) => r.name).join(", ")} — deterministic schema-based widgets were used instead. Re-run the request to try the model again.`);
+    }
     const merged = mergeHarvest(harvest, datasets, b.userPrompt, mergeStyle(b.brief));
     if (countWidgets(merged) > 0) { spec = merged; pipeline = "agents"; }
     else console.warn("[dashboard] agent harvest empty — falling back to the monolithic planner");
@@ -160,6 +172,7 @@ export async function handleDashboardBuild(
       const r = applyOps(currentSpec, ops, b.userPrompt, selectedWidget?.id);
       if (ops.length === 0) {
         // The model judged the request unactionable — better to say so than guess.
+        audit({ turnId, conversationId, stage: "edit_ops", detail: { applied: [], rejected: [], unactionable: true } });
         return { status: 200, body: { app: null, spec: currentSpec, warnings: [], noChange: true, pipeline: "patch",
           summary: ["I wasn't sure what to change there — could you name the widget or describe the edit more specifically?"] } };
       }
@@ -171,10 +184,21 @@ export async function handleDashboardBuild(
         return { status: 200, body: { app: null, spec: currentSpec, warnings: [], noChange: true, pipeline: "patch",
           summary: ["I couldn't apply that edit: " + r.rejected.join("; ") + ". Could you rephrase or point at the widget?"] } };
       }
+      // E2: ops "applied" can still be a NET-ZERO change (e.g. the metric
+      // identity guard reverted the only real mutation). An unchanged board
+      // must never be announced as "Updated the dashboard".
+      if (JSON.stringify(r.spec) === JSON.stringify(currentSpec)) {
+        const why = [...r.notes, ...r.rejected];
+        audit({ turnId, conversationId, stage: "edit_ops", detail: { applied: r.applied, rejected: r.rejected, notes: r.notes, netZero: true } });
+        return { status: 200, body: { app: null, spec: currentSpec, warnings: why, noChange: true, pipeline: "patch",
+          summary: ["That edit wouldn't change anything" + (why.length ? ": " + why.join("; ") : ".")] } };
+      }
       spec = r.spec;
       pipeline = "patch" as any;
-      healedNotes = r.rejected;
-      audit({ turnId, conversationId, stage: "edit_ops", detail: { applied: r.applied, rejected: r.rejected } });
+      // E3: decline-class notes (guards that kept things as they were) are
+      // user-facing facts, not internal logs — surface them with rejections.
+      healedNotes = [...r.notes, ...r.rejected];
+      audit({ turnId, conversationId, stage: "edit_ops", detail: { applied: r.applied, rejected: r.rejected, notes: r.notes } });
       if (r.rejected.length) console.log(`[dashboard] ops rejected: ${r.rejected.join(" | ")}`);
     } else {
       console.warn("[dashboard] op planning failed — falling back to full-spec edit + reconciliation");
@@ -183,7 +207,10 @@ export async function handleDashboardBuild(
   if (!spec) {
     // ---- Planner path: edit turns, kill-switch, or agent-harvest fallback ------
     spec = await runPlannerPath(planner, datasets, b.userPrompt, enhancement, currentSpec, chatContext, selectedWidget);
-    if (!spec) return { status: 502, body: { error: "planner could not produce a dashboard spec — the model call likely failed. Check the BFF logs and GEMINI_API_KEY (verify with GET /health?model=1)." } };
+    if (!spec) {
+      audit({ turnId, conversationId, stage: "reject", detail: { status: 502, reason: "planner produced no spec (model failure likely)" } });
+      return { status: 502, body: { error: "planner could not produce a dashboard spec — the model call likely failed. Check the BFF logs and GEMINI_API_KEY (verify with GET /health?model=1)." } }
+    }
     // EDIT RECONCILIATION: the previous version is the truth for everything the
     // user didn't touch — heal any kept widget the model re-emitted with missing
     // required fields, BEFORE validation gets a chance to drop it. A style-only
@@ -192,6 +219,7 @@ export async function handleDashboardBuild(
       const r = reconcileEdit(currentSpec, spec, b.userPrompt);
       spec = r.spec;
       healedNotes = r.healed;
+      if (r.healed.length) audit({ turnId, conversationId, stage: "history", detail: { reconcileHealed: r.healed.slice(0, 10) } });
       if (r.healed.length) console.log(`[dashboard] edit reconciliation healed ${r.healed.length} field(s): ${r.healed.slice(0, 4).join(" | ")}${r.healed.length > 4 ? " | …" : ""}`);
     }
   }
@@ -203,6 +231,7 @@ export async function handleDashboardBuild(
   // ---- Stage 3: validate + compile to deterministic SQL, then render ----------
   const plan = compileSpec(spec, datasets);
   if (!plan.sections.length) {
+    audit({ turnId, conversationId, stage: "reject", detail: { status: 422, reason: "no valid widgets after validation", warnings: plan.warnings.slice(0, 8) } });
     return { status: 422, body: { error: "no valid widgets after validation", warnings: plan.warnings } };
   }
 
@@ -215,7 +244,7 @@ export async function handleDashboardBuild(
   const rendered = plan.spec;
   const dropped = allWidgets(spec).length - allWidgets(rendered).length;
   if (dropped > 0) console.log(`[dashboard] validation dropped ${dropped} widget(s): ${plan.warnings.join(" | ")}`);
-  const warnings = [...healedNotes, ...plan.warnings];
+  const warnings = [...healedNotes, ...degradedNotes, ...plan.warnings];
   const summary = summarizeSpecChange(currentSpec, rendered);
   audit({ turnId, conversationId, stage: "render", detail: { pipeline, widgets: allWidgets(rendered).length, dropped, warnings: plan.warnings.slice(0, 6), sql: plan.sections.flatMap((sc: any) => sc.widgets.map((cw: any) => cw.sql)).slice(0, 30) } });
   // Diff History: every accepted version enters the conversation's undo stack.

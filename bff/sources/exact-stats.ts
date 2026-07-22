@@ -23,9 +23,10 @@ export async function exactColumnStats(
   readAll: ReadAll,
   tableRef: string,
   columns: ColumnProfile[],
-  opts: { maxDistinctForTop?: number } = {},
+  opts: { maxDistinctForTop?: number; quoteId?: (s: string) => string } = {},
 ): Promise<ColumnProfile[]> {
   const maxDistinct = opts.maxDistinctForTop ?? 50;
+  const q = opts.quoteId ?? qid; // MySQL callers pass backtick quoting
   const out = columns.map((c) => ({ ...c }));
 
   // 1. Categorical topValues + exact uniqueCount, one query per string column
@@ -35,7 +36,7 @@ export async function exactColumnStats(
     if (c.uniqueCount > maxDistinct && c.topValues === undefined) continue; // sample says id-like/free text
     try {
       const rows = await readAll(
-        `SELECT ${qid(c.name)} AS v, count(*) AS c FROM ${tableRef} WHERE ${qid(c.name)} IS NOT NULL GROUP BY 1 ORDER BY 2 DESC, 1 LIMIT ${TOP_VALUES_LIMIT + 1}`,
+        `SELECT ${q(c.name)} AS v, count(*) AS c FROM ${tableRef} WHERE ${q(c.name)} IS NOT NULL GROUP BY 1 ORDER BY 2 DESC, 1 LIMIT ${TOP_VALUES_LIMIT + 1}`,
         `topValues ${c.name}`,
       );
       if (!rows.length) continue;
@@ -45,6 +46,7 @@ export async function exactColumnStats(
         // topValues.length) is now truthful.
         c.topValues = rows.map((r) => ({ value: String(r.v), count: Number(r.c) }));
         c.uniqueCount = rows.length;
+        c.statsExact = true;
       } else {
         // More values exist than we list: keep the top slice, and make sure
         // uniqueCount says NON-exhaustive so the guard only warns, never drops.
@@ -58,8 +60,9 @@ export async function exactColumnStats(
   const ranged = out.filter((c) => c.type === "integer" || c.type === "number" || c.type === "date");
   if (ranged.length) {
     const selects = ranged.flatMap((c, i) => [
-      `min(${qid(c.name)}) AS lo${i}`,
-      `max(${qid(c.name)}) AS hi${i}`,
+      `min(${q(c.name)}) AS lo${i}`,
+      `max(${q(c.name)}) AS hi${i}`,
+      ...(c.type === "date" ? [] : [`avg(${q(c.name)}) AS av${i}`]),
     ]);
     try {
       const [row] = await readAll(`SELECT ${selects.join(", ")} FROM ${tableRef}`, "min/max sweep");
@@ -73,6 +76,8 @@ export async function exactColumnStats(
           } else {
             const nlo = Number(lo), nhi = Number(hi);
             if (Number.isFinite(nlo)) { c.min = nlo; c.max = Number.isFinite(nhi) ? nhi : nlo; }
+            const av = Number(row[`av${i}`]);
+            if (Number.isFinite(av)) c.avg = av;
           }
         });
       }

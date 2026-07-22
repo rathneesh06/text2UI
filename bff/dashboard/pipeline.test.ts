@@ -78,7 +78,7 @@ await (async () => {
   const DATA: Dataset = {
     tableName: "tickets",
     profile: { source: { filename: "t.csv", format: "csv" }, rowCount: 100, columns: [
-      col("status", "string", 3, { topValues: [{ value: "Open", count: 60 }, { value: "Closed", count: 30 }, { value: "PIR", count: 10 }] }),
+      col("status", "string", 3, { topValues: [{ value: "Open", count: 60 }, { value: "Closed", count: 30 }, { value: "PIR", count: 10 }], statsExact: true }),
       col("age_hours", "number", 50, { min: 0, max: 500 }),
     ], sampleRows: [] },
   };
@@ -127,6 +127,88 @@ await (async () => {
   assert.ok(/num\.where/.test(src) && /den\.where/.test(src), "coerceExpr carries where on BOTH sides");
   void agents;
   console.log("pipeline: agent coercion preserves where ✅");
+})();
+
+// ---- 5. UNFORGEABLE EXHAUSTIVENESS (the A3/D1/F1 completion) ----------------
+// A sample-floor profile (no statsExact) may NEVER hard-drop a literal as
+// "provably empty" — it hasn't seen the whole column. Only exact producers
+// (exact SQL stats / full-data ingest) set statsExact and earn the drop.
+{
+  const mkData = (statsExact: boolean): Dataset => ({
+    tableName: "sla",
+    profile: { source: { filename: "s.csv", format: "csv" }, rowCount: 1000, columns: [
+      col("sla_status", "string", 2, { topValues: [{ value: "met", count: 3 }, { value: "breached", count: 2 }], ...(statsExact ? { statsExact: true } : {}) }),
+    ], sampleRows: [] },
+  });
+  const mkSpec = (): DashboardSpec => ({ version: 1, meta: { title: "T" }, sections: [{ id: "s", widgets: [
+    { id: "k", kind: "kpi", title: "SLA attainment", table: "sla", metric: { col: "", agg: "count", expr: { op: "pct",
+      num: { col: "", agg: "count", where: [{ col: "sla_status", op: "=", value: "achieved" }] }, den: { col: "", agg: "count" } } } } as KpiWidget,
+  ] }] });
+
+  // Floor profile: same no-match literal only WARNS (kept) — a 5-row sample
+  // "proving" emptiness was the failure mode.
+  let r = validateSpec(mkSpec(), [mkData(false)]);
+  assert.equal(r.spec.sections.length, 1, "sample-floor profile cannot hard-drop");
+  assert.ok(r.warnings.some((w) => w.includes("not among the top observed values")), "…but it does warn");
+  // Exact profile: the drop is earned.
+  r = validateSpec(mkSpec(), [mkData(true)]);
+  assert.equal(r.spec.sections.length, 0, "exact profile drops the provably-empty condition");
+  console.log("pipeline: exhaustiveness requires statsExact ✅");
+}
+
+// ---- 6. SANITIZER ↔ COMPILE PARITY (D5a + F5) -------------------------------
+// The query path re-validates client widgets and must accept EVERYTHING the
+// build path renders — same widget in, same SQL out. The live incident: an
+// expr KPI (compile ignores top-level agg/col) was rejected by a sanitizer
+// that demanded them → rendered on build, 400ed on filter.
+await (async () => {
+  const { sanitizeWidget, buildWidgetSql } = await import("./filters");
+  const { buildKpiSql } = await import("./sql");
+  const exprKpi: any = { id: "k", kind: "kpi", title: "Rate", table: "sla", metric: {
+    // NOTE: no top-level agg/col — exactly what an edit-path model emits.
+    expr: { op: "pct", num: { col: "", agg: "count", where: [{ col: "sla_status", op: "=", value: "met" }] }, den: { col: "", agg: "count" } } } };
+  const sanitized = sanitizeWidget(exprKpi); // must NOT throw (the D5a regression)
+  const querySql = buildWidgetSql(exprKpi, []);
+  assert.ok(/FILTER \(WHERE "sla_status" = 'met'\)/.test(querySql), "query path compiles the conditional rate: " + querySql);
+  // Parity: a fully-specified widget produces identical SQL on both paths.
+  const plain: any = { id: "k2", kind: "kpi", title: "N", table: "sla", metric: { col: "", agg: "count" },
+    filters: [{ col: "sla_status", op: "=", value: "met" }] };
+  assert.equal(buildWidgetSql(plain, []), buildKpiSql(plain), "build and query paths emit identical SQL");
+  void sanitized;
+  console.log("pipeline: sanitizer ↔ compile parity ✅");
+})();
+
+// ---- 7. RENDERER FORMAT COVERAGE (C1/C2 completions) ------------------------
+// The renderer is one template literal; these are structural presence checks —
+// a format produced upstream must have a consumer in the template.
+await (async () => {
+  const fs = await import("node:fs");
+  const src = fs.readFileSync(new URL("./renderer.ts", import.meta.url), "utf8");
+  assert.ok(/tickFormatter=\{tickFmt\}/.test(src), "chart YAxis applies series format");
+  assert.ok(/formatter=\{tipFmt\}/.test(src), "chart Tooltip applies series format");
+  assert.ok(/fmt\(v, colMeta\[h\] && colMeta\[h\]\.format\)/.test(src), "table cells apply per-column format");
+  assert.ok(/No rows match the current filters/.test(src), "filter-aware empty state present");
+  for (const f of ["percent", "currency", "hours", "days", "compact"]) {
+    assert.ok(src.includes(`"${f}"`), `format "${f}" handled in fmt()`);
+  }
+  // compile must feed the table columns the renderer consumes:
+  const compileSrc = fs.readFileSync(new URL("./compile.ts", import.meta.url), "utf8");
+  assert.ok(/columns: cols/.test(compileSrc), "compile attaches table column metadata");
+  console.log("pipeline: renderer consumes every produced format ✅");
+})();
+
+// ---- 8. HONESTY CHANNEL CONTRACTS (E1/E2/E3 completions) --------------------
+await (async () => {
+  const { applyOps } = await import("./patch");
+  const cur: DashboardSpec = { version: 1, meta: { title: "T" }, sections: [{ id: "s1", widgets: [
+    { id: "k1", kind: "kpi", title: "Avg Age", table: "t", metric: { col: "age", agg: "avg" } } as KpiWidget ] }] };
+  // The metric-identity decline must land in the NOTES channel (surfaced to
+  // the user), and applying only a reverted change must be detectable as
+  // net-zero by deep-equality.
+  const r = applyOps(structuredClone(cur), [{ op: "update_widget", id: "k1", set: { metric: { col: "", agg: "count" } } } as any], "make it look nicer");
+  assert.ok(r.notes.some((n) => n.includes("kept")), "decline lands in notes");
+  assert.equal(JSON.stringify(r.spec), JSON.stringify(cur), "reverted-only edit is net-zero detectable");
+  console.log("pipeline: honesty channels (notes + net-zero) ✅");
 })();
 
 console.log("pipeline.test.ts: all assertions passed ✅");

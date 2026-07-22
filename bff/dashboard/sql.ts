@@ -4,8 +4,7 @@
 // by construction: the model picks columns/aggregations as data; the SQL grammar is
 // fixed and always valid DuckDB.
 import type {
-  Agg, Dimension, Filter, KpiWidget, ChartWidget, TableWidget, Metric, TimeGrain,
-} from "../../shared/dashboard-spec";
+  Agg, Dimension, Filter, KpiWidget, ChartWidget, TableWidget, Metric, TimeGrain, ValueFormat } from "../../shared/dashboard-spec";
 
 /** Quote an identifier for DuckDB. */
 export const qid = (s: string) => `"${String(s).replace(/"/g, '""')}"`;
@@ -115,10 +114,10 @@ export function buildChartSql(w: ChartWidget, extraWhere?: string[]): { sql: str
   return { sql, seriesKeys: keys };
 }
 
-export function buildTableSql(w: TableWidget, extraWhere?: string[]): { sql: string; cols: { key: string; label: string }[] } {
+export function buildTableSql(w: TableWidget, extraWhere?: string[]): { sql: string; cols: { key: string; label: string; format?: ValueFormat }[] } {
   const grouped = (w.groupBy?.length ?? 0) > 0;
   const selects: string[] = [];
-  const cols: { key: string; label: string }[] = [];
+  const cols: { key: string; label: string; format?: ValueFormat }[] = [];
 
   for (const g of w.groupBy ?? []) {
     const key = (g.label || g.col).toLowerCase().replace(/[^a-z0-9]+/g, "_") || g.col;
@@ -129,7 +128,7 @@ export function buildTableSql(w: TableWidget, extraWhere?: string[]): { sql: str
     const key = (c.label || c.col).toLowerCase().replace(/[^a-z0-9]+/g, "_") + `_${i}`;
     const expr = grouped && c.agg ? aggExpr(c.agg, c.col) : qid(c.col);
     selects.push(`${expr} AS ${qid(key)}`);
-    cols.push({ key, label: c.label || c.col });
+    cols.push({ key, label: c.label || c.col, ...(c.format ? { format: c.format } : {}) });
   });
 
   let sql = `SELECT ${selects.join(", ")} FROM ${qid(w.table)}${whereClause(w.filters, extraWhere)}`;

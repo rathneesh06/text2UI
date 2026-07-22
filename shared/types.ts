@@ -14,6 +14,9 @@ export interface ColumnProfile {
   avg?: number;                                   // mean, numeric columns
   nullCount?: number;                             // count of NULLs
   topValues?: { value: unknown; count: number }[]; // most frequent values, categoricals
+  statsExact?: boolean;                           // true ONLY when topValues/uniqueCount came from a
+                                                  // full pass (exact SQL or full in-memory data) —
+                                                  // the exhaustiveness guard may hard-drop only then
 }
 
 export interface DataProfile {

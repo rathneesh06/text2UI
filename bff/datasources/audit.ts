@@ -16,7 +16,7 @@ export interface AuditEvent {
   at?: string;
   turnId: string;
   conversationId?: string;
-  stage: "prompt" | "enhance" | "decompose" | "agents" | "edit_ops" | "history" | "validate" | "render" | "reject";
+  stage: "prompt" | "enhance" | "decompose" | "agents" | "edit_ops" | "history" | "validate" | "render" | "reject" | "query";
   detail: Record<string, unknown>;
 }
 

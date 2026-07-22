@@ -9,6 +9,7 @@ import { tmpdir } from "os";
 import { join } from "path";
 import type { Dataset, DataProfile, ColumnProfile, ColumnType } from "../../shared/types";
 import { enrichColumns } from "../../shared/profile-enrich";
+import { exactColumnStats } from "../sources/exact-stats";
 
 const qid = (s: string) => `"${String(s).replace(/"/g, '""')}"`;
 const qstr = (s: string) => `'${String(s).replace(/'/g, "''")}'`;
@@ -58,6 +59,8 @@ async function profileTable(conn: DuckDBConnection, table: string, format: DataP
   });
 
   columns = enrichColumns(columns, sample);
+  // We own this DuckDB — exact stats replace the 20-row floor (statsExact).
+  try { columns = await exactColumnStats((q, l) => readRows(conn, q), qid(table), columns); } catch { /* floor stands */ }
   const profile: DataProfile = {
     source: { filename: `upload:${table}`, format },  // upload: marker → never treated as colo
     rowCount: Number(rowCount ?? 0),

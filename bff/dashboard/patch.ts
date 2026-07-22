@@ -27,12 +27,13 @@ const WIDGET_FIELDS = {
   properties: {
     kind: { type: "string", enum: ["kpi", "line", "bar", "area", "pie", "donut", "table"] },
     title: { type: "string" }, subtitle: { type: "string" }, table: { type: "string" },
-    metric: { type: "object", properties: { col: { type: "string" }, agg: { type: "string" }, label: { type: "string" }, format: { type: "string" }, expr: { type: "object", properties: { op: { type: "string", enum: ["ratio", "pct", "diff"] }, num: { type: "object", properties: { col: { type: "string" }, agg: { type: "string" }, where: { type: "array", items: { type: "object", properties: { col: { type: "string" }, op: { type: "string", enum: ["=", "!=", ">", ">=", "<", "<=", "in", "not_null", "is_null"] }, value: { type: "string" } }, required: ["col", "op"] } } }, required: ["agg"] }, den: { type: "object", properties: { col: { type: "string" }, agg: { type: "string" }, where: { type: "array", items: { type: "object", properties: { col: { type: "string" }, op: { type: "string", enum: ["=", "!=", ">", ">=", "<", "<=", "in", "not_null", "is_null"] }, value: { type: "string" } }, required: ["col", "op"] } } }, required: ["agg"] } }, required: ["op", "num", "den"] } } },
-    x: { type: "object", properties: { col: { type: "string" }, timeGrain: { type: "string" }, label: { type: "string" } } },
+    metric: { type: "object", properties: { col: { type: "string" }, agg: { type: "string", enum: ["count", "count_distinct", "sum", "avg", "min", "max", "median"] }, label: { type: "string" }, format: { type: "string", enum: ["number", "percent", "currency", "hours", "days", "compact"] }, expr: { type: "object", properties: { op: { type: "string", enum: ["ratio", "pct", "diff"] }, num: { type: "object", properties: { col: { type: "string" }, agg: { type: "string" }, where: { type: "array", items: { type: "object", properties: { col: { type: "string" }, op: { type: "string", enum: ["=", "!=", ">", ">=", "<", "<=", "in", "not_null", "is_null"] }, value: { type: "string" } }, required: ["col", "op"] } } }, required: ["agg"] }, den: { type: "object", properties: { col: { type: "string" }, agg: { type: "string" }, where: { type: "array", items: { type: "object", properties: { col: { type: "string" }, op: { type: "string", enum: ["=", "!=", ">", ">=", "<", "<=", "in", "not_null", "is_null"] }, value: { type: "string" } }, required: ["col", "op"] } } }, required: ["agg"] } }, required: ["op", "num", "den"] } } },
+    x: { type: "object", properties: { col: { type: "string" }, timeGrain: { type: "string", enum: ["day", "week", "month", "quarter", "year"] }, label: { type: "string" } } },
     series: { type: "array", items: { type: "object", properties: { col: { type: "string" }, agg: { type: "string" }, label: { type: "string" }, format: { type: "string" }, expr: { type: "object", properties: { op: { type: "string", enum: ["ratio", "pct", "diff"] }, num: { type: "object", properties: { col: { type: "string" }, agg: { type: "string" }, where: { type: "array", items: { type: "object", properties: { col: { type: "string" }, op: { type: "string", enum: ["=", "!=", ">", ">=", "<", "<=", "in", "not_null", "is_null"] }, value: { type: "string" } }, required: ["col", "op"] } } }, required: ["agg"] }, den: { type: "object", properties: { col: { type: "string" }, agg: { type: "string" }, where: { type: "array", items: { type: "object", properties: { col: { type: "string" }, op: { type: "string", enum: ["=", "!=", ">", ">=", "<", "<=", "in", "not_null", "is_null"] }, value: { type: "string" } }, required: ["col", "op"] } } }, required: ["agg"] } }, required: ["op", "num", "den"] } } } },
-    columns: { type: "array", items: { type: "object", properties: { col: { type: "string" }, label: { type: "string" }, agg: { type: "string" } } } },
+    columns: { type: "array", items: { type: "object", properties: { col: { type: "string" }, label: { type: "string" }, agg: { type: "string", enum: ["count", "count_distinct", "sum", "avg", "min", "max", "median"] }, format: { type: "string", enum: ["number", "percent", "currency", "hours", "days", "compact"] } } } },
     groupBy: { type: "array", items: { type: "object", properties: { col: { type: "string" }, timeGrain: { type: "string" } } } },
     limit: { type: "integer" }, width: { type: "string", enum: ["quarter", "third", "half", "full"] },
+    sort: { type: "object", properties: { by: { type: "string" }, dir: { type: "string", enum: ["asc", "desc"] } }, required: ["by", "dir"] },
     filters: { type: "array", description: "scope this widget to a SUBSET of rows ('only open tickets'). Use EXACT observed literals.", items: { type: "object", properties: { col: { type: "string" }, op: { type: "string", enum: ["=", "!=", ">", ">=", "<", "<=", "in", "not_null", "is_null"] }, value: { type: "string" } }, required: ["col", "op"] } },
   },
 };
@@ -130,13 +131,14 @@ export async function planEditOps(input: PlanEditOpsInput, run: EditRun = callGe
 
 export const REMOVAL_INTENT = /\b(remove|delete|drop|get rid|hide|without|no more|only keep|keep only|just keep|simplif\w*|fewer|less charts?|too many)\b/i;
 
-export interface ApplyResult { spec: DashboardSpec; applied: string[]; rejected: string[] }
+export interface ApplyResult { spec: DashboardSpec; applied: string[]; rejected: string[]; notes: string[] }
 
 /** Apply ops to the current spec. Pure. Unknown ids and ungated removals are
  *  rejected with a human note instead of silently doing the wrong thing. */
 export function applyOps(current: DashboardSpec, ops: EditOp[], userPrompt: string, selectedId?: string): ApplyResult {
   const applied: string[] = [];
   const rejected: string[] = [];
+  const notes: string[] = [];
   let seq = 0;
   const spec: DashboardSpec = {
     ...current,
@@ -185,7 +187,7 @@ export function applyOps(current: DashboardSpec, ops: EditOp[], userPrompt: stri
         const colNamed = colChanged && (p.includes(String(nm.col).toLowerCase().split("_").join(" ")) || p.includes(String(nm.col).toLowerCase()));
         if ((aggChanged && !aggNamed) || (colChanged && !colNamed)) {
           nm = { ...nm, col: cur.col, agg: cur.agg };
-          applied.push(`kept "${target.title ?? op.id}" measuring ${cur.agg}(${cur.col || "*"}) — the request didn't ask to change the metric`);
+          notes.push(`kept "${target.title ?? op.id}" measuring ${cur.agg}(${cur.col || "*"}) — the request didn't ask to change the metric`);
         }
         // Metric merges FIELD-WISE: unspecified fields survive.
         set.metric = { ...cur, ...nm };
@@ -256,5 +258,5 @@ export function applyOps(current: DashboardSpec, ops: EditOp[], userPrompt: stri
   }
   // Drop sections emptied by removals.
   spec.sections = spec.sections.filter((s) => s.widgets.length > 0);
-  return { spec, applied, rejected };
+  return { spec, applied, rejected, notes };
 }

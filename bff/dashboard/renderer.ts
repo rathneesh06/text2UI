@@ -109,11 +109,17 @@ function useRows(sql, widget) {
       .catch(function (e) { if (alive) setState({ rows: null, loading: false, error: (e && e.message) || "query failed" }); });
     return function () { alive = false; };
   }, [key]);
+  state.filtered = active.length > 0;
   return state;
 }
 function Loading() { return <div className={(COMPACT ? "h-28" : "h-40") + " animate-pulse rounded-lg bg-slate-100"} />; }
 function ErrorBox(props) { return <div className="text-sm text-rose-600">Could not load: {props.msg}</div>; }
-function Empty() { return <div className="text-sm text-slate-400">No data</div>; }
+function Empty(props) {
+  // E5: 0 rows AFTER a filter is a different fact than an empty source —
+  // conflating them makes filters look broken.
+  const filtered = props && props.filtered;
+  return <div className="text-sm text-slate-400">{filtered ? "No rows match the current filters" : "No data"}</div>;
+}
 function Card(props) {
   return (
     <div className={widthClass(props.width) + CARD_CLS}>
@@ -157,6 +163,13 @@ function Chart(props) {
   const w = props.w;
   const keys = props.seriesKeys || [];
   const s = useRows(props.sql, w);
+  // C1: per-series value formats travel on seriesKeys — apply them on the
+  // axis and tooltip (a pct series must read 45.2%, not 45.2).
+  const fmtByName = {};
+  keys.forEach(function (k) { if (k.format) { fmtByName[k.key] = k.format; fmtByName[k.label] = k.format; } });
+  const axisFormat = keys.length && keys[0].format ? keys[0].format : null;
+  function tickFmt(v) { return axisFormat ? fmt(v, axisFormat) : (typeof v === "number" ? v.toLocaleString() : v); }
+  function tipFmt(value, name) { return [fmt(value, fmtByName[name] || axisFormat || undefined), name]; }
   const data = (s.rows || []).map(function (r) {
     const o = { x: fmtX(r.x) };
     keys.forEach(function (k) { o[k.key] = (r[k.key] === null || r[k.key] === undefined) ? 0 : Number(r[k.key]); });
@@ -165,7 +178,7 @@ function Chart(props) {
   function body() {
     if (s.loading) return <Loading />;
     if (s.error) return <ErrorBox msg={s.error} />;
-    if (!data.length) return <Empty />;
+    if (!data.length) return <Empty filtered={s.filtered} />;
     if (w.kind === "pie" || w.kind === "donut") {
       const k = keys[0] ? keys[0].key : "value";
       const pdata = data.map(function (d) { return { name: d.x, value: d[k] }; });
@@ -175,7 +188,7 @@ function Chart(props) {
             <Pie data={pdata} dataKey="value" nameKey="name" cx="50%" cy="50%" innerRadius={w.kind === "donut" ? PIE_R.inner : 0} outerRadius={PIE_R.outer}>
               {pdata.map(function (e, i) { return <Cell key={i} fill={COLORS[i % COLORS.length]} />; })}
             </Pie>
-            <Tooltip contentStyle={{ borderRadius: 8, border: "1px solid #e2e8f0", fontSize: 12 }} />
+            <Tooltip contentStyle={{ borderRadius: 8, border: "1px solid #e2e8f0", fontSize: 12 }} formatter={tipFmt} />
             <Legend />
           </PieChart>
         </ResponsiveContainer>
@@ -187,8 +200,8 @@ function Chart(props) {
         <Cmp data={data}>
           <CartesianGrid stroke={GRID} vertical={false} />
           <XAxis dataKey="x" tick={{ fill: TICK, fontSize: 12 }} axisLine={false} tickLine={false} />
-          <YAxis tick={{ fill: TICK, fontSize: 12 }} axisLine={false} tickLine={false} />
-          <Tooltip contentStyle={{ borderRadius: 8, border: "1px solid #e2e8f0", fontSize: 12 }} />
+          <YAxis tick={{ fill: TICK, fontSize: 12 }} axisLine={false} tickLine={false} tickFormatter={tickFmt} />
+          <Tooltip contentStyle={{ borderRadius: 8, border: "1px solid #e2e8f0", fontSize: 12 }} formatter={tipFmt} />
           {keys.length > 1 ? <Legend /> : null}
           {keys.map(function (k, i) {
             if (w.kind === "bar") {
@@ -232,15 +245,20 @@ function DataTable(props) {
   const s = useRows(props.sql, w);
   const rows = s.rows || [];
   const headers = rows.length ? Object.keys(rows[0]) : [];
+  // C2: compiled column metadata carries label + per-column format (a
+  // currency column must read $1,240, not 1240). Fall back to key-derived
+  // headers when metadata is absent (older compiled specs).
+  const colMeta = {};
+  (props.columns || []).forEach(function (c) { colMeta[c.key] = c; });
   return (
     <Card width={w.width || "full"} title={w.title} subtitle={w.subtitle}>
       <div onClick={function () { if (selectFeature) selectFeature({ id: w.id, title: w.title, type: "table", kind: "table", query: props.sql }); }}>
-      {s.loading ? <Loading /> : s.error ? <ErrorBox msg={s.error} /> : !rows.length ? <Empty /> : (
+      {s.loading ? <Loading /> : s.error ? <ErrorBox msg={s.error} /> : !rows.length ? <Empty filtered={s.filtered} /> : (
         <div className="overflow-x-auto">
           <table className="w-full text-sm">
             <thead>
               <tr className={"text-xs uppercase tracking-wide text-slate-500 border-b " + (DARK ? "border-slate-700" : "border-slate-200")}>
-                {headers.map(function (h) { return <th key={h} className="text-left py-1.5 pr-3">{prettyHeader(h)}</th>; })}
+                {headers.map(function (h) { return <th key={h} className="text-left py-1.5 pr-3">{colMeta[h] && colMeta[h].label ? colMeta[h].label : prettyHeader(h)}</th>; })}
               </tr>
             </thead>
             <tbody>
@@ -250,7 +268,7 @@ function DataTable(props) {
                     {headers.map(function (h) {
                       const v = r[h];
                       const num = typeof v === "number";
-                      return <td key={h} className={"py-1.5 pr-3 " + (num ? "text-right tabular-nums" : "")}>{num ? Number(v).toLocaleString() : fmtX(v)}</td>;
+                      return <td key={h} className={"py-1.5 pr-3 " + (num ? "text-right tabular-nums" : "")}>{num ? fmt(v, colMeta[h] && colMeta[h].format) : fmtX(v)}</td>;
                     })}
                   </tr>
                 );
@@ -312,7 +330,7 @@ function FilterBar(props) {
 function Widget(props) {
   const w = props.cw.widget;
   if (w.kind === "kpi") return <Kpi w={w} sql={props.cw.sql} idx={props.idx} />;
-  if (w.kind === "table") return <DataTable w={w} sql={props.cw.sql} />;
+  if (w.kind === "table") return <DataTable w={w} sql={props.cw.sql} columns={props.cw.columns} />;
   return <Chart w={w} sql={props.cw.sql} seriesKeys={props.cw.seriesKeys} />;
 }
 export default function App() {

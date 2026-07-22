@@ -47,6 +47,9 @@ export function enrichColumn(profile: ColumnProfile, values: unknown[]): ColumnP
       if (n > hi) hi = n;
     }
     if (lo <= hi) { out.min = lo; out.max = hi; }
+    let sum = 0, n = 0;
+    for (const v of nonNull) { const x = Number(v); if (Number.isFinite(x)) { sum += x; n++; } }
+    if (n) out.avg = sum / n;
   }
 
   if (profile.type === "date") {

@@ -37,8 +37,8 @@ const DIMENSION = { type: "object", properties: { col: { type: "string" }, timeG
 const wrap = (item: unknown) => ({ type: "object", properties: { widgets: { type: "array", items: item } }, required: ["widgets"] });
 
 const KPI_ITEM = { type: "object", properties: { title: { type: "string" }, subtitle: { type: "string", description: "short context line, e.g. 'All historical records'" }, table: { type: "string" }, metric: METRIC, filters: { type: "array", description: "scope this widget to a SUBSET of rows ('only open tickets'). Use EXACT observed literals.", items: FILTER_ITEM } }, required: ["title", "table", "metric"] };
-const CHART_ITEM = { type: "object", properties: { title: { type: "string" }, subtitle: { type: "string", description: "one line explaining what the chart shows" }, table: { type: "string" }, x: DIMENSION, series: { type: "array", items: METRIC }, limit: { type: "integer" }, kind: { type: "string", enum: ["line", "bar", "area", "pie", "donut"] }, filters: { type: "array", description: "scope this widget to a SUBSET of rows ('only open tickets'). Use EXACT observed literals.", items: FILTER_ITEM } }, required: ["title", "table", "x", "series"] };
-const TABLE_ITEM = { type: "object", properties: { title: { type: "string" }, subtitle: { type: "string" }, table: { type: "string" }, columns: { type: "array", items: { type: "object", properties: { col: { type: "string" }, label: { type: "string" }, agg: AGG }, required: ["col"] } }, groupBy: { type: "array", items: DIMENSION }, limit: { type: "integer" }, filters: { type: "array", description: "scope this widget to a SUBSET of rows ('only open tickets'). Use EXACT observed literals.", items: FILTER_ITEM } }, required: ["title", "table", "columns"] };
+const CHART_ITEM = { type: "object", properties: { title: { type: "string" }, subtitle: { type: "string", description: "one line explaining what the chart shows" }, table: { type: "string" }, x: DIMENSION, series: { type: "array", items: METRIC }, limit: { type: "integer" }, kind: { type: "string", enum: ["line", "bar", "area", "pie", "donut"] }, sort: { type: "object", description: "explicit ordering when the user asks for it (charts: by is x or y)", properties: { by: { type: "string", enum: ["x", "y"] } , dir: { type: "string", enum: ["asc", "desc"] } }, required: ["by", "dir"] }, filters: { type: "array", description: "scope this widget to a SUBSET of rows ('only open tickets'). Use EXACT observed literals.", items: FILTER_ITEM } }, required: ["title", "table", "x", "series"] };
+const TABLE_ITEM = { type: "object", properties: { title: { type: "string" }, subtitle: { type: "string" }, table: { type: "string" }, columns: { type: "array", items: { type: "object", properties: { col: { type: "string" }, label: { type: "string" }, agg: AGG, format: { type: "string", enum: ["number", "percent", "currency", "hours", "days", "compact"] } }, required: ["col"] } }, groupBy: { type: "array", items: DIMENSION }, limit: { type: "integer" }, sort: { type: "object", description: "explicit ordering when the user asks for it", properties: { by: { type: "string" }, dir: { type: "string", enum: ["asc", "desc"] } }, required: ["by", "dir"] }, filters: { type: "array", description: "scope this widget to a SUBSET of rows ('only open tickets'). Use EXACT observed literals.", items: FILTER_ITEM } }, required: ["title", "table", "columns"] };
 
 // ---------------------------------------------------------------------------
 // Prompt plumbing
@@ -126,6 +126,7 @@ function coerceCharts(parsed: any, kinds: ChartWidget["kind"][], fallbackKind: C
       x: { col: String(w.x.col), ...(w.x.timeGrain ? { timeGrain: w.x.timeGrain } : {}), ...(w.x.label ? { label: String(w.x.label) } : {}) },
       series: w.series.filter((m: any) => m?.col && m?.agg).map((m: any) => ({ col: String(m.col), agg: m.agg, label: m.label, format: m.format, ...coerceExpr(m.expr) })),
       ...(Number.isInteger(w.limit) && w.limit > 0 ? { limit: Math.min(w.limit, 50) } : {}),
+      ...((w.sort?.by === "x" || w.sort?.by === "y") && (w.sort.dir === "asc" || w.sort.dir === "desc") ? { sort: { by: w.sort.by, dir: w.sort.dir } } : {}),
       ...coerceWidgetFilters(w),
       width: "half",
     }))
@@ -137,9 +138,10 @@ function coerceTables(parsed: any): TableWidget[] {
   return arr.filter((w: any) => w?.title && w?.table && Array.isArray(w?.columns) && w.columns.length)
     .map((w: any): TableWidget => ({
       id: wid("tbl"), kind: "table", title: String(w.title), ...(w.subtitle ? { subtitle: String(w.subtitle) } : {}), table: String(w.table),
-      columns: w.columns.filter((c: any) => c?.col).map((c: any) => ({ col: String(c.col), ...(c.label ? { label: String(c.label) } : {}), ...(c.agg ? { agg: c.agg } : {}) })),
+      columns: w.columns.filter((c: any) => c?.col).map((c: any) => ({ col: String(c.col), ...(c.label ? { label: String(c.label) } : {}), ...(c.agg ? { agg: c.agg } : {}), ...(c.format ? { format: c.format } : {}) })),
       ...(Array.isArray(w.groupBy) ? { groupBy: w.groupBy.filter((g: any) => g?.col).map((g: any) => ({ col: String(g.col), ...(g.timeGrain ? { timeGrain: g.timeGrain } : {}) })) } : {}),
       limit: Number.isInteger(w.limit) && w.limit > 0 ? Math.min(w.limit, 100) : 25,
+      ...(w.sort?.by && (w.sort.dir === "asc" || w.sort.dir === "desc") ? { sort: { by: String(w.sort.by), dir: w.sort.dir } } : {}),
       ...coerceWidgetFilters(w),
       width: "full",
     }))
@@ -302,7 +304,7 @@ const TABLE_AGENT: AgentDef<TableWidget> = {
   fallback: fallbackTables,
 };
 
-export interface AgentReport { name: string; source: "model" | "fallback" | "skipped"; count: number }
+export interface AgentReport { name: string; source: "model" | "fallback" | "skipped"; count: number; modelFailed?: boolean }
 export interface AgentHarvest {
   kpis: KpiWidget[];
   trends: ChartWidget[];       // line/area
@@ -319,6 +321,8 @@ async function runAgent<T extends Widget>(
     return { widgets: [], report: { name: def.name, source: "skipped", count: 0 } };
   }
   const timeout = new Promise<null>((resolve) => setTimeout(() => resolve(null), timeoutMs));
+  let modelFailed = false; // E1: distinguish "model errored/timed out" (surface
+                           // to the user) from "model answered but unusably"
   const call = (async (): Promise<T[] | null> => {
     try {
       const { text } = await run(def.system, userPromptFor(input, def.ask, def.name), { ...ORCHESTRATE_OPTS, responseSchema: def.schema });
@@ -326,14 +330,16 @@ async function runAgent<T extends Widget>(
       return widgets.length ? widgets : null;
     } catch (err) {
       console.warn(`[agent:${def.name}] failed: ${(err as Error).message}`);
+      modelFailed = true;
       return null;
     }
   })();
-  const fromModel = await Promise.race([call, timeout]);
-  if (fromModel) return { widgets: fromModel, report: { name: def.name, source: "model", count: fromModel.length } };
+  const raced = await Promise.race([call.then((v) => ({ v, timedOut: false })), timeout.then(() => ({ v: null as T[] | null, timedOut: true }))]);
+  if (raced.timedOut) modelFailed = true;
+  if (raced.v) return { widgets: raced.v, report: { name: def.name, source: "model", count: raced.v.length } };
   const fb = def.fallback(input.datasets, roles);
-  console.log(`[agent:${def.name}] using deterministic fallback (${fb.length} widget(s))`);
-  return { widgets: fb, report: { name: def.name, source: "fallback", count: fb.length } };
+  console.log(`[agent:${def.name}] using deterministic fallback (${fb.length} widget(s))${modelFailed ? " [model failed]" : ""}`);
+  return { widgets: fb, report: { name: def.name, source: "fallback", count: fb.length, modelFailed } };
 }
 
 /** Fan out all specialist agents IN PARALLEL. Total: every agent either returns

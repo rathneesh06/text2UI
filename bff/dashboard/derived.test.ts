@@ -21,8 +21,8 @@ const TICKETS: Dataset = {
     source: { filename: "tickets.csv", format: "csv" },
     rowCount: 5,
     columns: [
-      col("agent", "string", 2, { topValues: [{ value: "Ada", count: 3 }, { value: "Bo", count: 2 }] }),
-      col("status", "string", 2, { topValues: [{ value: "open", count: 2 }, { value: "closed", count: 3 }] }),
+      col("agent", "string", 2, { topValues: [{ value: "Ada", count: 3 }, { value: "Bo", count: 2 }], statsExact: true }),
+      col("status", "string", 2, { topValues: [{ value: "open", count: 2 }, { value: "closed", count: 3 }], statsExact: true }),
       col("sla_met", "integer", 2),
       col("hours", "number", 5, { min: 0, max: 100 }), // 0..100 range: avg+percent legitimately allowed
     ],
@@ -156,7 +156,7 @@ await (async () => {
   const withInd = fallbackRatioKpi([{
     tableName: "tickets",
     profile: { source: { filename: "t.csv", format: "csv" }, rowCount: 5, columns: [
-      col("agent", "string", 2, { topValues: [{ value: "Ada", count: 3 }, { value: "Bo", count: 2 }] }),
+      col("agent", "string", 2, { topValues: [{ value: "Ada", count: 3 }, { value: "Bo", count: 2 }], statsExact: true }),
       col("sla_met", "integer", 2, { min: 0, max: 1 }),
     ], sampleRows: [] },
   }], classifySchema([TICKETS]));
@@ -182,7 +182,7 @@ await (async () => {
 
   // No indicator → rows-per-dimension ratio.
   const noInd: Dataset = { tableName: "orders", profile: { source: { filename: "o.csv", format: "csv" }, rowCount: 100, columns: [
-    col("region", "string", 4, { topValues: [{ value: "EU", count: 60 }, { value: "US", count: 40 }] }),
+    col("region", "string", 4, { topValues: [{ value: "EU", count: 60 }, { value: "US", count: 40 }], statsExact: true }),
     col("amount", "number", 90),
   ], sampleRows: [] } };
   const perDim = fallbackRatioKpi([noInd], classifySchema([noInd]));
@@ -240,7 +240,7 @@ await (async () => {
   const SLA: Dataset = {
     tableName: "sla",
     profile: { source: { filename: "sla.csv", format: "csv" }, rowCount: 5, columns: [
-      col("sla_status", "string", 2, { topValues: [{ value: "met", count: 3 }, { value: "breached", count: 2 }] }),
+      col("sla_status", "string", 2, { topValues: [{ value: "met", count: 3 }, { value: "breached", count: 2 }], statsExact: true }),
       col("actual_tat_hours", "number", 5),
     ], sampleRows: [] },
   };
@@ -345,7 +345,7 @@ await (async () => {
 const SLA_HONESTY: Dataset = {
   tableName: "sla",
   profile: { source: { filename: "sla.csv", format: "csv" }, rowCount: 7888, columns: [
-    col("sla_status", "string", 2, { topValues: [{ value: "met", count: 6000 }, { value: "breached", count: 1888 }] }),
+    col("sla_status", "string", 2, { topValues: [{ value: "met", count: 6000 }, { value: "breached", count: 1888 }], statsExact: true }),
     col("age_hours", "number", 5000, { min: -50000, max: 90000 }),
     col("csat_pct", "number", 90, { min: 0, max: 100 }),
   ], sampleRows: [] },
@@ -398,7 +398,7 @@ await (async () => {
   assert.equal(kept.metric.agg, "avg", "agg preserved — the request didn't name count");
   assert.equal(kept.metric.col, "age_hours", "column preserved");
   assert.equal(kept.metric.format, "percent", "the display field the user DID ask about is applied");
-  assert.ok(rr.applied.some((a) => a.includes("kept")), "guard is reported");
+  assert.ok(rr.notes.some((a) => a.includes("kept")), "guard is reported (E3: via the surfaced notes channel)");
   const rr2 = applyOps(structuredClone(cur), structuredClone(swap), "show it as a count of tickets instead");
   assert.equal((rr2.spec.sections[0].widgets[0] as any).metric.agg, "count", "naming the new agg allows the change");
   console.log("derived: KPI honesty (twins, fake %, metric swap) ✅");

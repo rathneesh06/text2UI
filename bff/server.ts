@@ -4,6 +4,7 @@
 // IMPORTANT: `import "dotenv/config"` must be FIRST so process.env is populated
 // before aiflow.ts reads it at module load.
 import "dotenv/config";
+import { audit } from "./datasources/audit";
 import express from "express";
 import cors from "cors";
 import { assemble, assembleSummary, assemblePlan } from "./assembler";
@@ -564,8 +565,13 @@ export async function handleDashboardQuery(
   try {
     sql = buildWidgetSql(widget, filters);
   } catch (err: any) {
+    // D6: filter-time rejections were invisible in the audit trail — a widget
+    // that renders on build but 400s on filter is exactly the class the trail
+    // exists to catch.
+    audit({ turnId: "", conversationId: String(projectId), stage: "reject", detail: { where: "dashboard/query", error: String(err?.message ?? "invalid widget or filters"), widgetKind: (widget as any)?.kind, table: (widget as any)?.table } });
     return { status: 400, body: { error: err?.message ?? "invalid widget or filters" } };
   }
+  audit({ turnId: "", conversationId: String(projectId), stage: "query", detail: { where: "dashboard/query", table: (widget as any)?.table, kind: (widget as any)?.kind, filters: Array.isArray(filters) ? filters.length : 0 } });
   return handleQuery({ projectId, sql }, tenantId, storage);
 }
 

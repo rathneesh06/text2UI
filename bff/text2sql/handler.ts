@@ -37,6 +37,8 @@ import { planSqlTurn, type PlanSqlRun, type SqlTurnPlan } from "./planner";
 import { composeAnswer, composeFallback, type ComposeRun } from "./composer";
 import type { Dataset } from "../../shared/types";
 import { enrichColumns } from "../../shared/profile-enrich";
+import { exactColumnStats } from "../sources/exact-stats";
+import { duckTypeToColumnType } from "../sources/mysql";
 
 const QUERY_MAX_ROWS = Number(process.env.T2SQL_QUERY_MAX_ROWS ?? 500);
 const ROWS_TO_CLIENT = Number(process.env.T2SQL_ROWS_TO_CLIENT ?? 200);
@@ -545,18 +547,23 @@ async function materializeFindings(
     for (let n = 2; taken.has(name); n++) name = `${viewSlug(f.question)}_${n}`;
     try {
       await h.run(`CREATE OR REPLACE VIEW main.${qid(name)} AS ${f.sql}`, 15_000, `finding view ${name}`);
-      const sample = await h.readAll(`SELECT * FROM main.${qid(name)} LIMIT 5`, `sample ${name}`);
+      const sample = await h.readAll(`SELECT * FROM main.${qid(name)} LIMIT 200`, `sample ${name}`);
       const cnt = await h.readAll(`SELECT count(*) AS n FROM main.${qid(name)}`, `count ${name}`);
+      // Real column types from DESCRIBE (typeof-sniffing collapsed dates to
+      // string → no min/max → no derived daterange filter for finding views).
+      const desc = await h.readAll(`DESCRIBE main.${qid(name)}`, `describe ${name}`).catch(() => [] as Record<string, unknown>[]);
+      const typeOf = new Map(desc.map((d) => [String((d as any).column_name), duckTypeToColumnType(String((d as any).column_type))]));
       const columns = Object.keys(sample[0] ?? {}).map((col) => ({
         name: col,
-        type: typeof sample[0]?.[col] === "number" ? "number" : "string",
+        type: typeOf.get(col) ?? (typeof sample[0]?.[col] === "number" ? "number" : "string"),
         nullable: sample.some((r) => r[col] == null),
         uniqueCount: new Set(sample.map((r) => String(r[col]))).size,
         sampleValues: sample.map((r) => r[col]).filter((v) => v != null).slice(0, 5),
       }));
       if (!columns.length) continue;
       taken.add(name);
-      const enriched = enrichColumns(columns as any, sample);
+      let enriched = enrichColumns(columns as any, sample);
+      try { enriched = await exactColumnStats((q, l) => h.readAll(q, l ?? "stats"), `main.${qid(name)}`, enriched); } catch { /* floor stands */ }
       defs.push({ name, sql: f.sql });
       out.push({
         tableName: name,

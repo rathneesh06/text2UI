@@ -284,9 +284,14 @@ const EXPR_OPS = new Set(["ratio", "pct", "diff"]);
 
 function sanMetric(m: any, what: string): Metric {
   if (!m || typeof m !== "object") badValue(`${what} must be an object`);
-  const agg = m.agg as Agg;
+  // D5a: when a valid expr is present, compile IGNORES top-level agg/col
+  // (metricExpr computes num/den only) — so the sanitizer must not demand
+  // them. Requiring agg here 400-ed every rate/ratio KPI the moment a global
+  // filter was applied, even though the same widget rendered fine on build.
+  const hasExpr = m.expr !== undefined && m.expr !== null;
+  const agg = (hasExpr && !AGGS.has(m.agg) ? "count" : m.agg) as Agg;
   if (!AGGS.has(agg)) badValue(`${what}.agg invalid`);
-  const col = agg === "count" ? String(m.col ?? "") : str(m.col, `${what}.col`);
+  const col = agg === "count" || hasExpr ? String(m.col ?? "") : str(m.col, `${what}.col`);
   const out: Metric = { col, agg };
   const label = optStr(m.label, `${what}.label`); if (label) out.label = label;
   if (m.format !== undefined) { if (!FORMATS.has(m.format)) badValue(`${what}.format invalid`); out.format = m.format; }

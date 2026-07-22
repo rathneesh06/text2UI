@@ -60,6 +60,14 @@ async function request<T>(endpoint: string, options: RequestInit = {}): Promise<
   }
   const json: any = await res.json().catch(() => ({}));
   dbg(`← ${res.status} ${url}`, json);
+  if (!res.ok && Array.isArray(json?.warnings) && json.warnings.length) {
+    // E4: the server explains WHY it failed (e.g. every widget dropped, with
+    // per-widget reasons) — a bare "HTTP 422" throws that context away.
+    const err: any = new Error(String(json.error || `HTTP ${res.status}`) + " — " + json.warnings.slice(0, 4).join("; "));
+    err.warnings = json.warnings;
+    err.status = res.status;
+    throw err;
+  }
   if (!res.ok) throw new Error(json?.error ?? `Request failed (HTTP ${res.status})`);
   return json as T;
 }
