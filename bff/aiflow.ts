@@ -6,9 +6,50 @@ import type { GeneratedApp } from "../shared/types";
 import { recordCall, type TokenUsage, ZERO_USAGE } from "./metrics";
 
 const API_KEY = process.env.GEMINI_API_KEY!;
-const MODEL = process.env.GEMINI_MODEL ?? "gemini-flash-latest";
+let MODEL = process.env.GEMINI_MODEL ?? "gemini-flash-latest";
 const MAX_OUTPUT_TOKENS = Number(process.env.GEMINI_MAX_OUTPUT_TOKENS ?? 8192);
-const API_URL = `https://generativelanguage.googleapis.com/v1beta/models/${MODEL}:generateContent`;
+const API_URL = () => `https://generativelanguage.googleapis.com/v1beta/models/${MODEL}:generateContent`;
+
+// RESILIENCE (the 2026-07 outage): Google re-points aliases and retires
+// fields between model generations. Two adaptive switches keep one Google-side
+// change from taking the whole pipeline down:
+//   THINKING_FIELD_OK — Gemini 3.x rejects the 2.x thinkingConfig shape with a
+//     bare INVALID_ARGUMENT. First 400 flips this off for the process
+//     lifetime and the request retries once without it.
+//   resolveModel()    — on model NOT_FOUND, ask ListModels what this key can
+//     actually use and pick the best flash-class match.
+let THINKING_FIELD_OK = true;
+/** Pick the best generateContent-capable model from a ListModels response:
+ *  the NEWEST stable flash (gemini-<version>-flash, no -preview/-lite/-image/
+ *  -tts suffix), falling back to the flash-latest alias, then any flash. Pure
+ *  + exported so the selection policy is unit-testable offline. */
+export function pickBestFlash(names: string[], exclude?: string): string | null {
+  const clean = names.map((n) => n.replace(/^models\//, "")).filter((n) => n !== exclude);
+  const stable = clean
+    .map((n) => ({ n, m: /^gemini-(\d+(?:\.\d+)?)-flash$/.exec(n) }))
+    .filter((x): x is { n: string; m: RegExpExecArray } => !!x.m)
+    .sort((a, b) => Number(b.m[1]) - Number(a.m[1]));
+  if (stable.length) return stable[0].n;
+  if (clean.includes("gemini-flash-latest")) return "gemini-flash-latest";
+  const anyFlash = clean.find((n) => /flash/.test(n) && !/preview|image|tts|lite|embedding/.test(n));
+  return anyFlash ?? null;
+}
+export async function resolveModel(): Promise<string | null> {
+  try {
+    const res = await fetch(`https://generativelanguage.googleapis.com/v1beta/models?key=${API_KEY}`);
+    if (!res.ok) return null;
+    const json: any = await res.json();
+    const usable = (json.models ?? [])
+      .filter((m: any) => (m.supportedGenerationMethods ?? []).includes("generateContent"))
+      .map((m: any) => String(m.name));
+    const picked = pickBestFlash(usable, MODEL);
+    if (picked) { MODEL = picked; return picked; }
+    return null;
+  } catch {
+    return null;
+  }
+}
+export const currentModel = () => MODEL;
 
 const MAX_CONTINUATIONS = 4; // stitch budget before we give up
 
@@ -45,8 +86,8 @@ function generationConfig(opts: GenOptions) {
     // thinking tokens count against maxOutputTokens on flash-class models —
     // grow the budget so reasoning never starves the actual code output.
     maxOutputTokens: MAX_OUTPUT_TOKENS + thinking,
-    thinkingConfig: { thinkingBudget: thinking },
   };
+  if (THINKING_FIELD_OK) cfg.thinkingConfig = { thinkingBudget: thinking };
   if (opts.responseMimeType) cfg.responseMimeType = opts.responseMimeType;
   if (opts.responseSchema) cfg.responseSchema = opts.responseSchema;
   return cfg;
@@ -158,13 +199,24 @@ function rateLimitMessage(bodyText: string): string {
 export async function checkModelHealth(): Promise<{ ok: boolean; detail: string }> {
   if (!API_KEY) return { ok: false, detail: "GEMINI_API_KEY is not set" };
   try {
-    const res = await fetch(API_URL, {
+    const res = await fetch(API_URL(), {
       method: "POST",
       headers: { "Content-Type": "application/json", "x-goog-api-key": API_KEY },
       body: JSON.stringify({ contents: [{ role: "user", parts: [{ text: "ping" }] }], generationConfig: { maxOutputTokens: 1 } }),
     });
-    if (res.ok) return { ok: true, detail: "model reachable" };
+    if (res.ok) return { ok: true, detail: `model reachable (${MODEL})` };
     const text = (await res.text().catch(() => "")).replace(/\s+/g, " ").slice(0, 300);
+    // MODEL AUTO-RESOLUTION: a retired/re-pointed model name is a Google-side
+    // change, not a user error — ask ListModels what this key can use, pick
+    // the best flash-class match, and re-verify once.
+    if (res.status === 404) {
+      const bad = MODEL;
+      const picked = await resolveModel();
+      if (picked) {
+        console.warn(`[gemini] model "${bad}" unavailable for this key — auto-resolved to "${picked}" (pin it in .env as GEMINI_MODEL to silence this)`);
+        return checkModelHealth();
+      }
+    }
     return { ok: false, detail: `HTTP ${res.status}: ${text}` };
   } catch (err: any) {
     return { ok: false, detail: err?.message ?? "network error" };
@@ -173,7 +225,7 @@ export async function checkModelHealth(): Promise<{ ok: boolean; detail: string 
 
 export async function callGemini(systemPrompt: string, userPrompt: string, opts: GenOptions = {}, images: ImagePart[] = []): Promise<GenResult> {
   const t0 = Date.now();
-  const body = JSON.stringify({
+  const makeBody = () => JSON.stringify({
     systemInstruction: { parts: [{ text: systemPrompt }] },
     contents: [{ role: "user", parts: buildUserParts(userPrompt, images) }],
     generationConfig: generationConfig(opts),
@@ -182,10 +234,10 @@ export async function callGemini(systemPrompt: string, userPrompt: string, opts:
   for (let attempt = 0; ; attempt++) {
     let res: Response;
     try {
-      res = await fetch(API_URL, {
+      res = await fetch(API_URL(), {
         method: "POST",
         headers: { "Content-Type": "application/json", "x-goog-api-key": API_KEY },
-        body,
+        body: makeBody(),
       });
     } catch (netErr) {
       if (attempt < MAX_RETRIES) {
@@ -204,6 +256,15 @@ export async function callGemini(systemPrompt: string, userPrompt: string, opts:
     }
 
     const text = await res.text().catch(() => "");
+    // ADAPTIVE FIELD DEGRADATION: Gemini 3.x rejects the 2.x thinkingConfig
+    // shape with a bare INVALID_ARGUMENT. Drop the field process-wide and
+    // retry this request once — one 400 self-heals instead of failing every
+    // call in the pipeline.
+    if (res.status === 400 && THINKING_FIELD_OK && /INVALID_ARGUMENT/.test(text)) {
+      THINKING_FIELD_OK = false;
+      console.warn(`[gemini] 400 INVALID_ARGUMENT with thinkingConfig — dropping the field for this process (model ${MODEL}) and retrying`);
+      continue;
+    }
     if (RETRY_STATUSES.has(res.status) && attempt < MAX_RETRIES) {
       // On 429, prefer Gemini's own suggested delay. If it's longer than our cap,
       // the quota won't reset soon — don't hang; fall through and surface it now.
@@ -301,7 +362,7 @@ export async function planApp(
      { type: "progress",     chars }            cumulative size so far
    The caller (the BFF's SSE route) forwards these to the browser. */
 
-const STREAM_URL = `https://generativelanguage.googleapis.com/v1beta/models/${MODEL}:streamGenerateContent?alt=sse`;
+const STREAM_URL = () => `https://generativelanguage.googleapis.com/v1beta/models/${MODEL}:streamGenerateContent?alt=sse`;
 
 export type GenEvent =
   | { type: "stage"; stage: "planning" | "model_call" | "continuation" | "validating" | "styling"; detail?: string }
@@ -328,7 +389,7 @@ export async function callGeminiStream(
   opts: GenOptions = {},
   images: ImagePart[] = [],
 ): Promise<GenResult> {
-  const body = JSON.stringify({
+  const makeBody = () => JSON.stringify({
     systemInstruction: { parts: [{ text: systemPrompt }] },
     contents: [{ role: "user", parts: buildUserParts(userPrompt, images) }],
     generationConfig: generationConfig(opts),
@@ -337,10 +398,10 @@ export async function callGeminiStream(
   for (let attempt = 0; ; attempt++) {
     let res: Response;
     try {
-      res = await fetch(STREAM_URL, {
+      res = await fetch(STREAM_URL(), {
         method: "POST",
         headers: { "Content-Type": "application/json", "x-goog-api-key": API_KEY },
-        body,
+        body: makeBody(),
       });
     } catch (netErr) {
       if (attempt < MAX_RETRIES) {
@@ -353,6 +414,11 @@ export async function callGeminiStream(
 
     if (!res.ok) {
       const text = await res.text().catch(() => "");
+      if (res.status === 400 && THINKING_FIELD_OK && /INVALID_ARGUMENT/.test(text)) {
+        THINKING_FIELD_OK = false;
+        console.warn(`[gemini] 400 INVALID_ARGUMENT with thinkingConfig (stream) — dropping the field for this process and retrying`);
+        continue;
+      }
       if (RETRY_STATUSES.has(res.status) && attempt < MAX_RETRIES) {
         const suggested = res.status === 429 ? parseRetryDelayMs(text) : null;
         if (suggested == null || suggested <= RATE_CAP_MS) {

@@ -211,4 +211,20 @@ await (async () => {
   console.log("pipeline: honesty channels (notes + net-zero) ✅");
 })();
 
+// ---- 9. MODEL RESILIENCE POLICY (the 2026-07 Google-side outage) ------------
+// Google retired gemini-2.5-flash for new keys (404) and re-pointed the
+// flash-latest alias to a generation that rejects the 2.x thinkingConfig
+// (bare 400 INVALID_ARGUMENT on EVERY call). The policy under test: model
+// selection is dynamic (newest stable flash from ListModels), and the
+// selection function is pure so this never needs a network to verify.
+await (async () => {
+  const { pickBestFlash } = await import("../aiflow");
+  const listed = ["models/gemini-2.5-flash", "models/gemini-flash-latest", "models/gemini-3.5-flash",
+    "models/gemini-3.6-flash", "models/gemini-3.1-flash-lite", "models/gemini-3-flash-preview"];
+  assert.equal(pickBestFlash(listed), "gemini-3.6-flash", "newest stable flash wins over aliases/previews/lites");
+  assert.equal(pickBestFlash(listed, "gemini-3.6-flash"), "gemini-3.5-flash", "a failed model is excluded from re-selection");
+  assert.equal(pickBestFlash(["models/gemini-flash-latest"]), "gemini-flash-latest", "alias fallback");
+  console.log("pipeline: model auto-resolution policy ✅");
+})();
+
 console.log("pipeline.test.ts: all assertions passed ✅");
