@@ -36,6 +36,7 @@ import { runAnalystLoop, formatEvidenceDirective, compactEvidence, type AnalystR
 import { planSqlTurn, type PlanSqlRun, type SqlTurnPlan } from "./planner";
 import { composeAnswer, composeFallback, type ComposeRun } from "./composer";
 import type { Dataset } from "../../shared/types";
+import { enrichColumns } from "../../shared/profile-enrich";
 
 const QUERY_MAX_ROWS = Number(process.env.T2SQL_QUERY_MAX_ROWS ?? 500);
 const ROWS_TO_CLIENT = Number(process.env.T2SQL_ROWS_TO_CLIENT ?? 200);
@@ -555,13 +556,14 @@ async function materializeFindings(
       }));
       if (!columns.length) continue;
       taken.add(name);
+      const enriched = enrichColumns(columns as any, sample);
       defs.push({ name, sql: f.sql });
       out.push({
         tableName: name,
         profile: {
           source: { filename: `live finding: ${f.id}`, format: "json" },
           rowCount: Number((cnt[0] as any)?.n ?? sample.length),
-          columns: columns as any,
+          columns: enriched as any,
           sampleRows: sample,
         },
       } as Dataset);

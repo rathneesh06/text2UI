@@ -15,6 +15,7 @@
 // ATTACH connection string), and we never log or return the password.
 import { DuckDBInstance, type DuckDBConnection } from "@duckdb/node-api";
 import type { Dataset, ColumnProfile, ColumnType } from "../../shared/types";
+import { enrichColumns } from "../../shared/profile-enrich";
 
 export interface MysqlConn {
   host: string;
@@ -336,7 +337,7 @@ export async function introspectMysql(conn: MysqlConn, opts: IntrospectOptions =
       }
       if (windowInfo) log(`  ${name}: ${windowInfo} → ~${(windowedCount ?? sample.length).toLocaleString()} rows`);
 
-      const columns: ColumnProfile[] = cols.map(({ col, type }) => {
+      let columns: ColumnProfile[] = cols.map(({ col, type }) => {
         const values = sample.map((r) => r[col]).filter((v) => v !== null && v !== undefined);
         return {
           name: col,
@@ -346,6 +347,8 @@ export async function introspectMysql(conn: MysqlConn, opts: IntrospectOptions =
           sampleValues: values.slice(0, 5),
         };
       });
+
+      columns = enrichColumns(columns, sample);
 
       datasets.push({
         tableName: name,

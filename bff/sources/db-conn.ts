@@ -19,6 +19,8 @@ import {
 } from "./mysql";
 export type { AttachHandle } from "./mysql"; // engine-agnostic façade re-export (tests + callers)
 import type { ColumnProfile, Dataset } from "../../shared/types";
+import { enrichColumns } from "../../shared/profile-enrich";
+import { exactColumnStats } from "./exact-stats";
 
 export type Dialect = "mysql" | "postgres";
 
@@ -359,7 +361,7 @@ async function introspectPostgres(conn: DbConn, opts: IntrospectOptions = {}): P
         warnings.push(`sample failed for ${t.name}: ${(e as Error).message}`);
       }
       const cols = colsByTable.get(key(t.schema, t.table)) ?? [];
-      const columns: ColumnProfile[] = cols.map(({ col, type }) => {
+      let columns: ColumnProfile[] = cols.map(({ col, type }) => {
         const values = sample.map((r) => r[col]).filter((v) => v !== null && v !== undefined);
         return {
           name: col,
@@ -369,6 +371,8 @@ async function introspectPostgres(conn: DbConn, opts: IntrospectOptions = {}): P
           sampleValues: values.slice(0, 5),
         };
       });
+      columns = enrichColumns(columns, sample);
+      try { columns = await exactColumnStats((q, l) => readAll(q, l ?? "stats"), t.ref, columns); } catch { /* sample floor stands */ }
       datasets.push({
         tableName: t.name,
         profile: {
@@ -473,7 +477,7 @@ export async function snapshotFromHandle(
     if (rowCount >= rowCap) warnings.push(`${want}: hit ${rowCap.toLocaleString()} row cap`);
     const sample = await readAll(`SELECT * FROM ${dest} LIMIT ${sampleN}`, `sample ${want}`);
     const described = await readAll(`DESCRIBE ${dest}`, `describe ${want}`);
-    const columns: ColumnProfile[] = described.map((d) => {
+    let columns: ColumnProfile[] = described.map((d) => {
       const col = String((d as any).column_name);
       const values = sample.map((r) => r[col]).filter((v) => v !== null && v !== undefined);
       return {
@@ -484,6 +488,8 @@ export async function snapshotFromHandle(
         sampleValues: values.slice(0, 5),
       };
     });
+    columns = enrichColumns(columns, sample);
+    try { columns = await exactColumnStats((q, l) => readAll(q, l ?? "stats"), dest, columns); } catch { /* sample floor stands */ }
     datasets.push({
       tableName: local,
       profile: {

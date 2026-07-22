@@ -120,6 +120,28 @@ export function baselineInstructions(datasets: Dataset[], userPrompt: string, cu
   else parts.push("No temporal column exists — do NOT plan line/area trend charts; use bar/pie breakdowns instead.");
   if (roles.dimensions.length) parts.push(`Dimensions for breakdowns (cardinality in brackets): ${li(roles.dimensions, (r) => `${r.table}.${r.col.name} [${r.col.uniqueCount}]`)}.`);
   else parts.push("No low-cardinality dimension exists — favor KPIs, trends, and detail tables over categorical charts.");
+  // OBSERVED VALUES — the single highest-leverage fact for correct conditional
+  // metrics: filters and expr numerators must use these EXACT literals (the
+  // "0.0% SLA attainment" class = the model guessing "met" when the data says
+  // otherwise; equality on a guessed literal matches zero rows).
+  const valueLines: string[] = [];
+  for (const d of datasets) {
+    for (const c of d.profile.columns) {
+      if (!c.topValues?.length || c.type !== "string") continue;
+      const total = c.topValues.reduce((n, t) => n + t.count, 0) || 1;
+      const shown = c.topValues.slice(0, 8).map((t) => {
+        const pctShare = Math.round((t.count / total) * 100);
+        return pctShare >= 1 ? `"${String(t.value)}" (${pctShare}%)` : `"${String(t.value)}"`;
+      });
+      const more = c.topValues.length > 8 ? `, +${c.topValues.length - 8} more` : "";
+      valueLines.push(`${d.tableName}.${c.name}: ${shown.join(", ")}${more}`);
+      if (valueLines.length >= 14) break;
+    }
+    if (valueLines.length >= 14) break;
+  }
+  if (valueLines.length) {
+    parts.push(`OBSERVED CATEGORY VALUES — conditions and expr numerators MUST use these exact literals (equality is case-sensitive; a guessed spelling matches zero rows): ${valueLines.join("; ")}.`);
+  }
   if (roles.identifiers.length) parts.push(`Identifiers (use count_distinct for volume KPIs, never sum): ${li(roles.identifiers, (r) => `${r.table}.${r.col.name}`)}.`);
 
   const totalRows = datasets.reduce((n, d) => n + d.profile.rowCount, 0);

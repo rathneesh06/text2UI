@@ -64,6 +64,21 @@ function profileColumn(name: string, column: unknown[]): ColumnProfile {
     uniqueCount: distinct.size,
     sampleValues: Array.from(distinct.values()).slice(0, 5),
   };
+  if (type === "string" && distinct.size >= 1 && distinct.size <= 50) {
+    // topValues: the observed category values + counts (full pass — uploads
+    // are fully in memory, so this is EXACT). Feeds select filters, the
+    // observed-value guard, and the model's literal choices.
+    const counts = new Map<string, number>();
+    for (const v of column) {
+      if (isBlank(v)) continue;
+      const key = String(v);
+      counts.set(key, (counts.get(key) ?? 0) + 1);
+    }
+    profile.topValues = [...counts.entries()]
+      .sort((x, y) => y[1] - x[1] || x[0].localeCompare(y[0]))
+      .slice(0, 25)
+      .map(([value, count]) => ({ value, count }));
+  }
   if (type === "integer" || type === "number") {
     const nums = Array.from(distinct.values()).map(toNumber).filter(Number.isFinite);
     if (nums.length) { profile.min = Math.min(...nums); profile.max = Math.max(...nums); }

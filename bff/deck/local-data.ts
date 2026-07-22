@@ -8,6 +8,7 @@ import { writeFileSync, mkdtempSync, rmSync } from "fs";
 import { tmpdir } from "os";
 import { join } from "path";
 import type { Dataset, DataProfile, ColumnProfile, ColumnType } from "../../shared/types";
+import { enrichColumns } from "../../shared/profile-enrich";
 
 const qid = (s: string) => `"${String(s).replace(/"/g, '""')}"`;
 const qstr = (s: string) => `'${String(s).replace(/'/g, "''")}'`;
@@ -45,7 +46,7 @@ async function profileTable(conn: DuckDBConnection, table: string, format: DataP
     : {};
   const sample = await readRows(conn, `SELECT * FROM ${qid(table)} LIMIT 20`);
 
-  const columns: ColumnProfile[] = desc.map((d) => {
+  let columns: ColumnProfile[] = desc.map((d) => {
     const name = String(d.column_name);
     return {
       name,
@@ -56,6 +57,7 @@ async function profileTable(conn: DuckDBConnection, table: string, format: DataP
     };
   });
 
+  columns = enrichColumns(columns, sample);
   const profile: DataProfile = {
     source: { filename: `upload:${table}`, format },  // upload: marker → never treated as colo
     rowCount: Number(rowCount ?? 0),

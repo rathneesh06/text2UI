@@ -12,6 +12,7 @@ import { mkdirSync } from "node:fs";
 import { dirname } from "node:path";
 import { attachMysql, qstr, qid, duckTypeToColumnType, type MysqlConn } from "./mysql";
 import type { Dataset, ColumnProfile } from "../../shared/types";
+import { enrichColumns } from "../../shared/profile-enrich";
 
 const bt = (s: string) => "`" + String(s).replace(/`/g, "``") + "`"; // MySQL identifier
 
@@ -143,7 +144,7 @@ export async function snapshotMysql(conn: MysqlConn, opts: SnapshotOptions): Pro
     return rows.map((r) => ({ col: String((r as any).col), type: String((r as any).type) }));
   };
   const profileFrom = (local: string, cols: Col[], sample: Record<string, unknown>[], rowCount: number, label: string): Dataset => {
-    const columns: ColumnProfile[] = cols.map(({ col, type }) => {
+    let columns: ColumnProfile[] = cols.map(({ col, type }) => {
       const values = sample.map((r) => r[col]).filter((v) => v !== null && v !== undefined);
       return {
         name: col, type: duckTypeToColumnType(type),
@@ -151,6 +152,7 @@ export async function snapshotMysql(conn: MysqlConn, opts: SnapshotOptions): Pro
         uniqueCount: new Set(values.map((v) => String(v))).size, sampleValues: values.slice(0, 5),
       };
     });
+    columns = enrichColumns(columns, sample);
     return { tableName: local, profile: { source: { filename: label, format: "json" }, rowCount, columns, sampleRows: sample } };
   };
 
