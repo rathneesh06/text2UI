@@ -249,11 +249,17 @@ await (async () => {
     sections: [{ id: "s", widgets: [{ id: "k1", kind: "kpi", title: "SLA", table: "sla", metric }] }],
   });
 
-  // (a) The live incident: identical sides → dropped with the degenerate warning.
+  // (a) OPEN-GRAMMAR: identical sides with no conditions are UNWRAPPED to the
+  // plain aggregate — the tautological 100% is still impossible to render, but
+  // the widget survives with an honest number.
   const degenerate: Metric = { col: "", agg: "count",
     expr: { op: "pct", num: { col: "", agg: "count" }, den: { col: "", agg: "count" } } };
   let r = validateSpec(mkSpec(degenerate), [SLA]);
-  assert.equal(r.spec.sections.length, 0, "count(*)/count(*) pct is dropped");
+  assert.equal(r.spec.sections.length, 1, "count(*)/count(*) pct is repaired, not dropped");
+  const unwrapped = (r.spec.sections[0].widgets[0] as KpiWidget).metric;
+  assert.equal(unwrapped.expr, undefined, "expr unwrapped — no ratio remains");
+  assert.equal(unwrapped.agg, "count", "…to the plain numerator aggregate");
+  assert.notEqual(unwrapped.format, "percent", "…never displayed as a percent");
   assert.ok(r.warnings.some((w) => w.includes("degenerate")), "warned as degenerate: " + r.warnings.join(" | "));
 
   // (a2) The live edit incident: patch model omitted den entirely → REPAIRED
@@ -287,8 +293,14 @@ await (async () => {
     num: { col: "", agg: "count", where: [{ col: "sla_status", op: "=", value: "achieved" }] },
     den: { col: "", agg: "count" } } };
   r = validateSpec(mkSpec(guessedWrong), [SLA]);
-  assert.equal(r.spec.sections.length, 0, "provably-empty condition drops the metric (no fake 0%)");
-  assert.ok(r.warnings.some((w) => w.includes("matches NO observed value")), "drop names the reason: " + r.warnings.join(" | "));
+  // OPEN-GRAMMAR: the condition is kept and the rate renders its true value —
+  // 0% is the honest answer to "share where sla_status='achieved'" when no row
+  // matches — with a warning naming the observed values. The 0.0% INCIDENT
+  // class (a silent, unexplained guessed-literal zero) stays pinned dead by the
+  // rewrite above plus the mandatory explanation here.
+  assert.equal(r.spec.sections.length, 1, "provably-empty condition renders honestly");
+  assert.ok(r.warnings.some((w) => w.includes("matches NO observed value")), "warning names the observed values");
+
 
   // (b) The real rate: conditional numerator survives validation…
   const real: Metric = { col: "", agg: "count", expr: { op: "pct",
@@ -367,12 +379,16 @@ await (async () => {
   const withExpr: any = { ...k(""), metric: { col: "", agg: "count", expr: { op: "pct", num: { col: "", agg: "count", where: [{ col: "sla_status", op: "=", value: "met" }] }, den: { col: "", agg: "count" } } } };
   assert.notEqual(widgetSignature(k("")), widgetSignature(withExpr), "an expr KPI is a different question than a plain count");
 
-  // (i) title honesty: rate-titled count drops; the same title with a real expr lives.
+  // (i) title honesty, OPEN-GRAMMAR form: a rate-titled count is RETITLED to
+  // what it computes — the number survives, the screen never claims a rate it
+  // didn't compute. The same title with a real expr lives untouched.
   const mk = (title: string, metric: Metric): DashboardSpec => ({ version: 1, meta: { title: "T" },
     sections: [{ id: "s", widgets: [{ id: "k1", kind: "kpi", title, table: "sla", metric }] }] });
   let r = validateSpec(mk("SLA Breach Rate", { col: "", agg: "count" }), [SLA_HONESTY]);
-  assert.equal(r.spec.sections.length, 0, "rate-titled count is dropped");
-  assert.ok(r.warnings.some((w) => w.includes("titled as a rate")), "warning names the mismatch");
+  assert.equal(r.spec.sections.length, 1, "rate-titled count is repaired, not dropped");
+  const retitled = r.spec.sections[0].widgets[0] as KpiWidget;
+  assert.ok(!/\b(rate|ratio|percent)/i.test(retitled.title), "repaired title no longer claims a rate: " + retitled.title);
+  assert.ok(r.warnings.some((w) => w.includes("titled as a rate") && w.includes("retitled")), "warning names the mismatch and the retitle");
   r = validateSpec(mk("SLA Attainment Rate", { col: "", agg: "count", expr: { op: "pct",
     num: { col: "", agg: "count", where: [{ col: "sla_status", op: "=", value: "met" }] }, den: { col: "", agg: "count" } } }), [SLA_HONESTY]);
   assert.equal(r.spec.sections.length, 1, "rate-titled real ratio lives");

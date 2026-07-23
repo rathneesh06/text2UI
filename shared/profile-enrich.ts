@@ -14,9 +14,9 @@
 // to this.
 import type { ColumnProfile } from "./types";
 
-export const TOP_VALUES_LIMIT = 25;
+export const TOP_VALUES_LIMIT = 50;
 /** Only track topValues for string columns whose distinct count stays sane. */
-export const TOP_VALUES_MAX_DISTINCT = 50;
+export const TOP_VALUES_MAX_DISTINCT = 100;
 
 /** Enrich one column profile from its (sampled or full) values. Mutates a COPY. */
 export function enrichColumn(profile: ColumnProfile, values: unknown[]): ColumnProfile {

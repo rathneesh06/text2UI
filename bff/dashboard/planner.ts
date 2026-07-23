@@ -14,7 +14,7 @@ const PLAN_TIMEOUT_MS = Number(process.env.DASHBOARD_PLANNER_TIMEOUT_MS ?? 20000
 
 // Compact OpenAPI-subset schema. Widgets are a single permissive object (Gemini does
 // not handle discriminated unions well); we normalize/validate in code afterwards.
-const FILTER_ITEM = { type: "object", properties: { col: { type: "string" }, op: { type: "string", enum: ["=", "!=", ">", ">=", "<", "<=", "in", "not_null", "is_null"] }, value: { type: "string", description: "literal value; pass numbers as strings" } }, required: ["col", "op"] };
+const FILTER_ITEM = { type: "object", properties: { col: { type: "string" }, op: { type: "string", enum: ["=", "!=", ">", ">=", "<", "<=", "in", "not_in", "between", "contains", "not_null", "is_null"] }, value: { type: "string", description: "literal value; pass numbers as strings. For contains: the substring to search" }, values: { type: "array", items: { type: "string" }, description: "for in/not_in: the list; for between: exactly [lo, hi]" } }, required: ["col", "op"] };
 const BASE_METRIC = {
   type: "object",
   properties: { col: { type: "string" }, agg: { type: "string", enum: ["count", "count_distinct", "sum", "avg", "min", "max", "median"] }, where: { type: "array", items: FILTER_ITEM } },
@@ -134,7 +134,7 @@ Rules:
 
 On an EDIT turn you are given the CURRENT spec. Return the FULL updated spec, changing as little as possible: keep existing widget ids and untouched widgets exactly, and apply only what the user asked.
 CONVERSATION AWARENESS (edit turns): when a CONVERSATION section is provided, resolve references through it — "the chart we added", "like before", "the same color as earlier", "no, the OTHER one" all point at things said or done in prior turns. When a SELECTED WIDGET is provided, that is the user's "this"/"that"/"it": apply the edit to that exact widget (match its id) unless the user clearly names a different one. Never reinterpret the whole dashboard because of a reference you cannot resolve — leave unclear things unchanged.
-To show a SUBSET of rows ("only open tickets", "P1 only"), set widget.filters: [{col,op,value}] with EXACT observed literals — never bake the subset into the title alone. To show a column from a RELATED table (e.g. tickets by status NAME when tickets only carries status_id), set widget.join = {table, on:[baseCol, refCol]} — allowed ONLY for relationships the digest lists as VERIFIED; any other join is rejected.
+To show a SUBSET of rows ("only open tickets", "P1 only"), set widget.filters: [{col,op,value}] with EXACT observed literals — never bake the subset into the title alone. Ops beyond equality: contains (substring match, value = the text), in/not_in (values = the list), between (values = exactly [lo, hi] — dates as YYYY-MM-DD). To show a column from a RELATED table (e.g. tickets by status NAME when tickets only carries status_id), set widget.join = {table, on:[baseCol, refCol]} — prefer relationships the digest lists as VERIFIED; a plausible unlisted join is measured against the live data and kept only if it proves out.
 `;
 
 function schemaText(datasets: Dataset[]): string {

@@ -22,8 +22,12 @@ import type {
 import { qid, buildKpiSql, buildChartSql, buildTableSql } from "./sql";
 
 // ---- limits (bound query size; injection is handled by escaping, these guard cost)
-const MAX_OPTIONS = 25;          // choices surfaced per select filter
-const MAX_SELECT_FILTERS = 2;    // categorical filters in the bar
+const envInt = (name: string, dflt: number) => {
+  const n = Number(process.env[name]);
+  return Number.isFinite(n) && n > 0 ? Math.floor(n) : dflt;
+};
+const MAX_OPTIONS = envInt("T2UI_FILTER_MAX_OPTIONS", 50);          // choices surfaced per select filter
+const MAX_SELECT_FILTERS = envInt("T2UI_FILTER_MAX_SELECTS", 4);    // categorical filters in the bar
 const MAX_VALUE_LEN = 500;       // one literal
 const MAX_MULTI_VALUES = 50;     // IN-list size
 const MAX_APPLIED = 10;          // filters per query
@@ -278,7 +282,7 @@ const KINDS = new Set(["kpi", "line", "bar", "area", "pie", "donut", "table"]);
 const AGGS = new Set<Agg>(["count", "count_distinct", "sum", "avg", "min", "max", "median"]);
 const GRAINS = new Set<TimeGrain>(["day", "week", "month", "quarter", "year"]);
 const FORMATS = new Set<ValueFormat>(["number", "compact", "percent", "currency", "hours", "days"]);
-const OPS = new Set<FilterOp>(["=", "!=", ">", ">=", "<", "<=", "in", "not_null", "is_null"]);
+const OPS = new Set<FilterOp>(["=", "!=", ">", ">=", "<", "<=", "in", "not_in", "between", "contains", "not_null", "is_null"]);
 
 function str(v: unknown, what: string, max = 200): string {
   if (typeof v !== "string" || !v.length) badValue(`${what} must be a non-empty string`);
@@ -360,10 +364,13 @@ function sanFilters(f: any): Filter[] | undefined {
     const op = x.op as FilterOp;
     if (!OPS.has(op)) badValue(`filters[${i}].op invalid`);
     const out: Filter = { col: str(x.col, `filters[${i}].col`), op };
-    if (op === "in") {
+    if (op === "in" || op === "not_in") {
       const arr = Array.isArray(x.value) ? x.value : [x.value];
       if (arr.length > MAX_MULTI_VALUES) badValue(`filters[${i}] IN list too long`);
       out.value = arr.map((v: unknown, j: number) => scalar(v, `filters[${i}].value[${j}]`)) as any;
+    } else if (op === "between") {
+      if (!Array.isArray(x.value) || x.value.length !== 2) badValue(`filters[${i}] between needs [lo, hi]`);
+      out.value = x.value.map((v: unknown, j: number) => scalar(v, `filters[${i}].value[${j}]`)) as any;
     } else if (op !== "is_null" && op !== "not_null") {
       out.value = scalar(x.value, `filters[${i}].value`);
     }

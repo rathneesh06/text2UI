@@ -7,9 +7,13 @@ import type { Dataset } from "../../shared/types";
 import type { DashboardSpec, Widget, ChartWidget, KpiWidget, TableWidget, Section } from "../../shared/dashboard-spec";
 import type { AgentHarvest } from "./agents";
 
-const MAX_KPIS = 6;
-const MAX_CHARTS = 8;
-const MAX_TABLES = 2;
+const envInt = (name: string, dflt: number) => {
+  const n = Number(process.env[name]);
+  return Number.isFinite(n) && n > 0 ? Math.floor(n) : dflt;
+};
+const MAX_KPIS = envInt("T2UI_MAX_KPIS", 8);
+const MAX_CHARTS = envInt("T2UI_MAX_CHARTS", 12);
+const MAX_TABLES = envInt("T2UI_MAX_TABLES", 3);
 
 export const DEFAULT_PALETTE = ["#7c3aed", "#06b6d4", "#f59e0b", "#10b981", "#f43f5e", "#3b82f6"];
 

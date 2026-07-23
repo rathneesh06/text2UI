@@ -78,14 +78,29 @@ export function dimExpr(d: Dimension): string {
   return qcol(d.col);
 }
 
+/** ILIKE pattern literal for `contains`: the VALUE's own %/_/\ are escaped so
+ *  user text can never smuggle wildcards; the surrounding %…% are ours. */
+function likeLit(v: unknown): string {
+  const escaped = String(v ?? "").replace(/\\/g, "\\\\").replace(/%/g, "\\%").replace(/_/g, "\\_");
+  return lit(`%${escaped}%`);
+}
+
 function oneFilter(f: Filter): string {
   const c = qcol(f.col);
   switch (f.op) {
     case "is_null": return `${c} IS NULL`;
     case "not_null": return `${c} IS NOT NULL`;
-    case "in": {
+    case "contains": return `CAST(${c} AS VARCHAR) ILIKE ${likeLit(f.value)} ESCAPE '\\'`;
+    case "between": {
+      const arr = Array.isArray(f.value) ? f.value : [];
+      if (arr.length !== 2) return "1=1"; // validation enforces the pair; never compile a half-range
+      return `${c} BETWEEN ${lit(arr[0])} AND ${lit(arr[1])}`;
+    }
+    case "in": case "not_in": {
       const arr = Array.isArray(f.value) ? f.value : [f.value as any];
-      return arr.length ? `${c} IN (${arr.map(lit).join(", ")})` : "1=1";
+      if (!arr.length) return "1=1";
+      const neg = f.op === "not_in" ? " NOT" : "";
+      return `${c}${neg} IN (${arr.map(lit).join(", ")})`;
     }
     case "=": case "!=": case ">": case ">=": case "<": case "<=":
       return `${c} ${f.op} ${lit(f.value)}`;

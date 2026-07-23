@@ -38,6 +38,7 @@ import { pushVersion, undo, redo, decisionsText, detectHistoryIntent, cursorInde
 import { reconcileEdit } from "./reconcile";
 import { planEditOps, applyOps } from "./patch";
 import { renderPlanToApp } from "./renderer";
+import { verifySpecJoins, type ReadAll } from "../sources/relationships";
 
 // Re-exported so existing imports/tests keep working after the brief helpers
 // moved into the enhancement layer where they belong.
@@ -51,6 +52,10 @@ export interface HandlerDeps {
   agentRun?: AgentRun;
   /** injectable for tests: skip the enhancement layer's LLM rewrite */
   skipRewrite?: boolean;
+  /** OPEN-GRAMMAR: a guarded query handle for this project. When present,
+   *  model-proposed joins not already verified are MEASURED at build time
+   *  (uniqueness + containment proofs) before validation judges them. */
+  readAll?: ReadAll;
 }
 
 export async function handleDashboardBuild(
@@ -227,6 +232,17 @@ export async function handleDashboardBuild(
   // Vibrancy guarantee: never ship on drab defaults.
   if (!spec.meta.chartPalette?.length) spec.meta.chartPalette = DEFAULT_PALETTE;
   if (!spec.meta.accent || !HEX_RE.test(spec.meta.accent)) spec.meta.accent = spec.meta.chartPalette[0];
+
+  // ---- Stage 2.9: measure-on-demand join verification --------------------------
+  // The verified-edge law stands; this turns "rejected because unmeasured" into
+  // "proven or refuted right now" whenever we own a query handle.
+  if (deps.readAll) {
+    try {
+      const jv = await verifySpecJoins(spec, datasets, deps.readAll);
+      if (jv.measured) audit({ turnId, conversationId, stage: "validate", detail: { joinMeasuredOnDemand: jv.measured, proven: jv.proven } });
+      if (jv.proven.length) console.log(`[dashboard] measured-on-demand: proved ${jv.proven.length} join edge(s)`);
+    } catch { /* best-effort — validation falls back to the existing rejection */ }
+  }
 
   // ---- Stage 3: validate + compile to deterministic SQL, then render ----------
   const plan = compileSpec(spec, datasets);

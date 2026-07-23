@@ -24,7 +24,10 @@ const qid = (s: string) => `"${String(s).replace(/"/g, '""')}"`;
  *  ≤0.5% orphans still proves the relationship for lookup-join purposes. */
 const ORPHAN_TOLERANCE = 0.005;
 /** Don't measure absurdly large right sides — a lookup table isn't 5M rows. */
-const MAX_REF_ROWS = 500_000;
+const MAX_REF_ROWS = (() => {
+  const n = Number(process.env.T2UI_JOIN_MAX_REF_ROWS);
+  return Number.isFinite(n) && n > 0 ? Math.floor(n) : 5_000_000;
+})();
 
 /** Prove (or refute) one candidate edge by querying the actual data. */
 export interface MeasureOpts {
@@ -64,6 +67,56 @@ export async function measureCandidate(
   } catch {
     return null;
   }
+}
+
+/** OPEN-GRAMMAR: measure-on-demand for MODEL-PROPOSED joins. The verified-edge
+ *  law is unchanged — widget.join compiles only against proven edges — but a
+ *  proposed edge that was never measured at profiling time now gets its proof
+ *  attempted AT BUILD TIME instead of being rejected outright. Proven → the
+ *  edge joins the base profile's foreignKeys (this turn's datasets, in place)
+ *  and validation accepts it; refuted or unmeasurable → validation drops it
+ *  with the existing note. Requires a query handle; without one, behavior is
+ *  exactly as before. */
+export async function verifySpecJoins(
+  spec: { sections: Array<{ widgets: any[] }> },
+  datasets: Dataset[],
+  readAll: ReadAll | undefined,
+  opts: MeasureOpts = {},
+): Promise<{ measured: number; proven: ForeignKeyEdge[] }> {
+  const proven: ForeignKeyEdge[] = [];
+  if (!readAll) return { measured: 0, proven };
+  const byName = new Map(datasets.map((d) => [d.tableName, d]));
+  const tried = new Set<string>();
+  let measured = 0;
+  for (const sec of spec.sections ?? []) {
+    for (const w of sec.widgets ?? []) {
+      const j = w?.join;
+      if (!j?.table || !Array.isArray(j.on) || j.on.length !== 2) continue;
+      const base = byName.get(String(w.table));
+      const ref = byName.get(String(j.table));
+      if (!base || !ref) continue;
+      const [lc, rc] = [String(j.on[0]), String(j.on[1])];
+      const key = [w.table, lc, j.table, rc].join("|");
+      if (tried.has(key)) continue;
+      tried.add(key);
+      const existing = base.profile.foreignKeys ?? [];
+      if (existing.some((e) => e.col === lc && e.refTable === String(j.table) && e.refCol === rc)) continue;
+      // columns must exist before we spend a query on the proof
+      if (!base.profile.columns.some((c) => c.name === lc) || !ref.profile.columns.some((c) => c.name === rc)) continue;
+      measured++;
+      const edge = await measureCandidate(
+        readAll,
+        { leftTable: String(w.table), leftCol: lc, rightTable: String(j.table), rightCol: rc, confidence: "medium", reason: "model-proposed (measured on demand)" },
+        ref.profile.rowCount,
+        opts,
+      );
+      if (edge) {
+        base.profile.foreignKeys = [...existing, edge];
+        proven.push(edge);
+      }
+    }
+  }
+  return { measured, proven };
 }
 
 /** Candidate edges = the semantic layer's name-heuristics PLUS a direct

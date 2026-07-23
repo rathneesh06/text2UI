@@ -28,7 +28,7 @@ const AGENT_TIMEOUT_MS = Number(process.env.DASHBOARD_AGENT_TIMEOUT_MS ?? 15000)
 // ---------------------------------------------------------------------------
 const AGG = { type: "string", enum: ["count", "count_distinct", "sum", "avg", "min", "max", "median"] };
 const FORMAT = { type: "string", enum: ["number", "compact", "percent", "currency", "hours", "days"] };
-const FILTER_ITEM = { type: "object", properties: { col: { type: "string" }, op: { type: "string", enum: ["=", "!=", ">", ">=", "<", "<=", "in", "not_null", "is_null"] }, value: { type: "string", description: "literal value; pass numbers as strings" } }, required: ["col", "op"] };
+const FILTER_ITEM = { type: "object", properties: { col: { type: "string" }, op: { type: "string", enum: ["=", "!=", ">", ">=", "<", "<=", "in", "not_in", "between", "contains", "not_null", "is_null"] }, value: { type: "string", description: "literal value; pass numbers as strings. For contains: the substring to search" }, values: { type: "array", items: { type: "string" }, description: "for in/not_in: the list; for between: exactly [lo, hi]" } }, required: ["col", "op"] };
 const BASE_METRIC = { type: "object", properties: { col: { type: "string" }, agg: AGG, where: { type: "array", description: "conditions making this side CONDITIONAL, e.g. count where sla_status='met'", items: FILTER_ITEM } }, required: ["col", "agg"] };
 const METRIC_EXPR = { type: "object", description: "derived metric: ratio=num/den, pct=num/den*100, diff=num-den. Use for rates, percentages, per-X averages. num and den MUST differ (identical sides = a meaningless constant 100%); make the numerator conditional with where when the qualifying rows are marked by a column value. NEVER label a plain sum as a percent.", properties: { op: { type: "string", enum: ["ratio", "pct", "diff"] }, num: BASE_METRIC, den: BASE_METRIC }, required: ["op", "num", "den"] };
 const METRIC = { type: "object", properties: { col: { type: "string" }, agg: AGG, label: { type: "string" }, format: FORMAT, expr: METRIC_EXPR }, required: ["col", "agg"] };
@@ -50,7 +50,7 @@ function schemaText(datasets: Dataset[]): string {
   }).join("\n");
 }
 
-const COMMON = `Give every widget a human title and a one-line subtitle that explains what it shows. You output ONLY the requested JSON. Ground every choice in columns that exist in the data profile — never invent a column or table. Follow the baseline instructions and analytical directive when given. To show a SUBSET of rows ("only open tickets", "P1 only"), set widget.filters: [{col,op,value}] with EXACT observed literals — never bake the subset into the title alone. To show a column from a RELATED table (e.g. tickets by status NAME when tickets only carries status_id), set widget.join = {table, on:[baseCol, refCol]} — allowed ONLY for relationships the digest lists as VERIFIED; any other join is rejected.`;
+const COMMON = `Give every widget a human title and a one-line subtitle that explains what it shows. You output ONLY the requested JSON. Ground every choice in columns that exist in the data profile — never invent a column or table. Follow the baseline instructions and analytical directive when given. To show a SUBSET of rows ("only open tickets", "P1 only"), set widget.filters: [{col,op,value}] with EXACT observed literals — never bake the subset into the title alone. Ops beyond equality: contains (substring match, value = the text), in/not_in (values = the list), between (values = exactly [lo, hi] — dates as YYYY-MM-DD). To show a column from a RELATED table (e.g. tickets by status NAME when tickets only carries status_id), set widget.join = {table, on:[baseCol, refCol]} — prefer relationships the digest lists as VERIFIED; a plausible unlisted join is measured against the live data and kept only if it proves out.`;
 
 export interface AgentInput {
   datasets: Dataset[];
@@ -89,12 +89,24 @@ const wid = (p: string) => `${p}${++seq}_${Math.random().toString(36).slice(2, 6
 // collapses a conditional rate (count FILTER (WHERE status='met') / count) into
 // the degenerate count/count, which the guard then rightly kills. That exact
 // strip is why builds kept losing their SLA KPI.
-const COERCE_OPS = new Set(["=", "!=", ">", ">=", "<", "<=", "in", "not_null", "is_null"]);
+const COERCE_OPS = new Set(["=", "!=", ">", ">=", "<", "<=", "in", "not_in", "between", "contains", "not_null", "is_null"]);
 function coerceWhere(w: any): { where?: Filter[] } {
   if (!Array.isArray(w)) return {};
   const kept = w
     .filter((f: any) => f && typeof f.col === "string" && f.col && COERCE_OPS.has(f.op))
-    .map((f: any): Filter => ({ col: String(f.col), op: f.op, ...(f.value !== undefined ? { value: f.value } : {}) }));
+    .map((f: any): Filter | null => {
+      // `values` (array) is how the schemas express list ops; fold it into the
+      // Filter value shape. A between without exactly [lo, hi] is unusable.
+      const vals = Array.isArray(f.values) ? f.values : undefined;
+      if (f.op === "between") {
+        const pair = vals ?? (Array.isArray(f.value) ? f.value : undefined);
+        if (!pair || pair.length !== 2) return null;
+        return { col: String(f.col), op: f.op, value: [pair[0], pair[1]] };
+      }
+      if ((f.op === "in" || f.op === "not_in") && vals) return { col: String(f.col), op: f.op, value: vals };
+      return { col: String(f.col), op: f.op, ...(f.value !== undefined ? { value: f.value } : {}) };
+    })
+    .filter((f): f is Filter => !!f);
   return kept.length ? { where: kept } : {};
 }
 function coerceExpr(e: any): { expr?: import("../../shared/dashboard-spec").MetricExpr } {

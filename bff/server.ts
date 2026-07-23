@@ -898,7 +898,18 @@ export function createServer() {
     if (convId) {
       try { history = await store.getHistory(convId, 20); } catch { /* memory best-effort */ }
     }
-    const { status, body } = await handleDashboardBuild({ ...(req.body as any), history });
+    const buildBody = { ...(req.body as any), history };
+    // OPEN-GRAMMAR: hand the build a guarded query handle (rides handleQuery's
+    // read-only/caps/timeout routing) so proposed joins can be proven on demand.
+    const pid = typeof (buildBody as any).projectId === "string" ? (buildBody as any).projectId : "";
+    const readAll = pid && PROJECT_ID_RE.test(pid)
+      ? async (sql: string) => {
+          const r = await handleQuery({ projectId: pid, sql }, req.tenantId ?? DEV_TENANT);
+          if (r.status !== 200 || !Array.isArray((r.body as any)?.rows)) throw new Error((r.body as any)?.error ?? "query failed");
+          return (r.body as any).rows as Record<string, unknown>[];
+        }
+      : undefined;
+    const { status, body } = await handleDashboardBuild(buildBody, { readAll });
     if (status === 200 && convId) {
       try {
         const prompt = String((req.body as any).userPrompt ?? "");

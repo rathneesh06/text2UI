@@ -7,13 +7,14 @@
 export type Agg = "count" | "count_distinct" | "sum" | "avg" | "min" | "max" | "median";
 export type TimeGrain = "day" | "week" | "month" | "quarter" | "year";
 export type ValueFormat = "number" | "compact" | "percent" | "currency" | "hours" | "days";
-export type FilterOp = "=" | "!=" | ">" | ">=" | "<" | "<=" | "in" | "not_null" | "is_null";
+export type FilterOp = "=" | "!=" | ">" | ">=" | "<" | "<=" | "in" | "not_in" | "between" | "contains" | "not_null" | "is_null";
 export type WidgetWidth = "quarter" | "third" | "half" | "full";
 
 export interface Filter {
   col: string;
   op: FilterOp;
-  /** omitted for is_null / not_null; array for `in`. */
+  /** omitted for is_null / not_null; array for `in`/`not_in`; [lo, hi] pair
+   *  for `between`; substring text for `contains` (compiles to escaped ILIKE). */
   value?: string | number | boolean | Array<string | number>;
 }
 

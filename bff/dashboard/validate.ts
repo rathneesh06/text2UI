@@ -10,7 +10,7 @@ type ColMap = Map<string, string>; // colName -> profile type (integer|number|bo
 const NUMERIC = new Set(["integer", "number"]);
 const TEMPORAL = new Set(["date"]);
 const NUMERIC_AGGS: Agg[] = ["sum", "avg", "min", "max", "median"];
-const OPS = ["=", "!=", ">", ">=", "<", "<=", "in", "not_null", "is_null"];
+const OPS = ["=", "!=", ">", ">=", "<", "<=", "in", "not_in", "between", "contains", "not_null", "is_null"];
 const VALUE_FORMATS = new Set(["number", "percent", "currency", "hours", "days", "compact"]);
 
 function tableIndex(profiles: Dataset[]): Map<string, ColMap> {
@@ -53,7 +53,31 @@ export function validateSpec(spec: DashboardSpec, profiles: Dataset[]): Validati
   // no match while topValues are EXHAUSTIVE (uniqueCount ≤ observed count)
   // → the condition is provably empty → signal drop. Non-exhaustive columns
   // only warn, since the value may legitimately live outside the top values.
-  const checkValues = (table: string, f: Filter, where: string): Filter | null => {
+  // OPEN-GRAMMAR: normalize the schemas' `values` array into the Filter value
+  // shape (agents coerce this already; the raw-pass planner and patch merges may
+  // not), and shape-check the pair/scalar ops. Returns null only for structurally
+  // unusable conditions (a half `between`, an empty `contains`), never for
+  // data-content reasons — content issues annotate and render.
+  const normalizeFilter = (f: Filter, where: string): Filter | null => {
+    const vals = Array.isArray((f as any).values) ? (f as any).values : undefined;
+    let out: Filter = { col: f.col, op: f.op, ...(f.value !== undefined ? { value: f.value } : {}) };
+    if (f.op === "between") {
+      const pair = vals ?? (Array.isArray(f.value) ? f.value : undefined);
+      if (!pair || pair.length !== 2) { warn(`${where}: between needs exactly [lo, hi] — condition unusable`); return null; }
+      out = { ...out, value: [pair[0], pair[1]] as any };
+    } else if ((f.op === "in" || f.op === "not_in") && vals && !Array.isArray(f.value)) {
+      out = { ...out, value: vals as any };
+    } else if (f.op === "contains") {
+      const v = Array.isArray(f.value) ? f.value[0] : f.value ?? (vals ? vals[0] : undefined);
+      if (v === undefined || String(v) === "") { warn(`${where}: contains needs a search text — condition unusable`); return null; }
+      out = { ...out, value: String(v) };
+    }
+    return out;
+  };
+
+  const checkValues = (table: string, f0: Filter, where: string): Filter | null => {
+    const f = normalizeFilter(f0, where);
+    if (f === null) return null;
     if (f.op !== "=" && f.op !== "in") return f;
     const cp = pidx.get(table)?.get(f.col);
     const observed = (cp?.topValues ?? []).map((t) => String(t.value ?? ""));
@@ -78,8 +102,10 @@ export function validateSpec(spec: DashboardSpec, profiles: Dataset[]): Validati
       const r = fixOne(f.value);
       if (r.ok) return { ...f, value: r.v };
       if (exhaustive) {
-        warn(`${where}: "${f.col}" = "${String(f.value)}" matches NO observed value (observed: ${observed.slice(0, 8).join(", ")}) — dropped to avoid a structurally-zero result`);
-        return null;
+        // OPEN-GRAMMAR: the question stays askable — render the honest zero/empty
+        // result instead of dropping the widget, and say why it is empty.
+        warn(`${where}: "${f.col}" = "${String(f.value)}" matches NO observed value (observed: ${observed.slice(0, 8).join(", ")}) — rendered honestly; expect an empty/zero result`);
+        return f;
       }
       warn(`${where}: "${f.col}" = "${String(f.value)}" is not among the top observed values — result may be empty`);
       return f;
@@ -88,12 +114,10 @@ export function validateSpec(spec: DashboardSpec, profiles: Dataset[]): Validati
     const arr = (Array.isArray(f.value) ? f.value : [f.value]).map(fixOne);
     const kept = arr.filter((r) => r.ok).map((r) => r.v);
     const missed = arr.filter((r) => !r.ok).map((r) => r.v);
-    if (missed.length && exhaustive) warn(`${where}: IN values [${missed.join(", ")}] match no observed value — removed`);
-    const final = exhaustive ? kept : [...kept, ...missed];
-    if (!final.length) {
-      warn(`${where}: IN list has no valid values (observed: ${observed.slice(0, 8).join(", ")}) — dropped`);
-      return null;
-    }
+    if (missed.length && exhaustive) warn(`${where}: IN values [${missed.join(", ")}] match no observed value — kept; they will match no rows`);
+    // OPEN-GRAMMAR: keep even provably-missing IN values — the compiled IN
+    // simply matches nothing for them, and the warning above names the facts.
+    const final = [...kept, ...missed];
     return { ...f, value: final as any };
   };
 
@@ -157,8 +181,19 @@ export function validateSpec(spec: DashboardSpec, profiles: Dataset[]): Validati
       if ((ex.op === "ratio" || ex.op === "pct")
         && num.agg === den.agg && num.col === den.col
         && JSON.stringify(num.where ?? []) === JSON.stringify(den.where ?? [])) {
-        warn(`${where}: degenerate ${ex.op} — numerator equals denominator (always ${ex.op === "pct" ? "100%" : "1"}). Use a conditional numerator (where) to express a real rate — dropped`);
-        return null;
+        // OPEN-GRAMMAR repair: identical sides are structurally constant. With a
+        // condition on both sides, the plausible intent was "share of all rows" —
+        // keep the conditional numerator over count(*). With no condition anywhere,
+        // unwrap to the numerator's plain aggregate. Either way the widget
+        // survives and the tautological 100% stays impossible to render.
+        if (num.where && num.where.length) {
+          warn(`${where}: degenerate ${ex.op} — numerator equals denominator; denominator repaired to count(*) (share of all rows)`);
+          const rm: Metric = { ...m, expr: { op: ex.op, num, den: { col: "", agg: "count" } } };
+          if (ex.op === "pct" && !rm.format) rm.format = "percent";
+          return rm;
+        }
+        warn(`${where}: degenerate ${ex.op} — numerator equals denominator (always ${ex.op === "pct" ? "100%" : "1"}); unwrapped to the plain ${num.agg} value`);
+        return { col: num.col, agg: num.agg, ...(m.label ? { label: m.label } : {}), format: "number" };
       }
       const out: Metric = { ...m, expr: { op: ex.op, num, den } };
       // pct means "this IS a percentage" — make the display format agree.
@@ -177,8 +212,10 @@ export function validateSpec(spec: DashboardSpec, profiles: Dataset[]): Validati
       const idName = /(^|_)id$/i.test(m.col);
       const idCard = cp2 && rows > 20 && cp2.type === "integer" && cp2.uniqueCount >= rows * 0.9;
       if (cp2 && (idName || idCard)) {
-        warn(`${where}: ${m.agg}("${m.col}") aggregates an id-like column — the result is meaningless. Use count/count_distinct, or a real measure — dropped`);
-        return null;
+        // OPEN-GRAMMAR repair: the question ("how many X") is answerable — the
+        // meaningless sum/avg of ids is not. count_distinct preserves both.
+        warn(`${where}: ${m.agg}("${m.col}") aggregates an id-like column — repaired to count_distinct("${m.col}")`);
+        return { ...m, agg: "count_distinct", ...(m.format === "percent" ? { format: "number" as const } : {}) };
       }
     }
     // A2 guard: the fake-percent class ("5559.0%") = an additive aggregate
@@ -298,8 +335,13 @@ export function validateSpec(spec: DashboardSpec, profiles: Dataset[]): Validati
       const RATEISH = /\b(rate|percentage|percent|share|ratio|attainment|compliance)\b|%/i;
       const additive = m.agg === "count" || m.agg === "count_distinct" || m.agg === "sum";
       if (!m.expr && additive && RATEISH.test(String(w.title ?? ""))) {
-        warn(`kpi "${w.id}" ("${w.title}"): titled as a rate but computes ${m.agg}(${m.col || "*"}) — a plain ${m.agg === "sum" ? "sum" : "count"}, not a rate. Use expr {op:"pct"|"ratio"} with a conditional numerator, or retitle — dropped`);
-        return null;
+        // OPEN-GRAMMAR repair: fix the LABEL to match the number instead of
+        // dropping the number. The screen never claims a rate it didn't compute.
+        const honest = m.label
+          ? m.label
+          : m.agg === "sum" ? `Total ${m.col}` : m.agg === "count_distinct" ? `Distinct ${m.col}` : `Total records`;
+        warn(`kpi "${w.id}" ("${w.title}"): titled as a rate but computes ${m.agg}(${m.col || "*"}) — retitled to "${honest}". Use expr {op:"pct"} with a conditional numerator for a real rate`);
+        return { ...w, title: honest, metric: m };
       }
       return { ...w, metric: m };
     }

@@ -99,11 +99,12 @@ await (async () => {
   assert.equal(((r.spec.sections[0].widgets[0] as any).filters[0] as Filter).value, "Open", "literal rewritten");
   assert.ok(r.warnings.some((w) => w.includes("rewritten to observed value")), "rewrite warned");
 
-  // Provably-empty subset (exhaustive topValues, no match): widget DROPS —
-  // an honest gap instead of a silently-wrong-or-empty widget.
+  // OPEN-GRAMMAR: a provably-empty subset RENDERS honestly (the true answer is
+  // zero) with a warning naming the observed values — the question stays askable.
   r = validateSpec(mk([{ col: "status", op: "=", value: "Reopened" }]), [DATA]);
-  assert.equal(r.spec.sections.length, 0, "provably-empty subset drops the widget");
-  assert.ok(r.warnings.some((w) => w.includes("matches NO observed value")), "drop names observed values");
+  assert.equal(r.spec.sections.length, 1, "provably-empty subset renders honestly");
+  assert.equal(((r.spec.sections[0].widgets[0] as any).filters[0] as Filter).value, "Reopened", "literal kept as asked");
+  assert.ok(r.warnings.some((w) => w.includes("matches NO observed value") && w.includes("rendered honestly")), "warning names observed values and the honest-empty outcome");
 
   // Nonexistent column: drop with a warning (would be broken SQL at runtime).
   r = validateSpec(mk([{ col: "not_a_column", op: "=", value: "x" }]), [DATA]);
@@ -150,9 +151,12 @@ await (async () => {
   let r = validateSpec(mkSpec(), [mkData(false)]);
   assert.equal(r.spec.sections.length, 1, "sample-floor profile cannot hard-drop");
   assert.ok(r.warnings.some((w) => w.includes("not among the top observed values")), "…but it does warn");
-  // Exact profile: the drop is earned.
+  // Exact profile: the STRONG claim ("matches NO observed value") is earned —
+  // and under OPEN-GRAMMAR the widget still renders its honest zero, so the
+  // statsExact gate now governs the WORDING of the warning, not a drop.
   r = validateSpec(mkSpec(), [mkData(true)]);
-  assert.equal(r.spec.sections.length, 0, "exact profile drops the provably-empty condition");
+  assert.equal(r.spec.sections.length, 1, "exact profile renders honestly too");
+  assert.ok(r.warnings.some((w) => w.includes("matches NO observed value")), "exact profile earns the provably-empty wording");
   console.log("pipeline: exhaustiveness requires statsExact ✅");
 }
 
@@ -261,9 +265,106 @@ await (async () => {
     x: { col: "created_at", timeGrain: "month" }, series: [{ col: "itilticketid", agg: "sum" }],
   } as any] }] };
   const rv = validateSpec(badSpec, [IDS]);
-  assert.equal(rv.spec.sections.length, 0, "sum of an id-like column is dropped");
-  assert.ok(rv.warnings.some((w) => w.includes("id-like")), "warning names the class");
+  // OPEN-GRAMMAR: the widget survives, repaired to a meaningful count_distinct —
+  // the garbage 1M-scale sum stays impossible, the question stays answered.
+  assert.equal(rv.spec.sections.length, 1, "id-like aggregation is repaired, not dropped");
+  const rw: any = rv.spec.sections[0].widgets[0];
+  assert.equal(rw.series[0].agg, "count_distinct", "sum(id) repaired to count_distinct(id)");
+  assert.ok(rv.warnings.some((w) => w.includes("id-like") && w.includes("repaired")), "warning names the class and the repair");
   console.log("pipeline: A3.1 live-incident pins (filters/repair/id-like) ✅");
+})();
+
+
+// ---- 11. OPEN-GRAMMAR OPS: three-surface symmetry + compiled shapes ---------
+await (async () => {
+  const NEW_OPS = ["contains", "not_in", "between"];
+  const fs = await import("node:fs");
+  const read = (f: string) => fs.readFileSync(new URL(f, import.meta.url), "utf8");
+  // (a) every surface that enumerates ops enumerates the NEW ops too — a
+  // capability added to one layer must exist everywhere (the symmetry law).
+  for (const file of ["../../shared/dashboard-spec.ts", "./agents.ts", "./planner.ts", "./patch.ts", "./filters.ts", "./validate.ts"]) {
+    const src = read(file);
+    for (const op of NEW_OPS) assert.ok(src.includes(`"${op}"`), `${file} knows op ${op}`);
+  }
+  // (b) the schemas expose `values` (array) so list ops are expressible in
+  // structured output, and the agent coercer folds it into the Filter shape.
+  for (const file of ["./agents.ts", "./planner.ts", "./patch.ts"]) {
+    assert.ok(/values: \{ type: "array"/.test(read(file)), `${file} schema has values[]`);
+  }
+  // (c) compiled shapes — executed grammar, not just presence.
+  const { buildKpiSql: kpiSql } = await import("./sql");
+  const mkW = (filters: Filter[]): KpiWidget =>
+    ({ id: "k", kind: "kpi", title: "T", table: "t", metric: { col: "", agg: "count" }, filters });
+  let sql = kpiSql(mkW([{ col: "notes", op: "contains", value: "50%_off\\'x" }]));
+  assert.ok(/ILIKE '%50\\%\\_off\\\\''x%' ESCAPE/.test(sql), "contains escapes %/_/\\ and quotes: " + sql);
+  sql = kpiSql(mkW([{ col: "status", op: "not_in", value: ["Open", "Closed"] }]));
+  assert.ok(/"status" NOT IN \('Open', 'Closed'\)/.test(sql), "not_in compiles: " + sql);
+  sql = kpiSql(mkW([{ col: "age", op: "between", value: [1, 10] }]));
+  assert.ok(/"age" BETWEEN 1 AND 10/.test(sql), "between compiles: " + sql);
+  sql = kpiSql(mkW([{ col: "age", op: "between", value: [1] as any }]));
+  assert.ok(/1=1/.test(sql) && !/BETWEEN/.test(sql), "half between never compiles a range: " + sql);
+  // (d) validation normalizes the schemas' values[] field (raw-pass planner /
+  // patch merges) and shape-checks the pair ops.
+  const DATA: Dataset = { tableName: "t", profile: { source: { filename: "t", format: "csv" }, rowCount: 50, columns: [
+    col("status", "string", 3, { topValues: [{ value: "Open", count: 30 }, { value: "Closed", count: 20 }], statsExact: true }),
+    col("age", "integer", 40), col("notes", "string", 45),
+  ], sampleRows: [] } };
+  const mkSpec = (f: any): DashboardSpec => ({ version: 1, meta: { title: "T" },
+    sections: [{ id: "s", widgets: [{ id: "k", kind: "kpi", title: "T", table: "t", metric: { col: "", agg: "count" }, filters: [f] } as KpiWidget] }] });
+  let r = validateSpec(mkSpec({ col: "status", op: "not_in", values: ["Open"] }), [DATA]);
+  assert.equal(((r.spec.sections[0].widgets[0] as any).filters[0] as Filter).op, "not_in", "values[] normalized for not_in");
+  assert.deepEqual(((r.spec.sections[0].widgets[0] as any).filters[0] as Filter).value, ["Open"], "values folded into value");
+  r = validateSpec(mkSpec({ col: "age", op: "between", values: ["1", "10"] }), [DATA]);
+  assert.deepEqual(((r.spec.sections[0].widgets[0] as any).filters[0] as Filter).value, ["1", "10"], "between pair normalized");
+  r = validateSpec(mkSpec({ col: "age", op: "between", values: ["1"] }), [DATA]);
+  assert.equal(r.spec.sections.length, 0, "half between is structurally unusable — widget dropped with the fix named");
+  assert.ok(r.warnings.some((w) => w.includes("between needs exactly")), "warning names the shape");
+  // (e) the sanitizer accepts the new ops (bridge parity with build-time).
+  const { sanitizeWidget } = await import("./filters");
+  const sw: any = sanitizeWidget({ id: "k", kind: "kpi", title: "T", table: "t", metric: { col: "", agg: "count" },
+    filters: [{ col: "notes", op: "contains", value: "refund" }, { col: "age", op: "between", value: [1, 10] }, { col: "status", op: "not_in", value: ["Open"] }] });
+  assert.equal(sw.filters.length, 3, "sanitizer passes all three new ops");
+  assert.throws(() => sanitizeWidget({ id: "k", kind: "kpi", title: "T", table: "t", metric: { col: "", agg: "count" },
+    filters: [{ col: "age", op: "between", value: [1] }] }), /between needs/, "sanitizer rejects a half between");
+  console.log("pipeline: open-grammar ops symmetric + compiled ✅");
+})();
+
+// ---- 12. MEASURE-ON-DEMAND JOINS (injected readAll, executed proofs) --------
+await (async () => {
+  const { verifySpecJoins } = await import("../sources/relationships");
+  const base: Dataset = { tableName: "tickets", profile: { source: { filename: "t", format: "csv" }, rowCount: 4, columns: [
+    col("status_id", "integer", 3) ], sampleRows: [] } };
+  const ref: Dataset = { tableName: "statuses", profile: { source: { filename: "s", format: "csv" }, rowCount: 3, columns: [
+    col("id", "integer", 3), col("name", "string", 3) ], sampleRows: [] } };
+  const spec: any = { sections: [{ widgets: [{ id: "b1", kind: "bar", title: "T", table: "tickets",
+    x: { col: "name" }, series: [{ col: "", agg: "count" }],
+    join: { table: "statuses", on: ["status_id", "id"] } }] }] };
+  // A readAll that PROVES the edge: right side unique+non-null, zero orphans.
+  const proving = async (sql: string) => /count\(DISTINCT/i.test(sql)
+    ? [{ n: 3, d: 3, nulls: 0 }]
+    : [{ total: 4, orphans: 0 }];
+  let out = await verifySpecJoins(structuredClone(spec), [structuredClone(base), ref].map((d) => structuredClone(d)) as any, proving);
+  // NOTE: datasets are mutated in place — rebuild to inspect the edge.
+  const ds = [structuredClone(base), structuredClone(ref)];
+  out = await verifySpecJoins(structuredClone(spec), ds as any, proving);
+  assert.equal(out.proven.length, 1, "plausible join proven on demand");
+  assert.deepEqual(ds[0].profile.foreignKeys?.[0], { col: "status_id", refTable: "statuses", refCol: "id", verified: "measured" }, "edge attached to the base profile");
+  // …and validation now ACCEPTS the join it would have rejected cold.
+  const full: DashboardSpec = { version: 1, meta: { title: "T" }, sections: spec.sections } as any;
+  const rv = validateSpec(structuredClone(full), ds as any);
+  assert.equal(rv.spec.sections.length, 1, "measured edge admits the widget");
+  // A readAll that REFUTES (orphans over tolerance) attaches nothing.
+  const refuting = async (sql: string) => /count\(DISTINCT/i.test(sql)
+    ? [{ n: 3, d: 3, nulls: 0 }]
+    : [{ total: 4, orphans: 2 }];
+  const ds2 = [structuredClone(base), structuredClone(ref)];
+  const out2 = await verifySpecJoins(structuredClone(spec), ds2 as any, refuting);
+  assert.equal(out2.proven.length, 0, "refuted candidate attaches no edge");
+  assert.equal(ds2[0].profile.foreignKeys, undefined, "no edge on refutation");
+  // No handle → no measurement, behavior exactly as before.
+  const out3 = await verifySpecJoins(structuredClone(spec), [structuredClone(base), structuredClone(ref)] as any, undefined);
+  assert.equal(out3.measured, 0, "no readAll, no measurement");
+  console.log("pipeline: measure-on-demand joins ✅");
 })();
 
 console.log("pipeline.test.ts: all assertions passed ✅");

@@ -97,9 +97,11 @@ await (async () => {
   const dt = exact.find((c) => c.name === "created_at")!;
   assert.equal(String(dt.min).slice(0, 10), "2026-01-01", "date min from full sweep");
 
-  // >25 distinct values: top slice kept, uniqueCount forced ABOVE the list
-  // length so the observed-value guard can only warn, never falsely drop.
-  await conn.run(`CREATE TABLE wide AS SELECT 'cat_' || (i % 40) AS c FROM range(0, 400) t(i)`);
+  // >TOP_VALUES_LIMIT distinct values: top slice kept, uniqueCount forced ABOVE
+  // the list length so the observed-value guard can only warn, never falsely
+  // claim exhaustiveness. (Fixture cardinality rides the limit so raising the
+  // cap keeps this contract exercised.)
+  await conn.run(`CREATE TABLE wide AS SELECT 'cat_' || (i % ${TOP_VALUES_LIMIT + 10}) AS c FROM range(0, 400) t(i)`);
   const wide = await exactColumnStats(readAll, '"wide"', [col("c", "string", 30)]);
   assert.equal(wide[0].topValues!.length, TOP_VALUES_LIMIT, "top slice capped");
   assert.ok(wide[0].uniqueCount > wide[0].topValues!.length, "non-exhaustive is encoded (no false 'provably empty')");
