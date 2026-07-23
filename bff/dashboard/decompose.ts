@@ -1,4 +1,10 @@
-// bff/dashboard/decompose.ts — the query breakdown layer.
+// bff/dashboard/decompose.ts — the PLAN-BRIEF layer (query breakdown + design).
+//
+// DAY-1 MERGE: this is now ONE structured call instead of the old sequential
+// rewrite→decompose pair — it returns bounded reasoning (schema-constrained
+// COT), the grounded task list, AND a typed DESIGN channel (accent + vibrant
+// palette + vibe) that the handler lands deterministically into spec.meta.
+// Cold builds drop from three sequential model round-trips to two.
 //
 // Sits ABOVE the specialist agents: the user's question is decomposed into a
 // small set of typed analytical TASKS ("how is attainment trending" → trend;
@@ -32,11 +38,29 @@ export interface AnalysisTask {
 
 export type DecomposeRun = (system: string, user: string, opts?: GenOptions) => Promise<GenResult>;
 
+/** The typed design channel. Colors are HEX-validated at coercion; anything
+ *  invalid is dropped so downstream never trusts a model color blindly. */
+export interface PlanDesign { accent?: string; palette?: string[]; vibe?: string }
+
+const HEX = /^#[0-9a-fA-F]{6}$/;
+function coerceDesign(d: any): PlanDesign | undefined {
+  if (!d || typeof d !== "object") return undefined;
+  const out: PlanDesign = {};
+  if (typeof d.accent === "string" && HEX.test(d.accent.trim())) out.accent = d.accent.trim();
+  if (Array.isArray(d.palette)) {
+    const pal = d.palette.map((c: any) => String(c).trim()).filter((c: string) => HEX.test(c));
+    if (pal.length >= 3) out.palette = pal.slice(0, 8);
+  }
+  if (typeof d.vibe === "string" && d.vibe.trim()) out.vibe = d.vibe.trim().slice(0, 140);
+  return out.accent || out.palette || out.vibe ? out : undefined;
+}
+
 const MAX_TASKS = 8;
 
 const SCHEMA = {
   type: "object",
   properties: {
+    reasoning: { type: "string", description: "2-4 sentences BEFORE anything else: what the data supports, how the request maps to tasks, and what visual mood fits the domain." },
     tasks: {
       type: "array",
       items: {
@@ -50,8 +74,18 @@ const SCHEMA = {
         required: ["question", "kind", "columns"],
       },
     },
+    design: {
+      type: "object",
+      description: "Art direction for the dashboard. VIBRANT, high-saturation, domain-fitting — never gray or drab.",
+      properties: {
+        accent: { type: "string", description: "primary accent as #rrggbb" },
+        palette: { type: "array", items: { type: "string" }, description: "5-6 DISTINCT vivid chart colors as #rrggbb, ordered by prominence" },
+        vibe: { type: "string", description: "one line of visual direction, e.g. 'confident fintech: electric violet on cool neutrals'" },
+      },
+      required: ["accent", "palette"],
+    },
   },
-  required: ["tasks"],
+  required: ["tasks", "design"],
 };
 
 const SYSTEM = `You are the task-decomposition layer of a dashboard builder. Break the user's request into 3-8 concrete analytical sub-questions, each answerable by ONE widget family:
@@ -61,7 +95,10 @@ const SYSTEM = `You are the task-decomposition layer of a dashboard builder. Bre
 - composition: share-of-total (pie/donut, low-cardinality category)
 - comparison: two measures or segments side by side
 - detail: a drill-down table
-Ground every task in REAL columns from the data profile — name them in "columns". Cover the user's explicit asks first, then add the most valuable complementary questions. Output ONLY {"tasks":[...]}.`;
+Ground every task in REAL columns from the data profile — name them in "columns". Cover the user's explicit asks first, then add the most valuable complementary questions.
+Think in "reasoning" FIRST (2-4 sentences), THEN emit tasks.
+You are ALSO the art director: in "design", pick a vivid accent and a 5-6 color high-saturation palette (#rrggbb) that fits the domain and the user's stated mood — colorful and confident, never gray, never drab, colors clearly distinct from one another — plus a one-line vibe. Honor any explicit color/style words in the user's request.
+Output ONLY {"reasoning": "...", "tasks":[...], "design":{...}}.`;
 
 /** Deterministic gate: prompts with no analytical content skip the LLM call. */
 export function isTrivialPrompt(prompt: string): boolean {
@@ -103,7 +140,7 @@ function stripFences(t: string): string {
 export async function decomposeQuery(
   datasets: Dataset[], userPrompt: string, directive: string,
   run: DecomposeRun = callGemini,
-): Promise<{ tasks: AnalysisTask[]; source: "model" | "deterministic" }> {
+): Promise<{ tasks: AnalysisTask[]; source: "model" | "deterministic"; design?: PlanDesign; reasoning?: string }> {
   const roles = classifySchema(datasets);
   if (isTrivialPrompt(userPrompt)) {
     const tasks = fallbackTasks(datasets, roles);
@@ -117,9 +154,11 @@ export async function decomposeQuery(
       "DATA PROFILE:", schemaLines, "",
       "GUIDANCE:", directive.slice(0, 1500), "",
       "USER REQUEST:", userPrompt, "",
-      'Return {"tasks":[...]}.',
+      'Return {"reasoning": "...", "tasks":[...], "design":{...}}.',
     ].join("\n"), { ...ORCHESTRATE_OPTS, responseSchema: SCHEMA });
     const parsed = JSON.parse(stripFences(text));
+    const design = coerceDesign(parsed?.design);
+    const reasoning = typeof parsed?.reasoning === "string" ? parsed.reasoning.slice(0, 600) : undefined;
     const raw: any[] = Array.isArray(parsed?.tasks) ? parsed.tasks : [];
     const tasks: AnalysisTask[] = raw
       .filter((t) => t?.question && t?.kind && Array.isArray(t?.columns))
@@ -133,8 +172,8 @@ export async function decomposeQuery(
       .filter((t) => t.columns.length > 0)
       .slice(0, MAX_TASKS);
     if (tasks.length) {
-      console.log(`[decompose] ${tasks.length} task(s): ${tasks.map((t) => t.kind).join(", ")}`);
-      return { tasks, source: "model" };
+      console.log(`[decompose] ${tasks.length} task(s): ${tasks.map((t) => t.kind).join(", ")}${design ? " · design: " + (design.vibe ?? design.accent ?? "palette") : ""}`);
+      return { tasks, source: "model", ...(design ? { design } : {}), ...(reasoning ? { reasoning } : {}) };
     }
     console.warn("[decompose] model returned no grounded tasks — deterministic fallback");
   } catch (err) {

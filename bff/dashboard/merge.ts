@@ -17,6 +17,36 @@ const MAX_TABLES = envInt("T2UI_MAX_TABLES", 3);
 
 export const DEFAULT_PALETTE = ["#7c3aed", "#06b6d4", "#f59e0b", "#10b981", "#f43f5e", "#3b82f6"];
 
+// ---- Deterministic vibrancy floor ------------------------------------------
+// seededPalette guarantees a distinct, high-saturation palette even when every
+// model call fails: hash the seed (dominant table/entity name) to a base hue,
+// then walk the wheel by the golden angle so consecutive colors stay far apart.
+// Same seed → same palette (stable across reruns); different domains → visibly
+// different boards. Saturation 68-78%, lightness 50-58%: vivid, never drab,
+// never neon-on-white illegible.
+function hslToHex(h: number, s: number, l: number): string {
+  const a = (s / 100) * Math.min(l / 100, 1 - l / 100);
+  const f = (n: number) => {
+    const k = (n + h / 30) % 12;
+    const c = l / 100 - a * Math.max(-1, Math.min(k - 3, 9 - k, 1));
+    return Math.round(255 * c).toString(16).padStart(2, "0");
+  };
+  return `#${f(0)}${f(8)}${f(4)}`;
+}
+export function seededPalette(seed: string, n = 6): string[] {
+  let h = 0;
+  for (let i = 0; i < seed.length; i++) h = (h * 31 + seed.charCodeAt(i)) >>> 0;
+  const baseHue = h % 360;
+  const out: string[] = [];
+  for (let i = 0; i < n; i++) {
+    const hue = (baseHue + i * 137.508) % 360;
+    const sat = 68 + ((h >> (i + 3)) % 11);      // 68..78
+    const lig = 50 + ((h >> (i + 7)) % 9);       // 50..58
+    out.push(hslToHex(hue, sat, lig));
+  }
+  return out;
+}
+
 /** A widget's analytical signature — two widgets with the same signature answer the
  *  same question, so only the first survives the merge. */
 export function widgetSignature(w: Widget): string {

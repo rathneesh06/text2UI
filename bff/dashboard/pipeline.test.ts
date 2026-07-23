@@ -367,4 +367,61 @@ await (async () => {
   console.log("pipeline: measure-on-demand joins ✅");
 })();
 
+
+// ---- 13. PLAN-BRIEF: merged call contracts + deterministic vibrancy floor ---
+await (async () => {
+  const fs = await import("node:fs");
+  const src = fs.readFileSync(new URL("./decompose.ts", import.meta.url), "utf8");
+  // (a) schema-constrained COT: reasoning is declared BEFORE tasks (generation
+  // order), and the design channel is REQUIRED with accent + palette.
+  const iReasoning = src.indexOf('reasoning: { type: "string"');
+  const iTasks = src.indexOf("tasks: {");
+  const iDesign = src.indexOf("design: {");
+  assert.ok(iReasoning > -1 && iTasks > -1 && iDesign > -1, "schema declares reasoning, tasks, design");
+  assert.ok(iReasoning < iTasks, "reasoning precedes tasks in the schema");
+  assert.ok(/required: \["tasks", "design"\]/.test(src), "design is a required channel");
+  // (b) the merged call: ONE injected run yields tasks AND a coerced design;
+  // invalid colors are dropped, valid ones survive.
+  const { decomposeQuery } = await import("./decompose");
+  const DATA: Dataset = { tableName: "tickets", profile: { source: { filename: "t", format: "csv" }, rowCount: 50, columns: [
+    col("status", "string", 3), col("created_at", "date", 40) ], sampleRows: [] } };
+  let calls = 0;
+  const run = async () => { calls++; return { text: JSON.stringify({
+    reasoning: "Tickets by status and over time; helpdesk mood.",
+    tasks: [{ question: "Which statuses dominate?", kind: "ranking", columns: ["status"], table: "tickets" }],
+    design: { accent: "#FF5A5F", palette: ["#FF5A5F", "#2EC4B6", "#FFBF69", "nope", "#5A189A"], vibe: "warm helpdesk" },
+  }) } as any; };
+  const r = await decomposeQuery([DATA], "show me which ticket statuses dominate and how volume trends", "directive", run);
+  assert.equal(calls, 1, "ONE model round-trip produces tasks + design");
+  assert.equal(r.source, "model", "model tasks accepted");
+  assert.equal(r.design?.accent, "#FF5A5F", "accent coerced through");
+  assert.deepEqual(r.design?.palette, ["#FF5A5F", "#2EC4B6", "#FFBF69", "#5A189A"], "invalid hex dropped, valid kept");
+  assert.equal(r.design?.vibe, "warm helpdesk", "vibe kept");
+  assert.ok((r.reasoning ?? "").includes("helpdesk"), "reasoning surfaced for the audit trail");
+  // A garbage design never breaks the tasks (design is optional downstream).
+  const r2 = await decomposeQuery([DATA], "show me which ticket statuses dominate and how volume trends", "d",
+    async () => ({ text: JSON.stringify({ tasks: [{ question: "q", kind: "kpi", columns: ["status"] }], design: { accent: "red", palette: ["x"] } }) } as any));
+  assert.equal(r2.source, "model", "tasks accepted despite unusable design");
+  assert.equal(r2.design, undefined, "unusable design dropped entirely");
+  // (c) the deterministic vibrancy floor: seeded, stable, distinct, vivid.
+  const { seededPalette } = await import("./merge");
+  const p1 = seededPalette("tickets|statuses");
+  const p2 = seededPalette("tickets|statuses");
+  const p3 = seededPalette("orders|customers");
+  assert.deepEqual(p1, p2, "same seed → same palette (stable across reruns)");
+  assert.notDeepEqual(p1, p3, "different domains → different palettes");
+  assert.equal(p1.length, 6, "six colors");
+  for (const c of p1) {
+    assert.ok(/^#[0-9a-f]{6}$/i.test(c), "hex format: " + c);
+    const [rr, gg, bb] = [1, 3, 5].map((i) => parseInt(c.slice(i, i + 2), 16));
+    assert.ok(Math.max(rr, gg, bb) - Math.min(rr, gg, bb) >= 50, "vivid, never gray: " + c);
+  }
+  assert.equal(new Set(p1).size, 6, "all six distinct");
+  // (d) the handler skips the standalone rewrite on agents-path builds — the
+  // plan-brief call IS the directive round-trip now.
+  const hsrc = fs.readFileSync(new URL("./handler.ts", import.meta.url), "utf8");
+  assert.ok(/legacyPlannerInjected \|\| agentsPath \? \{ skipRewrite: true \}/.test(hsrc), "agents-path builds skip the rewrite RT");
+  console.log("pipeline: plan-brief merged call + vibrancy floor ✅");
+})();
+
 console.log("pipeline.test.ts: all assertions passed ✅");

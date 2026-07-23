@@ -29,10 +29,10 @@ import type { DashboardSpec } from "../../shared/dashboard-spec";
 import { planSpec, HEX_RE, type PlanSpecInput } from "./planner";
 import { enhanceQuery, briefToStyleHints, briefToAnalyticalDirective, type Enhancement } from "./enhance";
 import { runChartAgents, type AgentRun, type AgentHarvest } from "./agents";
-import { decomposeQuery } from "./decompose";
+import { decomposeQuery, type PlanDesign } from "./decompose";
 import { buildSemanticModel, semanticDigest } from "../datasources/semantic";
 import { audit, newTurnId } from "../datasources/audit";
-import { mergeHarvest, DEFAULT_PALETTE } from "./merge";
+import { mergeHarvest, seededPalette } from "./merge";
 import { compileSpec } from "./compile";
 import { pushVersion, undo, redo, decisionsText, detectHistoryIntent, cursorIndex } from "./session";
 import { reconcileEdit } from "./reconcile";
@@ -84,6 +84,11 @@ export async function handleDashboardBuild(
   // ---- Diff History: undo/redo are deterministic, instant, and exact ----------
   // A bare "undo"/"redo" NEVER goes to a model — the session's version stack is
   // the truth, and re-rendering a stored spec cannot drift.
+  // DAY-1 MERGE: on agents-path BUILD turns the plan-brief call (decompose +
+  // design) replaces the standalone LLM rewrite — one fewer sequential model
+  // round-trip, and the directive floor (baseline + semantic digest) still
+  // always applies. Edits and the planner path keep the rewriter.
+  const agentsPath = !currentSpec && AGENTS_ENABLED && !legacyPlannerInjected;
   const historyIntent = currentSpec && conversationId ? detectHistoryIntent(b.userPrompt) : null;
   const turnId = newTurnId();
   if (historyIntent) {
@@ -124,12 +129,13 @@ export async function handleDashboardBuild(
     ...(currentSpec ? { currentSpec } : {}),
     ...(b.brief ? { brief: b.brief } : {}),
     ...(typeof b.analystDirective === "string" ? { analystDirective: b.analystDirective } : {}),
-    ...(deps.skipRewrite || legacyPlannerInjected ? { skipRewrite: true } : {}),
+    ...(deps.skipRewrite || legacyPlannerInjected || agentsPath ? { skipRewrite: true } : {}),
   });
   console.log(`[dashboard] directive source: ${enhancement.directiveSource} (${enhancement.combined.length} chars, baseline always applied) · semantic: ${semModel.metrics.length} candidate metric(s), ${semModel.joins.length} join candidate(s)`);
   audit({ turnId, conversationId, stage: "enhance", detail: { directiveSource: enhancement.directiveSource, candidateMetrics: semModel.metrics.length, joinCandidates: semModel.joins.length } });
 
   let spec: DashboardSpec | null = null;
+  let planDesign: PlanDesign | undefined;
   let pipeline: "agents" | "planner" | "patch" = "planner";
   const degradedNotes: string[] = []; // E1: model-failure fallbacks are user-facing facts
 
@@ -138,8 +144,9 @@ export async function handleDashboardBuild(
     // QUERY BREAKDOWN LAYER: decompose the request into grounded analytical
     // tasks, routed to the agent families below. Trivial prompts skip the model
     // call; failures fall back to deterministic schema-derived tasks.
-    const { tasks, source: taskSource } = await decomposeQuery(datasets, b.userPrompt, enhancement.combined, deps.agentRun);
-    audit({ turnId, conversationId, stage: "decompose", detail: { source: taskSource, tasks: tasks.map((t) => ({ kind: t.kind, q: t.question.slice(0, 80) })) } });
+    const { tasks, source: taskSource, design, reasoning } = await decomposeQuery(datasets, b.userPrompt, enhancement.combined, deps.agentRun);
+    planDesign = design;
+    audit({ turnId, conversationId, stage: "decompose", detail: { source: taskSource, tasks: tasks.map((t) => ({ kind: t.kind, q: t.question.slice(0, 80) })), ...(design ? { design } : {}), ...(reasoning ? { reasoning: reasoning.slice(0, 300) } : {}) } });
     const harvest = await runChartAgents(
       { datasets, userPrompt: b.userPrompt, directive: withStyle(enhancement), tasks },
       deps.agentRun,
@@ -152,7 +159,7 @@ export async function handleDashboardBuild(
     if (failed.length) {
       degradedNotes.push(`AI planning was unavailable for ${failed.map((r) => r.name).join(", ")} — deterministic schema-based widgets were used instead. Re-run the request to try the model again.`);
     }
-    const merged = mergeHarvest(harvest, datasets, b.userPrompt, mergeStyle(b.brief));
+    const merged = mergeHarvest(harvest, datasets, b.userPrompt, { ...designStyle(planDesign, datasets), ...mergeStyle(b.brief) });
     if (countWidgets(merged) > 0) { spec = merged; pipeline = "agents"; }
     else console.warn("[dashboard] agent harvest empty — falling back to the monolithic planner");
   }
@@ -229,9 +236,10 @@ export async function handleDashboardBuild(
     }
   }
 
-  // Vibrancy guarantee: never ship on drab defaults.
-  if (!spec.meta.chartPalette?.length) spec.meta.chartPalette = DEFAULT_PALETTE;
-  if (!spec.meta.accent || !HEX_RE.test(spec.meta.accent)) spec.meta.accent = spec.meta.chartPalette[0];
+  // Vibrancy guarantee: never ship on drab defaults — the plan design first,
+  // then the SEEDED palette (per-domain distinct), never a fixed constant.
+  if (!spec.meta.chartPalette?.length) spec.meta.chartPalette = planDesign?.palette ?? seededPalette(paletteSeed(datasets));
+  if (!spec.meta.accent || !HEX_RE.test(spec.meta.accent)) spec.meta.accent = planDesign?.accent ?? spec.meta.chartPalette[0];
 
   // ---- Stage 2.9: measure-on-demand join verification --------------------------
   // The verified-edge law stands; this turns "rejected because unmeasured" into
@@ -300,6 +308,18 @@ function buildChatContext(history: unknown, conversationId: string): string | nu
 /** The enhancement's combined directive plus the visual direction, for the agents. */
 function withStyle(e: Enhancement): string {
   return e.styleHints ? `${e.combined}\n\nVISUAL DIRECTION: ${e.styleHints}` : e.combined;
+}
+
+/** Deterministic palette seed: the dominant table name anchors the domain. */
+function paletteSeed(datasets: Dataset[]): string {
+  return datasets.map((d) => d.tableName).sort().join("|") || "t2ui";
+}
+
+/** The plan-brief's typed design channel → merger style opts. The seeded
+ *  palette is the floor, so a failed model call still ships colorful. */
+function designStyle(design: PlanDesign | undefined, datasets: Dataset[]): { accent?: string; chartPalette?: string[] } {
+  const pal = design?.palette?.length ? design.palette : seededPalette(paletteSeed(datasets));
+  return { accent: design?.accent ?? pal[0], chartPalette: pal };
 }
 
 /** Pull concrete style choices out of an orchestrator brief for the merger. */

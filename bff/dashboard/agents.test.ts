@@ -155,6 +155,48 @@ console.log("merge: dedupe + sections + defaults ✅");
 }
 console.log("handler: agents path end-to-end ✅");
 
+// ---- 5b. PLAN-BRIEF design lands deterministically in spec.meta -------------------
+{
+  // The plan-brief (decompose) call answers with tasks AND a design; the
+  // handler must land accent + palette into the rendered spec's meta.
+  const run = async (system: string) => {
+    if (system.includes("task-decomposition")) return { text: JSON.stringify({
+      reasoning: "Revenue focus; energetic commerce mood.",
+      tasks: [{ question: "What is total revenue?", kind: "kpi", columns: ["revenue"], table: "orders" }],
+      design: { accent: "#E63946", palette: ["#E63946", "#457B9D", "#2A9D8F", "#F4A261", "#9B5DE5", "#00BBF9"], vibe: "energetic commerce" },
+    }), finishReason: "STOP" } as any;
+    return { text: JSON.stringify({ widgets: [] }), finishReason: "STOP" } as any; // agents → fallbacks
+  };
+  const { status, body } = await handleDashboardBuild(
+    { datasets: orders, userPrompt: "show revenue performance with an energetic red look" },
+    { agentRun: run as any },
+  );
+  assert.equal(status, 200);
+  assert.equal(body.spec.meta.accent, "#E63946", "plan-brief accent landed in meta");
+  assert.deepEqual(body.spec.meta.chartPalette, ["#E63946", "#457B9D", "#2A9D8F", "#F4A261", "#9B5DE5", "#00BBF9"], "plan-brief palette landed in meta");
+}
+{
+  // Every model call fails → the SEEDED palette floor applies: still six vivid
+  // distinct hexes, and stable for the same datasets across reruns.
+  const down = async () => { throw new Error("model down"); };
+  const one = await handleDashboardBuild(
+    { datasets: orders, userPrompt: "show revenue performance with an energetic red look" },
+    { agentRun: down as any },
+  );
+  const two = await handleDashboardBuild(
+    { datasets: orders, userPrompt: "show revenue performance with an energetic red look" },
+    { agentRun: down as any },
+  );
+  assert.equal(one.status, 200);
+  const pal = one.body.spec.meta.chartPalette;
+  assert.equal(pal.length, 6, "seeded floor: six colors");
+  assert.equal(new Set(pal).size, 6, "seeded floor: all distinct");
+  for (const c of pal) assert.ok(/^#[0-9a-f]{6}$/i.test(c), "hex: " + c);
+  assert.deepEqual(pal, two.body.spec.meta.chartPalette, "seeded floor is stable per domain");
+  assert.equal(one.body.spec.meta.accent, pal[0], "accent anchors the palette");
+}
+console.log("handler: plan-brief design channel + seeded floor ✅");
+
 // ---- edit turns still take the surgical single-planner path -----------------------
 {
   let plannerCalls = 0;
