@@ -19,6 +19,7 @@ import {
   type DbConn, type DbTableInfo,
 } from "./db-conn";
 import type { Dataset } from "../../shared/types";
+import { cacheEnabled, cacheLookup, cacheStore, catalogSignatures, connFingerprint, type SigReadAll } from "./schema-cache";
 
 export interface ConnRecord {
   id: string;
@@ -234,12 +235,52 @@ export function publicView(rec: ConnRecord) {
 
 /** Profile additional tables on demand (e.g. the user expands one we skipped at
  *  connect time). Merges into rec.datasets, deduped by tableName. */
-export async function profileTables(rec: ConnRecord, tables: string[]): Promise<Dataset[]> {
-  const need = tables.filter((t) => !rec.datasets.some((d) => d.tableName === t));
-  if (need.length) {
-    const r = await introspectDb(rec.conn, { tables: need, sampleRows: 5 });
-    rec.datasets = [...rec.datasets, ...r.datasets];
-    rec.warnings.push(...r.warnings);
+/** Profile the requested tables, serving from the schema cache where the live
+ *  structure signature matches (see schema-cache.ts for the correctness rules).
+ *  `opts.refresh` bypasses the cache read (a fresh introspection re-populates
+ *  it); `opts.deps` injects the introspector and signature reader for offline
+ *  tests. Total: any cache/signature failure degrades to a full introspection. */
+export async function profileTables(
+  rec: ConnRecord, tables: string[],
+  opts: { refresh?: boolean; deps?: { introspect?: typeof introspectDb; sigReadAll?: SigReadAll } } = {},
+): Promise<Dataset[]> {
+  const need0 = tables.filter((t) => !rec.datasets.some((d) => d.tableName === t));
+  if (need0.length) {
+    const introspect = opts.deps?.introspect ?? introspectDb;
+    const fp = connFingerprint(rec.conn);
+    let need = need0;
+    let sigs: Map<string, string> | null = null;
+
+    const sigsFor = async (names: string[]): Promise<Map<string, string>> => {
+      const infos = rec.allTables.filter((t) => names.includes(t.name));
+      const readAll: SigReadAll = opts.deps?.sigReadAll
+        ?? (async (sql) => { const h = await getHandle(rec); return h.readAll(sql, "schema-cache signature"); });
+      return catalogSignatures(readAll, infos);
+    };
+
+    if (cacheEnabled() && !opts.refresh) {
+      try {
+        sigs = await sigsFor(need0);
+        const { hits, misses, note } = cacheLookup(fp, need0, sigs);
+        if (hits.length) {
+          rec.datasets = [...rec.datasets, ...hits];
+          if (note) { rec.warnings.push(note); console.log(`[schema-cache] ${rec.id}: ${note}`); }
+        }
+        need = misses;
+      } catch { need = need0; }
+    }
+
+    if (need.length) {
+      const r = await introspect(rec.conn, { tables: need, sampleRows: 5 });
+      rec.datasets = [...rec.datasets, ...r.datasets];
+      rec.warnings.push(...r.warnings);
+      if (cacheEnabled()) {
+        try {
+          if (!sigs) sigs = await sigsFor(need);
+          cacheStore(fp, rec.label, r.datasets, sigs);
+        } catch { /* best-effort write-through */ }
+      }
+    }
   }
   return rec.datasets.filter((d) => tables.includes(d.tableName));
 }
