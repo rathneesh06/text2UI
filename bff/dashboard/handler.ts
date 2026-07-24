@@ -39,6 +39,7 @@ import { reconcileEdit } from "./reconcile";
 import { planEditOps, applyOps } from "./patch";
 import { renderPlanToApp } from "./renderer";
 import { verifySpecJoins, type ReadAll } from "../sources/relationships";
+import { captureRunner, recordTurn, replayCaptureEnabled } from "./replay-capture";
 
 // Re-exported so existing imports/tests keep working after the brief helpers
 // moved into the enhancement layer where they belong.
@@ -66,7 +67,7 @@ export async function handleDashboardBuild(
   // injected planner also PINS the planner path (tests inject fakes and must stay
   // offline — fanning out to the real agents would defeat the injection).
   const legacyPlannerInjected = typeof plannerOrDeps === "function";
-  const deps: HandlerDeps = legacyPlannerInjected ? { planner: plannerOrDeps as Planner } : (plannerOrDeps as HandlerDeps);
+  let deps: HandlerDeps = legacyPlannerInjected ? { planner: plannerOrDeps as Planner } : (plannerOrDeps as HandlerDeps);
   const planner = deps.planner ?? planSpec;
 
   const b = body as any;
@@ -89,6 +90,10 @@ export async function handleDashboardBuild(
   // round-trip, and the directive floor (baseline + semantic digest) still
   // always applies. Edits and the planner path keep the rewriter.
   const agentsPath = !currentSpec && AGENTS_ENABLED && !legacyPlannerInjected;
+  // Phase D: replay capture — wrap whichever runner this turn will use so
+  // every model response is recorded in order. Opt-in, fire-and-forget.
+  const replayCap = replayCaptureEnabled() ? captureRunner(deps.agentRun) : null;
+  if (replayCap) deps = { ...deps, agentRun: replayCap.run } as typeof deps;
   const historyIntent = currentSpec && conversationId ? detectHistoryIntent(b.userPrompt) : null;
   const turnId = newTurnId();
   if (historyIntent) {
@@ -279,6 +284,16 @@ export async function handleDashboardBuild(
       summary: ["That edit didn't land" + (warnings.length ? ": " + warnings.slice(0, 3).join("; ") : ".") + " Try naming the metric or column explicitly."] } };
   }
   const summary = summarizeSpecChange(currentSpec, rendered);
+  // Phase D: record the replayable turn — full input + ordered model I/O +
+  // the VALIDATED spec that rendered. History/undo turns return earlier and
+  // are deliberately not recorded (they are deterministic stack operations).
+  if (replayCap) {
+    recordTurn({ v: 1, at: new Date().toISOString(), turnId, pipeline,
+      body: { userPrompt: String(b.userPrompt), datasets, currentSpec: currentSpec ?? null,
+        history: (b as any).history ?? null, brief: b.brief ?? null,
+        selectedWidget: selectedWidget ?? null, conversationId },
+      model: replayCap.log, spec: rendered, warnings: plan.warnings });
+  }
   audit({ turnId, conversationId, stage: "render", detail: { pipeline, widgets: allWidgets(rendered).length, dropped, warnings: plan.warnings.slice(0, 6), sql: plan.sections.flatMap((sc: any) => sc.widgets.map((cw: any) => cw.sql)).slice(0, 30) } });
   // Diff History: every accepted version enters the conversation's undo stack.
   if (conversationId) pushVersion(conversationId, rendered, summary.join(" "), b.userPrompt);
