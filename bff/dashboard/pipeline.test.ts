@@ -476,4 +476,57 @@ await (async () => {
   console.log("pipeline: A4 compare symmetry + compiled shape ✅");
 })();
 
+
+// ---- 16. PHASE B FEW-SHOT: examples are validated data, gated, bounded ------
+await (async () => {
+  const { EDITOPS_EXAMPLES, DECOMPOSE_EXAMPLES, EXAMPLE_SPEC, EXAMPLE_PROFILE,
+    editOpsFewshotBlock, decomposeFewshotBlock, FEWSHOT_BYTE_BUDGET } = await import("./fewshot");
+  const { applyOps } = await import("./patch");
+  // (a) every edit-ops example survives the REAL gates: applied fully, zero
+  // rejections — teaching material that violates the grammar fails the build.
+  for (const ex of EDITOPS_EXAMPLES) {
+    const r = applyOps(structuredClone(EXAMPLE_SPEC), structuredClone(ex.ops) as any, ex.user, ex.selectedId);
+    assert.equal(r.rejected.length, 0, `example "${ex.user}" rejected: ${r.rejected.join(" | ")}`);
+    assert.equal(r.applied.length, ex.ops.length, `example "${ex.user}" only partially applied`);
+  }
+  // …including that the ONLY removal example carries removal words of its own,
+  // and the unactionable example really is empty.
+  const removals = EDITOPS_EXAMPLES.filter((e) => e.ops.some((o: any) => o.op === "remove_widget"));
+  assert.equal(removals.length, 1, "exactly one removal example");
+  assert.ok(/remove|get rid|delete/i.test(removals[0].user), "the removal example's own words ask for removal");
+  assert.ok(EDITOPS_EXAMPLES.some((e) => e.ops.length === 0), "an unactionable example teaches empty ops");
+  // (b) every decompose example is grounded: only real columns of its table.
+  for (const ex of DECOMPOSE_EXAMPLES) {
+    const cols = new Set(EXAMPLE_PROFILE[ex.table]);
+    for (const t of ex.tasks) for (const c of t.columns) {
+      assert.ok(cols.has(c), `decompose example "${ex.prompt}" names unknown column ${c}`);
+    }
+  }
+  // (c) the flag gates injection, and enabled blocks respect the byte budget.
+  delete process.env.T2UI_FEWSHOT;
+  assert.ok(editOpsFewshotBlock().length > 200 && decomposeFewshotBlock().length > 200, "blocks render when enabled");
+  assert.ok(editOpsFewshotBlock().length <= FEWSHOT_BYTE_BUDGET, `edit-ops block ${editOpsFewshotBlock().length} > budget`);
+  assert.ok(decomposeFewshotBlock().length <= FEWSHOT_BYTE_BUDGET, `decompose block ${decomposeFewshotBlock().length} > budget`);
+  process.env.T2UI_FEWSHOT = "0";
+  assert.equal(editOpsFewshotBlock(), "", "T2UI_FEWSHOT=0 disables edit-ops injection");
+  assert.equal(decomposeFewshotBlock(), "", "T2UI_FEWSHOT=0 disables decompose injection");
+  delete process.env.T2UI_FEWSHOT;
+  // (d) schema-constrained COT on the edit surface: reasoning is declared
+  // BEFORE ops in EDIT_OPS_SCHEMA (generation order is what makes it real).
+  const fs = await import("node:fs");
+  const psrc = fs.readFileSync(new URL("./patch.ts", import.meta.url), "utf8");
+  const iR = psrc.indexOf('reasoning: { type: "string"');
+  const iO = psrc.indexOf('ops: {');
+  assert.ok(iR > -1 && iO > -1 && iR < iO, "reasoning precedes ops in EDIT_OPS_SCHEMA");
+  // (e) the eval sets keep a held-out domain that appears in NO example.
+  const { DECOMPOSE_EVAL, EDITOPS_EVAL } = await import("./eval-sets");
+  const exampleText = JSON.stringify({ EDITOPS_EXAMPLES, DECOMPOSE_EXAMPLES, EXAMPLE_PROFILE });
+  for (const held of ["clinic", "appointments", "no_show", "visit_type"]) {
+    assert.ok(!exampleText.includes(held), `held-out vocabulary "${held}" leaked into the examples`);
+  }
+  assert.ok(DECOMPOSE_EVAL.some((c) => c.domain === "clinic") && EDITOPS_EVAL.some((c) => c.domain === "clinic"),
+    "both eval sets exercise the held-out domain");
+  console.log("pipeline: few-shot examples validated + gated + held-out intact ✅");
+})();
+
 console.log("pipeline.test.ts: all assertions passed ✅");

@@ -68,6 +68,8 @@
     "test:compare": "tsx bff/dashboard/compare.test.ts",
     "test:scenario": "tsx bff/dashboard/scenario.test.ts",
     "test:hygiene": "node scripts/check-dead-assertions.mjs",
+    "eval:decompose": "tsx scripts/eval-fewshot.ts decompose",
+    "eval:editops": "tsx scripts/eval-fewshot.ts editops",
     "test:pipeline": "tsx bff/dashboard/pipeline.test.ts",
     "test:joins": "tsx bff/dashboard/joins.test.ts"
   },

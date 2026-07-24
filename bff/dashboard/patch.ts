@@ -18,6 +18,7 @@
 import type { Dataset } from "../../shared/types";
 import type { DashboardSpec, Widget, Section } from "../../shared/dashboard-spec";
 import { callGemini, ORCHESTRATE_OPTS, type GenResult, type GenOptions } from "../aiflow";
+import { editOpsFewshotBlock } from "./fewshot";
 
 export type EditRun = (system: string, user: string, opts?: GenOptions) => Promise<GenResult>;
 
@@ -48,6 +49,7 @@ const ADD_WIDGET_FIELDS = { ...WIDGET_FIELDS, required: ["kind", "title", "table
 export const EDIT_OPS_SCHEMA = {
   type: "object",
   properties: {
+    reasoning: { type: "string", description: "1-3 sentences BEFORE ops: which widget(s) the request targets and why the op list is minimal." },
     ops: {
       type: "array",
       items: {
@@ -116,7 +118,7 @@ export async function planEditOps(input: PlanEditOpsInput, run: EditRun = callGe
     'Return {"ops":[...]}.',
   ].join("\n");
   try {
-    const { text } = await run(SYSTEM, user, { ...ORCHESTRATE_OPTS, responseSchema: EDIT_OPS_SCHEMA });
+    const { text } = await run(SYSTEM + editOpsFewshotBlock(), user, { ...ORCHESTRATE_OPTS, responseSchema: EDIT_OPS_SCHEMA });
     const parsed = JSON.parse(stripFences(text));
     if (!Array.isArray(parsed?.ops)) return null;
     const ops = parsed.ops.filter((o: any) => o && typeof o.op === "string");

@@ -24,6 +24,7 @@
 import type { Dataset } from "../../shared/types";
 import { callGemini, ORCHESTRATE_OPTS, type GenResult, type GenOptions } from "../aiflow";
 import { classifySchema, type SchemaRoles } from "./enhance";
+import { decomposeFewshotBlock } from "./fewshot";
 
 export type TaskKind = "kpi" | "trend" | "ranking" | "composition" | "comparison" | "detail";
 
@@ -150,7 +151,7 @@ export async function decomposeQuery(
   const cols = allColumns(datasets);
   const schemaLines = datasets.map((d) => `Table "${d.tableName}": ${d.profile.columns.map((c) => `${c.name}:${c.type}`).join(", ")}`).join("\n");
   try {
-    const { text } = await run(SYSTEM, [
+    const { text } = await run(SYSTEM + decomposeFewshotBlock(), [
       "DATA PROFILE:", schemaLines, "",
       "GUIDANCE:", directive.slice(0, 1500), "",
       "USER REQUEST:", userPrompt, "",
