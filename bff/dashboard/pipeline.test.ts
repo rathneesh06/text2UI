@@ -529,4 +529,45 @@ await (async () => {
   console.log("pipeline: few-shot examples validated + gated + held-out intact ✅");
 })();
 
+
+// ---- 17. TARGETED-EDIT FAST-PATH: selection + gesture = op, NO model --------
+await (async () => {
+  const { deterministicSelectionOps } = await import("./patch");
+  const { handleDashboardBuild } = await import("./handler");
+  const DATA: Dataset = { tableName: "t", profile: { source: { filename: "t", format: "csv" }, rowCount: 40, columns: [
+    col("category", "string", 4), col("amount", "number", 30) ], sampleRows: [] } };
+  const SPEC: any = { version: 1, meta: { title: "T" }, sections: [{ id: "s1", widgets: [
+    { id: "w_kpi", kind: "kpi", title: "Total", table: "t", metric: { col: "", agg: "count" }, width: "quarter" },
+    { id: "w_bar", kind: "bar", title: "By Category", table: "t", x: { col: "category" }, series: [{ col: "", agg: "count" }], width: "half" },
+  ] }] };
+  // (a) the resolver: each gesture → exactly one correctly-targeted op
+  let ops = deterministicSelectionOps("make this a donut", "w_bar", SPEC);
+  assert.deepEqual(ops, [{ op: "update_widget", id: "w_bar", set: { kind: "donut" } }], "kind gesture");
+  ops = deterministicSelectionOps("Turn it into a line chart", "w_bar", SPEC);
+  assert.equal((ops?.[0] as any)?.set?.kind, "line", "phrasing variants");
+  ops = deterministicSelectionOps("remove this", "w_bar", SPEC);
+  assert.deepEqual(ops, [{ op: "remove_widget", id: "w_bar" }], "removal gesture (user's own removal words)");
+  ops = deterministicSelectionOps("rename this to Spend by Category", "w_bar", SPEC);
+  assert.equal((ops?.[0] as any)?.set?.title, "Spend by Category", "rename gesture");
+  ops = deterministicSelectionOps("show only 5", "w_bar", SPEC);
+  assert.equal((ops?.[0] as any)?.set?.limit, 5, "limit gesture");
+  // (b) discipline: no selection / unknown id / rich request → model path
+  assert.equal(deterministicSelectionOps("make this a donut", undefined, SPEC), null, "no selection → no fast-path");
+  assert.equal(deterministicSelectionOps("make this a donut", "ghost", SPEC), null, "stale selection → no fast-path");
+  assert.equal(deterministicSelectionOps("make this a donut and also add a revenue KPI", "w_bar", SPEC), null, "compound request → model");
+  // (c) end-to-end with a THROWING runner: the fast-path needs no model at all,
+  // and the edit lands on exactly the selected widget.
+  const dead = async () => { throw new Error("model must not be called"); };
+  const r = await handleDashboardBuild(
+    { datasets: [DATA], userPrompt: "make this a donut", currentSpec: SPEC, selectedWidget: { id: "w_bar", title: "By Category" } },
+    { agentRun: dead as any, skipRewrite: true });
+  assert.equal(r.status, 200, JSON.stringify(r.body).slice(0, 200));
+  assert.equal(r.body.pipeline, "patch", "fast-path rides the patch pipeline");
+  const ws = r.body.spec.sections.flatMap((x: any) => x.widgets);
+  assert.equal(ws.find((w: any) => w.id === "w_bar")?.kind, "donut", "the selected widget changed");
+  assert.equal(ws.find((w: any) => w.id === "w_kpi")?.kind, "kpi", "…and nothing else did");
+  assert.equal(ws.length, 2, "no widget churn");
+  console.log("pipeline: targeted-edit fast-path (no model, exact target) ✅");
+})();
+
 console.log("pipeline.test.ts: all assertions passed ✅");

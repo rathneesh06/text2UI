@@ -28,7 +28,7 @@ const WIDGET_FIELDS = {
   properties: {
     kind: { type: "string", enum: ["kpi", "line", "bar", "area", "pie", "donut", "table"] },
     title: { type: "string" }, subtitle: { type: "string" }, table: { type: "string" },
-    metric: { type: "object", properties: { col: { type: "string" }, compare: { type: "object", description: "A4: adds a vs-previous-period delta chip. ONLY when a real temporal column exists; grain should suit the data span (month for a year of data). Windows are computed from the data, never by you.", properties: { grain: { type: "string", enum: ["day", "week", "month", "quarter", "year"] }, dateCol: { type: "string" } }, required: ["grain", "dateCol"] }, agg: { type: "string", enum: ["count", "count_distinct", "sum", "avg", "min", "max", "median"] }, label: { type: "string" }, format: { type: "string", enum: ["number", "percent", "currency", "hours", "days", "compact"] }, expr: { type: "object", properties: { op: { type: "string", enum: ["ratio", "pct", "diff"] }, num: { type: "object", properties: { col: { type: "string" }, agg: { type: "string" }, where: { type: "array", items: { type: "object", properties: { col: { type: "string" }, op: { type: "string", enum: ["=", "!=", ">", ">=", "<", "<=", "in", "not_in", "between", "contains", "not_null", "is_null"] }, value: { type: "string" }, values: { type: "array", items: { type: "string" } } }, required: ["col", "op"] } } }, required: ["agg"] }, den: { type: "object", properties: { col: { type: "string" }, agg: { type: "string" }, where: { type: "array", items: { type: "object", properties: { col: { type: "string" }, op: { type: "string", enum: ["=", "!=", ">", ">=", "<", "<=", "in", "not_in", "between", "contains", "not_null", "is_null"] }, value: { type: "string" }, values: { type: "array", items: { type: "string" } } }, required: ["col", "op"] } } }, required: ["agg"] } }, required: ["op", "num", "den"] } } },
+    metric: { type: "object", properties: { col: { type: "string" }, compare: { type: "object", description: "vs-previous-period delta; needs a real temporal dateCol", properties: { grain: { type: "string", enum: ["day", "week", "month", "quarter", "year"] }, dateCol: { type: "string" } }, required: ["grain", "dateCol"] }, agg: { type: "string", enum: ["count", "count_distinct", "sum", "avg", "min", "max", "median"] }, label: { type: "string" }, format: { type: "string", enum: ["number", "percent", "currency", "hours", "days", "compact"] }, expr: { type: "object", properties: { op: { type: "string", enum: ["ratio", "pct", "diff"] }, num: { type: "object", properties: { col: { type: "string" }, agg: { type: "string" }, where: { type: "array", items: { type: "object", properties: { col: { type: "string" }, op: { type: "string", enum: ["=", "!=", ">", ">=", "<", "<=", "in", "not_in", "between", "contains", "not_null", "is_null"] }, value: { type: "string" }, values: { type: "array", items: { type: "string" } } }, required: ["col", "op"] } } }, required: ["agg"] }, den: { type: "object", properties: { col: { type: "string" }, agg: { type: "string" }, where: { type: "array", items: { type: "object", properties: { col: { type: "string" }, op: { type: "string", enum: ["=", "!=", ">", ">=", "<", "<=", "in", "not_in", "between", "contains", "not_null", "is_null"] }, value: { type: "string" }, values: { type: "array", items: { type: "string" } } }, required: ["col", "op"] } } }, required: ["agg"] } }, required: ["op", "num", "den"] } } },
     x: { type: "object", properties: { col: { type: "string" }, timeGrain: { type: "string", enum: ["day", "week", "month", "quarter", "year"] }, label: { type: "string" } } },
     series: { type: "array", items: { type: "object", properties: { col: { type: "string" }, agg: { type: "string" }, label: { type: "string" }, format: { type: "string" }, expr: { type: "object", properties: { op: { type: "string", enum: ["ratio", "pct", "diff"] }, num: { type: "object", properties: { col: { type: "string" }, agg: { type: "string" }, where: { type: "array", items: { type: "object", properties: { col: { type: "string" }, op: { type: "string", enum: ["=", "!=", ">", ">=", "<", "<=", "in", "not_in", "between", "contains", "not_null", "is_null"] }, value: { type: "string" }, values: { type: "array", items: { type: "string" } } }, required: ["col", "op"] } } }, required: ["agg"] }, den: { type: "object", properties: { col: { type: "string" }, agg: { type: "string" }, where: { type: "array", items: { type: "object", properties: { col: { type: "string" }, op: { type: "string", enum: ["=", "!=", ">", ">=", "<", "<=", "in", "not_in", "between", "contains", "not_null", "is_null"] }, value: { type: "string" }, values: { type: "array", items: { type: "string" } } }, required: ["col", "op"] } } }, required: ["agg"] } }, required: ["op", "num", "den"] } } } },
     columns: { type: "array", items: { type: "object", properties: { col: { type: "string" }, label: { type: "string" }, agg: { type: "string", enum: ["count", "count_distinct", "sum", "avg", "min", "max", "median"] }, format: { type: "string", enum: ["number", "percent", "currency", "hours", "days", "compact"] } } } },
@@ -105,6 +105,41 @@ export interface EditOp {
   id?: string; set?: any; widget?: any; sectionId?: string; meta?: any;
 }
 
+// ---- TARGETED-EDIT FAST-PATH (deterministic beats clever) ---------------------------
+// When a widget is SELECTED and the request is one of the common direct
+// gestures, the op is fully determined — no model call, no fallback risk, no
+// possibility of a full-board edit. This is why click-to-target must never
+// degrade: the click + a simple sentence IS the op.
+const KINDS = "donut|pie|bar|line|area|table";
+const DEIXIS = "(?:this|it|that|this one|that one|this widget|this chart|this card)";
+export function deterministicSelectionOps(
+  userPrompt: string, selectedId: string | undefined, current: DashboardSpec,
+): EditOp[] | null {
+  if (!selectedId) return null;
+  const exists = current.sections?.some((s) => s.widgets?.some((w: any) => w.id === selectedId));
+  if (!exists) return null;
+  const p = userPrompt.trim();
+
+  // "make this a donut" / "turn it into a bar chart" / "as a pie"
+  let m = p.match(new RegExp(`^(?:make|turn|change|convert|render|show)\\s+${DEIXIS}\\s+(?:into\\s+|to\\s+|as\\s+)?an?\\s+(${KINDS})(?:\\s*chart)?\\s*[.!]?$`, "i"));
+  if (m) return [{ op: "update_widget", id: selectedId, set: { kind: m[1].toLowerCase() } } as any];
+
+  // "remove this" / "delete that one" — selection + the user's OWN removal words
+  m = p.match(new RegExp(`^(?:remove|delete|drop|get rid of)\\s+${DEIXIS}\\s*[.!]?$`, "i"));
+  if (m) return [{ op: "remove_widget", id: selectedId } as any];
+
+  // "rename this to X" / "call it X" / "title this X"
+  m = p.match(new RegExp(`^(?:rename|retitle)\\s+${DEIXIS}\\s+(?:to\\s+|as\\s+)?["']?(.{1,80}?)["']?\\s*[.!]?$`, "i"))
+    ?? p.match(new RegExp(`^(?:call|title|label)\\s+${DEIXIS}\\s+["']?(.{1,80}?)["']?\\s*[.!]?$`, "i"));
+  if (m) return [{ op: "update_widget", id: selectedId, set: { title: m[1].trim() } } as any];
+
+  // "show only 5 rows" / "limit this to 10" — meaningful for tables and charts
+  m = p.match(new RegExp(`^(?:show\\s+only|limit\\s+${DEIXIS}\\s+to|top)\\s+(\\d{1,3})(?:\\s+rows?)?\\s*[.!]?$`, "i"));
+  if (m) return [{ op: "update_widget", id: selectedId, set: { limit: Number(m[1]) } } as any];
+
+  return null; // anything richer goes to the model, selection attached
+}
+
 /** Ask the model for the minimal op list. Null on any failure — caller falls back. */
 export async function planEditOps(input: PlanEditOpsInput, run: EditRun = callGemini): Promise<EditOp[] | null> {
   const user = [
@@ -112,7 +147,7 @@ export async function planEditOps(input: PlanEditOpsInput, run: EditRun = callGe
     "CURRENT DASHBOARD SPEC (edit against these ids):", JSON.stringify(input.currentSpec), "",
     ...(input.chatContext ? ["CONVERSATION:", input.chatContext, ""] : []),
     ...(input.selectedWidget?.id || input.selectedWidget?.title
-      ? [`SELECTED WIDGET (the user's "this"): id=${input.selectedWidget.id ?? "?"} title="${input.selectedWidget.title ?? ""}"`, ""] : []),
+      ? [`SELECTED WIDGET: id=${input.selectedWidget.id ?? "?"} title="${input.selectedWidget.title ?? ""}". Demonstratives (this/it/that one) refer to THIS widget — ops answering such phrasing MUST target exactly this id and touch nothing else.`, ""] : []),
     ...(input.directive ? ["GUIDANCE:", input.directive, ""] : []),
     "USER EDIT REQUEST:", input.userPrompt, "",
     'Return {"ops":[...]}.',
@@ -120,8 +155,17 @@ export async function planEditOps(input: PlanEditOpsInput, run: EditRun = callGe
   try {
     const { text } = await run(SYSTEM + editOpsFewshotBlock(), user, { ...ORCHESTRATE_OPTS, responseSchema: EDIT_OPS_SCHEMA });
     const parsed = JSON.parse(stripFences(text));
-    if (!Array.isArray(parsed?.ops)) return null;
-    const ops = parsed.ops.filter((o: any) => o && typeof o.op === "string");
+    if (!Array.isArray(parsed?.ops)) { console.warn(`[edit-ops] no ops array in response: ${String(text).slice(0, 160)}`); return null; }
+    const specIds = new Set((input.currentSpec.sections ?? []).flatMap((s) => (s.widgets ?? []).map((w: any) => w.id)));
+    const ops = parsed.ops.filter((o: any) => {
+      if (!o || typeof o.op !== "string") return false;
+      // Few-shot bleed guard: example ids can never be right on a real board.
+      if (o.id && !specIds.has(o.id) && ["k1", "c1", "t1"].includes(o.id)) {
+        console.warn(`[edit-ops] dropped op targeting few-shot example id "${o.id}"`);
+        return false;
+      }
+      return true;
+    });
     console.log(`[edit-ops] ${ops.length} op(s): ${ops.map((o: EditOp) => `${o.op}${o.id ? `(${o.id})` : ""}`).join(" ")}`);
     return ops as EditOp[];
   } catch (err) {

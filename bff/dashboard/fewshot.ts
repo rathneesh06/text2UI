@@ -93,7 +93,7 @@ export function editOpsFewshotBlock(): string {
     const sel = e.selectedId ? ` (selected widget: ${e.selectedId})` : "";
     return `User: "${e.user}"${sel}\nOps: ${JSON.stringify(e.ops)}\nWhy: ${e.lesson}`;
   });
-  return `\n\nWORKED EXAMPLES on a board with widgets k1 (kpi "Total Records"), c1 (bar "Records by Category"), t1 (table "Recent Records", columns category/status/amount/created_at):\n${lines.join("\n---\n")}`;
+  return `\n\nWORKED EXAMPLES on a board with widgets k1 (kpi "Total Records"), c1 (bar "Records by Category"), t1 (table "Recent Records", columns category/status/amount/created_at). The ids k1/c1/t1 exist ONLY in these examples — NEVER emit them; real ops use ids from the CURRENT DASHBOARD SPEC:\n${lines.join("\n---\n")}`;
 }
 
 // ---- Decompose examples: prompt → grounded tasks, across distant shapes -------------

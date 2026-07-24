@@ -36,7 +36,7 @@ import { mergeHarvest, seededPalette } from "./merge";
 import { compileSpec } from "./compile";
 import { pushVersion, undo, redo, decisionsText, detectHistoryIntent, cursorIndex } from "./session";
 import { reconcileEdit } from "./reconcile";
-import { planEditOps, applyOps } from "./patch";
+import { planEditOps, applyOps, deterministicSelectionOps } from "./patch";
 import { renderPlanToApp } from "./renderer";
 import { verifySpecJoins, type ReadAll } from "../sources/relationships";
 import { captureRunner, recordTurn, replayCaptureEnabled } from "./replay-capture";
@@ -181,7 +181,16 @@ export async function handleDashboardBuild(
   // op-planning tests inject agentRun.
   const opsPathEnabled = !legacyPlannerInjected && !(deps.planner && !deps.agentRun);
   if (!spec && currentSpec && opsPathEnabled) {
-    const ops = await planEditOps(
+    // TARGETED-EDIT FAST-PATH: a selected widget + a direct gesture ("make
+    // this a donut", "remove this", "rename this to X", "show only 5") is
+    // fully determined — resolved with NO model call, so a targeted edit can
+    // never degrade into a full-board re-plan for the common cases.
+    const fast = deterministicSelectionOps(String(b.userPrompt), selectedWidget?.id, currentSpec);
+    if (fast) {
+      console.log(`[edit-ops] deterministic selection fast-path: ${fast.map((o) => `${o.op}(${(o as any).id})`).join(" ")}`);
+      audit({ turnId, conversationId, stage: "edit_ops", detail: { fastPath: true, ops: fast } });
+    }
+    const ops = fast ?? await planEditOps(
       { datasets, userPrompt: b.userPrompt, currentSpec, chatContext, selectedWidget, directive: enhancement.styleHints ?? undefined },
       deps.agentRun,
     );
@@ -218,7 +227,12 @@ export async function handleDashboardBuild(
       audit({ turnId, conversationId, stage: "edit_ops", detail: { applied: r.applied, rejected: r.rejected, notes: r.notes } });
       if (r.rejected.length) console.log(`[dashboard] ops rejected: ${r.rejected.join(" | ")}`);
     } else {
+      // HONEST DEGRADATION: the fallback re-plans the WHOLE board (reconcile
+      // heals kept widgets, but layout/wording can shift). The user must be
+      // told this was the coarse path, not the precise one.
       console.warn("[dashboard] op planning failed — falling back to full-spec edit + reconciliation");
+      healedNotes = [...healedNotes,
+        "The precise edit planner was unavailable for this request, so a full-board re-plan was applied (unchanged widgets were healed back). If only one widget should change, keep it selected and phrase the change directly."];
     }
   }
   if (!spec) {
