@@ -125,7 +125,47 @@ export function seriesKey(m: Metric, i: number): string {
 
 // ---- builders --------------------------------------------------------------
 
+const GRAIN_STEP: Record<string, string> = {
+  day: "INTERVAL 1 DAY", week: "INTERVAL 7 DAY", month: "INTERVAL 1 MONTH",
+  quarter: "INTERVAL 3 MONTH", year: "INTERVAL 1 YEAR",
+};
+
+/** A4: the comparison anchor — the latest <grain> bucket present in the DATA,
+ *  from a scalar subquery over the BASE table (own scope: unqualified, no
+ *  alias, independent of join scoping). Deterministic; the model never writes
+ *  windows. */
+function compareAnchor(w: KpiWidget, grain: string, dateCol: string): string {
+  return `date_trunc('${grain}', (SELECT max(${qid(dateCol)}) FROM ${qid(w.table)}))`;
+}
+
+/** Wrap a metric so every aggregate is windowed by `cond` — plain metrics get
+ *  agg(...) FILTER (WHERE cond); expr sides AND cond into their own FILTER. */
+function windowedMetricExpr(m: KpiWidget["metric"], cond: string): string {
+  if (m.expr) {
+    const side = (b: { col: string; agg: Agg; where?: Filter[] }) => {
+      const own = (b.where ?? []).map(oneFilter);
+      return `${aggExpr(b.agg, b.col)} FILTER (WHERE ${[...own, cond].join(" AND ")})`;
+    };
+    const num = side(m.expr.num); const den = side(m.expr.den);
+    if (m.expr.op === "ratio") return `(${num} * 1.0 / nullif(${den}, 0))`;
+    if (m.expr.op === "pct") return `(${num} * 100.0 / nullif(${den}, 0))`;
+    return `(${num} - ${den})`;
+  }
+  return `${aggExpr(m.agg, m.col)} FILTER (WHERE ${cond})`;
+}
+
 export function buildKpiSql(w: KpiWidget, extraWhere?: string[]): string {
+  const cmp = w.metric.compare;
+  if (cmp && GRAIN_STEP[cmp.grain]) {
+    // Two adjacent windows in ONE query: the latest bucket in the data and the
+    // one immediately before it. prev_value NULL/0 → the renderer shows no chip.
+    const anchor = compareAnchor(w, cmp.grain, cmp.dateCol);
+    const cur = `date_trunc('${cmp.grain}', ${qcol(cmp.dateCol)}) = ${anchor}`;
+    const prev = `date_trunc('${cmp.grain}', ${qcol(cmp.dateCol)}) = ${anchor} - ${GRAIN_STEP[cmp.grain]}`;
+    return withJoin(w, () =>
+      `SELECT ${windowedMetricExpr(w.metric, cur)} AS value, ${windowedMetricExpr(w.metric, prev)} AS prev_value ` +
+      `FROM ${fromClause(w)}${whereClause(w.filters, extraWhere)}`);
+  }
   return withJoin(w, () => `SELECT ${metricExpr(w.metric)} AS value FROM ${fromClause(w)}${whereClause(w.filters, extraWhere)}`);
 }
 

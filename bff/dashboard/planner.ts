@@ -27,7 +27,7 @@ const METRIC = {
     agg: { type: "string", enum: ["count", "count_distinct", "sum", "avg", "min", "max", "median"] },
     label: { type: "string" },
     format: { type: "string", enum: ["number", "compact", "percent", "currency", "hours", "days"] },
-    expr: { type: "object", description: "derived metric: ratio=num/den, pct=num/den*100, diff=num-den — use for rates and percentages; never format a plain sum as percent", properties: { op: { type: "string", enum: ["ratio", "pct", "diff"] }, num: BASE_METRIC, den: BASE_METRIC }, required: ["op", "num", "den"] },
+    expr: { type: "object", description: "derived metric: ratio=num/den, pct=num/den*100, diff=num-den — use for rates and percentages; never format a plain sum as percent", properties: { op: { type: "string", enum: ["ratio", "pct", "diff"] }, num: BASE_METRIC, den: BASE_METRIC }, required: ["op", "num", "den"] }, compare: { type: "object", description: "A4: adds a vs-previous-period delta chip. ONLY when a real temporal column exists; grain should suit the data span (month for a year of data). Windows are computed from the data, never by you.", properties: { grain: { type: "string", enum: ["day", "week", "month", "quarter", "year"] }, dateCol: { type: "string" } }, required: ["grain", "dateCol"] },
   },
   required: ["col", "agg"],
 };

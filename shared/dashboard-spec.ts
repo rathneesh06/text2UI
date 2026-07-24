@@ -31,7 +31,17 @@ export interface Metric {
    *    diff  → num - den
    *  Division by zero yields NULL (renders as "—"), never garbage. */
   expr?: MetricExpr;
+  /** A4: period comparison — a delta chip "vs prev <grain>". Windows are
+   *  anchored at max(dateCol) IN THE DATA (latest bucket vs the one before),
+   *  computed deterministically in SQL; the model never writes the windows.
+   *  Valid only when dateCol is a real temporal column; validation repairs a
+   *  missing/wrong dateCol from the table's temporal column or strips compare
+   *  (the KPI itself always survives). */
+  compare?: Compare;
 }
+
+export type CompareGrain = "day" | "week" | "month" | "quarter" | "year";
+export interface Compare { grain: CompareGrain; dateCol: string }
 
 export type ExprOp = "ratio" | "pct" | "diff";
 /** One side of a derived expression: a plain aggregate, no nesting. `where`

@@ -282,6 +282,7 @@ const KINDS = new Set(["kpi", "line", "bar", "area", "pie", "donut", "table"]);
 const AGGS = new Set<Agg>(["count", "count_distinct", "sum", "avg", "min", "max", "median"]);
 const GRAINS = new Set<TimeGrain>(["day", "week", "month", "quarter", "year"]);
 const FORMATS = new Set<ValueFormat>(["number", "compact", "percent", "currency", "hours", "days"]);
+const COMPARE_GRAINS = new Set(["day", "week", "month", "quarter", "year"]);
 const OPS = new Set<FilterOp>(["=", "!=", ">", ">=", "<", "<=", "in", "not_in", "between", "contains", "not_null", "is_null"]);
 
 function str(v: unknown, what: string, max = 200): string {
@@ -331,6 +332,13 @@ function sanMetric(m: any, what: string): Metric {
   const col = agg === "count" || hasExpr ? String(m.col ?? "") : str(m.col, `${what}.col`);
   const out: Metric = { col, agg };
   const label = optStr(m.label, `${what}.label`); if (label) out.label = label;
+  // A4: compare must survive the sanitizer's whitelist rebuild or the delta
+  // chip vanishes on the first filter change (build↔runtime parity).
+  if (m.compare !== undefined && m.compare !== null) {
+    const c = m.compare;
+    if (!c || typeof c !== "object" || !COMPARE_GRAINS.has(c.grain)) badValue(`${what}.compare.grain invalid`);
+    out.compare = { grain: c.grain, dateCol: str(c.dateCol, `${what}.compare.dateCol`) };
+  }
   if (m.format !== undefined) { if (!FORMATS.has(m.format)) badValue(`${what}.format invalid`); out.format = m.format; }
   // A2: derived expression — a closed AST; both sides re-validated, op whitelisted.
   if (m.expr !== undefined && m.expr !== null) {

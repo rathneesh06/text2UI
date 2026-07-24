@@ -444,4 +444,36 @@ await (async () => {
   console.log("pipeline: click-to-target selection contract ✅");
 })();
 
+
+// ---- 15. A4 COMPARE: three-surface symmetry + compiled shape ----------------
+await (async () => {
+  const fs = await import("node:fs");
+  const read = (f: string) => fs.readFileSync(new URL(f, import.meta.url), "utf8");
+  // (a) every surface knows compare: spec grammar, all three schemas, the
+  // sanitizer whitelist, the validator repair, and the compiler.
+  for (const f of ["../../shared/dashboard-spec.ts", "./agents.ts", "./planner.ts", "./patch.ts", "./filters.ts", "./validate.ts", "./sql.ts"]) {
+    assert.ok(read(f).includes("compare"), `${f} knows compare`);
+  }
+  for (const f of ["./agents.ts", "./planner.ts", "./patch.ts"]) {
+    assert.ok(read(f).includes('enum: ["day", "week", "month", "quarter", "year"]'), `${f} schema enumerates the grains`);
+  }
+  // (b) the compiled shape: two columns, adjacent-window step, base-table anchor.
+  const { buildKpiSql: kSql } = await import("./sql");
+  const sql = kSql({ id: "k", kind: "kpi", title: "T", table: "t",
+    metric: { col: "", agg: "count", compare: { grain: "quarter", dateCol: "d" } } } as any);
+  assert.ok(sql.includes("AS value") && sql.includes("AS prev_value"), "two windows, one query: " + sql);
+  assert.ok(sql.includes("INTERVAL 3 MONTH"), "quarter steps by 3 months");
+  assert.ok(sql.includes('(SELECT max("d") FROM "t")'), "anchor = the DATA's own max date");
+  // (c) an unknown grain never compiles a window (falls back to the plain KPI).
+  const plain = kSql({ id: "k", kind: "kpi", title: "T", table: "t",
+    metric: { col: "", agg: "count", compare: { grain: "fortnight", dateCol: "d" } } } as any);
+  assert.ok(!plain.includes("prev_value"), "unknown grain → plain KPI, never bad SQL");
+  // (d) the renderer shows the chip only for compared KPIs and never invents one.
+  const rsrc = read("./renderer.ts");
+  assert.ok(rsrc.includes("function DeltaChip"), "delta chip exists");
+  assert.ok(rsrc.includes("p === 0) return null"), "zero/absent previous → no chip");
+  assert.ok(rsrc.includes("vs prev"), "chip names the comparison window");
+  console.log("pipeline: A4 compare symmetry + compiled shape ✅");
+})();
+
 console.log("pipeline.test.ts: all assertions passed ✅");

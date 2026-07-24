@@ -167,10 +167,29 @@ function toggleSelect(w, type, kind, sql) {
   }
 }
 var SEL_RING = " ring-2 ring-offset-2 ring-[var(--accent,#4f46e5)]";
+// A4: the vs-previous-period delta chip. Shown only when BOTH windows have a
+// real value and the previous is non-zero — a chip is never invented.
+function DeltaChip(props) {
+  const v = Number(props.value); const p = Number(props.prev);
+  if (props.value == null || props.prev == null || !isFinite(v) || !isFinite(p) || p === 0) return null;
+  const pct = ((v - p) / Math.abs(p)) * 100;
+  const up = pct >= 0;
+  const cls = up ? "text-emerald-600 bg-emerald-50" : "text-rose-600 bg-rose-50";
+  const arrow = up ? "\u25B2" : "\u25BC";
+  const label = Math.abs(pct) >= 100 ? Math.round(Math.abs(pct)) : Math.round(Math.abs(pct) * 10) / 10;
+  return (
+    <span className={"inline-flex items-center gap-1 rounded-full px-2 py-0.5 text-[11px] font-semibold " + cls}
+          title={"Latest " + props.grain + " vs the one before, from the data's own dates"}>
+      {arrow} {label}% <span className="font-normal opacity-70">vs prev {props.grain}</span>
+    </span>
+  );
+}
 function Kpi(props) {
   const w = props.w;
   const s = useRows(props.sql, w);
   const value = s.rows && s.rows[0] ? s.rows[0].value : null;
+  const prev = s.rows && s.rows[0] ? s.rows[0].prev_value : null;
+  const cmp = w.metric && w.metric.compare;
   const chip = COLORS[(props.idx || 0) % COLORS.length];
   const isSel = useSelected(w.id);
   return (
@@ -184,7 +203,10 @@ function Kpi(props) {
       </div>
       {s.loading ? <div className="mt-2 h-8 w-24 animate-pulse rounded bg-slate-100" />
         : s.error ? <ErrorBox msg={s.error} />
-        : <div className={"mt-0.5 font-bold tabular-nums tracking-tight" + KPI_TXT} style={{ color: ACCENT }}>{fmt(value, (w.metric && w.metric.format) || w.format)}</div>}
+        : <div className="mt-0.5 flex items-baseline gap-2 flex-wrap">
+            <span className={"font-bold tabular-nums tracking-tight" + KPI_TXT} style={{ color: ACCENT }}>{fmt(value, (w.metric && w.metric.format) || w.format)}</span>
+            {cmp ? <DeltaChip value={value} prev={prev} grain={cmp.grain} /> : null}
+          </div>}
       {w.subtitle ? <div className="mt-0.5 text-xs text-slate-400">{w.subtitle}</div> : null}
     </div>
   );

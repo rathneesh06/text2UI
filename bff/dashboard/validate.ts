@@ -343,7 +343,25 @@ export function validateSpec(spec: DashboardSpec, profiles: Dataset[]): Validati
         warn(`kpi "${w.id}" ("${w.title}"): titled as a rate but computes ${m.agg}(${m.col || "*"}) — retitled to "${honest}". Use expr {op:"pct"} with a conditional numerator for a real rate`);
         return { ...w, title: honest, metric: m };
       }
-      return { ...w, metric: m };
+      // A4: compare — valid only against a real temporal column on the KPI's
+      // table. Wrong dateCol → repaired from the table's temporal column;
+      // none exists → compare stripped WITH a warning (the KPI survives).
+      let met = m;
+      if (met.compare) {
+        // cols here maps column name → TYPE string.
+        const isDateType = (ty: unknown) => String(ty ?? "").toLowerCase().includes("date");
+        if (!isDateType(cols.get(met.compare.dateCol))) {
+          const t = [...cols.entries()].find(([, ty]) => isDateType(ty));
+          if (t) {
+            warn(`kpi "${w.id}": compare.dateCol "${met.compare.dateCol}" is not a temporal column — repaired to "${t[0]}"`);
+            met = { ...met, compare: { ...met.compare, dateCol: t[0] } };
+          } else {
+            warn(`kpi "${w.id}": compare needs a temporal column and ${w.table} has none — comparison removed (the KPI itself stays)`);
+            const { compare: _drop, ...rest } = met; met = rest as Metric;
+          }
+        }
+      }
+      return { ...w, metric: met };
     }
 
     if (w.kind === "table") {

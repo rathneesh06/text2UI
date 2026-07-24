@@ -15,7 +15,7 @@
 //   pie    → pie/donut charts (composition on low-cardinality categories)
 //   table  → detail / grouped tables
 import type { Dataset } from "../../shared/types";
-import type { KpiWidget, ChartWidget, TableWidget, Widget, Filter } from "../../shared/dashboard-spec";
+import type { Compare, KpiWidget, ChartWidget, TableWidget, Widget, Filter } from "../../shared/dashboard-spec";
 import { callGemini, ORCHESTRATE_OPTS, type GenResult, type GenOptions } from "../aiflow";
 import { classifySchema, type SchemaRoles } from "./enhance";
 import { tasksForAgent, taskDirective, type AnalysisTask } from "./decompose";
@@ -31,7 +31,7 @@ const FORMAT = { type: "string", enum: ["number", "compact", "percent", "currenc
 const FILTER_ITEM = { type: "object", properties: { col: { type: "string" }, op: { type: "string", enum: ["=", "!=", ">", ">=", "<", "<=", "in", "not_in", "between", "contains", "not_null", "is_null"] }, value: { type: "string", description: "literal value; pass numbers as strings. For contains: the substring to search" }, values: { type: "array", items: { type: "string" }, description: "for in/not_in: the list; for between: exactly [lo, hi]" } }, required: ["col", "op"] };
 const BASE_METRIC = { type: "object", properties: { col: { type: "string" }, agg: AGG, where: { type: "array", description: "conditions making this side CONDITIONAL, e.g. count where sla_status='met'", items: FILTER_ITEM } }, required: ["col", "agg"] };
 const METRIC_EXPR = { type: "object", description: "derived metric: ratio=num/den, pct=num/den*100, diff=num-den. Use for rates, percentages, per-X averages. num and den MUST differ (identical sides = a meaningless constant 100%); make the numerator conditional with where when the qualifying rows are marked by a column value. NEVER label a plain sum as a percent.", properties: { op: { type: "string", enum: ["ratio", "pct", "diff"] }, num: BASE_METRIC, den: BASE_METRIC }, required: ["op", "num", "den"] };
-const METRIC = { type: "object", properties: { col: { type: "string" }, agg: AGG, label: { type: "string" }, format: FORMAT, expr: METRIC_EXPR }, required: ["col", "agg"] };
+const METRIC = { type: "object", properties: { compare: { type: "object", description: "A4: adds a vs-previous-period delta chip. ONLY when a real temporal column exists; grain should suit the data span (month for a year of data). Windows are computed from the data, never by you.", properties: { grain: { type: "string", enum: ["day", "week", "month", "quarter", "year"] }, dateCol: { type: "string" } }, required: ["grain", "dateCol"] }, col: { type: "string" }, agg: AGG, label: { type: "string" }, format: FORMAT, expr: METRIC_EXPR }, required: ["col", "agg"] };
 const DIMENSION = { type: "object", properties: { col: { type: "string" }, timeGrain: { type: "string", enum: ["day", "week", "month", "quarter", "year"] }, label: { type: "string" } }, required: ["col"] };
 
 const wrap = (item: unknown) => ({ type: "object", properties: { widgets: { type: "array", items: item } }, required: ["widgets"] });
@@ -90,6 +90,13 @@ const wid = (p: string) => `${p}${++seq}_${Math.random().toString(36).slice(2, 6
 // the degenerate count/count, which the guard then rightly kills. That exact
 // strip is why builds kept losing their SLA KPI.
 const COERCE_OPS = new Set(["=", "!=", ">", ">=", "<", "<=", "in", "not_in", "between", "contains", "not_null", "is_null"]);
+const COMPARE_GRAINS = new Set(["day", "week", "month", "quarter", "year"]);
+function coerceCompare(c: any): { compare?: Compare } {
+  if (!c || typeof c !== "object") return {};
+  if (!COMPARE_GRAINS.has(c.grain) || typeof c.dateCol !== "string" || !c.dateCol.trim()) return {};
+  return { compare: { grain: c.grain, dateCol: c.dateCol.trim() } };
+}
+
 function coerceWhere(w: any): { where?: Filter[] } {
   if (!Array.isArray(w)) return {};
   const kept = w
@@ -134,7 +141,7 @@ function coerceWidgetFilters(w: any): { filters?: Filter[] } {
 function coerceKpis(parsed: any): KpiWidget[] {
   const arr = Array.isArray(parsed?.widgets) ? parsed.widgets : [];
   return arr.filter((w: any) => w?.title && w?.table && w?.metric?.col && w?.metric?.agg)
-    .map((w: any): KpiWidget => ({ id: wid("kpi"), kind: "kpi", title: String(w.title), ...(w.subtitle ? { subtitle: String(w.subtitle) } : {}), table: String(w.table), metric: { col: String(w.metric.col), agg: w.metric.agg, label: w.metric.label, format: w.metric.format, ...coerceExpr(w.metric.expr) }, ...coerceWidgetFilters(w), ...coerceJoin(w), width: "quarter" }));
+    .map((w: any): KpiWidget => ({ id: wid("kpi"), kind: "kpi", title: String(w.title), ...(w.subtitle ? { subtitle: String(w.subtitle) } : {}), table: String(w.table), metric: { col: String(w.metric.col), agg: w.metric.agg, label: w.metric.label, format: w.metric.format, ...coerceExpr(w.metric.expr), ...coerceCompare(w.metric.compare) }, ...coerceWidgetFilters(w), ...coerceJoin(w), width: "quarter" }));
 }
 
 function coerceCharts(parsed: any, kinds: ChartWidget["kind"][], fallbackKind: ChartWidget["kind"]): ChartWidget[] {
