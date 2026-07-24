@@ -139,14 +139,44 @@ function kpiGlyph(w) {
   if (a === "count_distinct") return "\u2211";
   return "#";
 }
+// Click-to-target selection: one shared store so every card can show the ring
+// without prop threading. Click selects (ring + message to the host chat);
+// clicking the same card again — or pressing Escape — clears both sides.
+var SEL = { id: null, subs: [] };
+function useSelected(id) {
+  const pair = useState(SEL.id === id);
+  const on = pair[0]; const set = pair[1];
+  useEffect(function () {
+    function sub(sid) { set(sid === id); }
+    SEL.subs.push(sub);
+    return function () { SEL.subs = SEL.subs.filter(function (f) { return f !== sub; }); };
+  }, [id]);
+  return on;
+}
+function setSelected(id) {
+  SEL.id = id;
+  SEL.subs.forEach(function (f) { f(id); });
+}
+function toggleSelect(w, type, kind, sql) {
+  if (SEL.id === w.id) {
+    setSelected(null);
+    if (selectFeature) selectFeature({ cleared: true, id: w.id });
+  } else {
+    setSelected(w.id);
+    if (selectFeature) selectFeature({ id: w.id, title: w.title, type: type, kind: kind, query: sql });
+  }
+}
+var SEL_RING = " ring-2 ring-offset-2 ring-[var(--accent,#4f46e5)]";
 function Kpi(props) {
   const w = props.w;
   const s = useRows(props.sql, w);
   const value = s.rows && s.rows[0] ? s.rows[0].value : null;
   const chip = COLORS[(props.idx || 0) % COLORS.length];
+  const isSel = useSelected(w.id);
   return (
-    <div className={widthClass(w.width || "quarter") + CARD_CLS + " cursor-pointer"}
-         onClick={function () { if (selectFeature) selectFeature({ id: w.id, title: w.title, type: "kpi", kind: "kpi", query: props.sql }); }}>
+    <div className={widthClass(w.width || "quarter") + CARD_CLS + " cursor-pointer" + (isSel ? SEL_RING : "")}
+         title={isSel ? "Selected — your next edit targets this. Click again or press Escape to clear." : "Click to target this widget in chat"}
+         onClick={function () { toggleSelect(w, "kpi", "kpi", props.sql); }}>
       <div className="flex items-start justify-between gap-2">
         <div className="text-[11px] font-semibold uppercase tracking-wider text-slate-500 pt-1">{w.title}</div>
         <div className="flex-none flex items-center justify-center rounded-lg font-semibold"
@@ -161,6 +191,7 @@ function Kpi(props) {
 }
 function Chart(props) {
   const w = props.w;
+  const chartSel = useSelected(w.id);
   const keys = props.seriesKeys || [];
   const s = useRows(props.sql, w);
   // C1: per-series value formats travel on seriesKeys — apply them on the
@@ -236,12 +267,15 @@ function Chart(props) {
   }
   return (
     <Card width={w.width || "half"} title={w.title} subtitle={w.subtitle}>
-      <div onClick={function () { if (selectFeature) selectFeature({ id: w.id, title: w.title, type: "chart", kind: w.kind, query: props.sql }); }}>{body()}</div>
+      <div className={chartSel ? SEL_RING + " rounded-xl" : ""}
+           title={chartSel ? "Selected — click again or press Escape to clear" : "Click to target this widget in chat"}
+           onClick={function () { toggleSelect(w, "chart", w.kind, props.sql); }}>{body()}</div>
     </Card>
   );
 }
 function DataTable(props) {
   const w = props.w;
+  const tableSel = useSelected(w.id);
   const s = useRows(props.sql, w);
   const rows = s.rows || [];
   const headers = rows.length ? Object.keys(rows[0]) : [];
@@ -252,7 +286,9 @@ function DataTable(props) {
   (props.columns || []).forEach(function (c) { colMeta[c.key] = c; });
   return (
     <Card width={w.width || "full"} title={w.title} subtitle={w.subtitle}>
-      <div onClick={function () { if (selectFeature) selectFeature({ id: w.id, title: w.title, type: "table", kind: "table", query: props.sql }); }}>
+      <div className={tableSel ? SEL_RING + " rounded-xl" : ""}
+           title={tableSel ? "Selected — click again or press Escape to clear" : "Click to target this widget in chat"}
+           onClick={function () { toggleSelect(w, "table", "table", props.sql); }}>
       {s.loading ? <Loading /> : s.error ? <ErrorBox msg={s.error} /> : !rows.length ? <Empty filtered={s.filtered} /> : (
         <div className="overflow-x-auto">
           <table className="w-full text-sm">
@@ -335,6 +371,17 @@ function Widget(props) {
 }
 export default function App() {
   const [fv, setFv] = useState({});
+  useEffect(function () {
+    function onKey(e) {
+      if (e.key === "Escape" && SEL.id) {
+        var was = SEL.id;
+        setSelected(null);
+        if (selectFeature) selectFeature({ cleared: true, id: was });
+      }
+    }
+    window.addEventListener("keydown", onKey);
+    return function () { window.removeEventListener("keydown", onKey); };
+  }, []);
   function setFilter(id, v) { setFv(function (prev) { const n = Object.assign({}, prev); n[id] = v; return n; }); }
   function resetFilters() { setFv({}); }
   return (

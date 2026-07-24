@@ -424,4 +424,24 @@ await (async () => {
   console.log("pipeline: plan-brief merged call + vibrancy floor ✅");
 })();
 
+
+// ---- 14. CLICK-TO-TARGET: two-sided selection contract ----------------------
+await (async () => {
+  const fs = await import("node:fs");
+  const rsrc = fs.readFileSync(new URL("./renderer.ts", import.meta.url), "utf8");
+  // The generated app: ring on the selected card, toggle-off + Escape both emit
+  // the cleared payload so the host chip can never disagree with the preview.
+  assert.ok(rsrc.includes("toggleSelect(w"), "widgets select through the shared toggle");
+  assert.equal(rsrc.split('toggleSelect(w, "').length - 1, 3, "all three wrappers (kpi/chart/table) call it");
+  assert.ok(rsrc.includes("selectFeature({ cleared: true"), "toggle-off/Escape emit the cleared payload");
+  assert.ok(rsrc.includes('e.key === "Escape"'), "Escape clears the selection");
+  assert.ok(rsrc.includes("useSelected(w.id)"), "cards subscribe to the selection store");
+  // The host: honors cleared, and re-validates the selection against every new
+  // spec (ghost-selection guard).
+  const hsrc = fs.readFileSync(new URL("../../src/pages/ChatPage.tsx", import.meta.url), "utf8");
+  assert.ok(hsrc.includes("if (p.cleared) { setSelectedWidget(null); return; }"), "host honors the cleared payload");
+  assert.ok(hsrc.includes("GHOST-SELECTION GUARD"), "host re-validates selection on every spec");
+  console.log("pipeline: click-to-target selection contract ✅");
+})();
+
 console.log("pipeline.test.ts: all assertions passed ✅");

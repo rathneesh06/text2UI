@@ -110,11 +110,27 @@ export default function ChatPage({
   // holding it here is what turns the chat into a direct-manipulation editor:
   // click a chart, type "make this a pie", done.
   const [selectedWidget, setSelectedWidget] = useState<{ id?: string; title?: string; kind?: string } | null>(null);
+  // GHOST-SELECTION GUARD: after every build/edit, re-validate the selection
+  // against the new spec — clear it if the widget is gone (an edit removed it),
+  // refresh the chip's title/kind if the widget changed. The chip can never
+  // point at a widget that no longer exists.
+  useEffect(() => {
+    if (!selectedWidget?.id || !spec) return;
+    const live = (spec.sections ?? []).flatMap((s: any) => s.widgets ?? []).find((w: any) => w.id === selectedWidget.id);
+    if (!live) { setSelectedWidget(null); return; }
+    if (live.title !== selectedWidget.title || live.kind !== selectedWidget.kind) {
+      setSelectedWidget({ id: live.id, title: live.title, kind: live.kind });
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [spec]);
   useEffect(() => {
     const onMsg = (e: MessageEvent) => {
       const data = e.data as any;
       if (!data || data.type !== "t2ui.featureSelected" || !data.payload) return;
       const p = data.payload;
+      // Toggle-off / Escape in the preview clears the chip too — one state,
+      // never two truths.
+      if (p.cleared) { setSelectedWidget(null); return; }
       if (p.id || p.title) setSelectedWidget({ id: p.id, title: p.title, kind: p.kind ?? p.type });
     };
     window.addEventListener("message", onMsg);
