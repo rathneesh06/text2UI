@@ -38,6 +38,7 @@ import { enrollGeneration } from "./design-rag/enroll";
 import { generateDeck } from "./slides";
 import { orchestrate, composePrompt, gateTurn, ORCHESTRATOR_ENABLED } from "./orchestrator";
 import { getChatStore, type ChatStore } from "./chat-store";
+import { mountTools } from "./tools";
 import type { OrchestratorResult, ChatMessage } from "../shared/types";
 import { parseAllowedOrigins, corsOptions, securityHeaders, validateConfig, applyConfigCheck } from "./security";
 import { parseAuthTokens, authMiddleware, DEV_TENANT } from "./auth";
@@ -714,6 +715,11 @@ export function createServer() {
   app.use(cors(corsOptions(parseAllowedOrigins(process.env.ALLOWED_ORIGINS))));
   app.use(securityHeaders());
   app.use(express.json({ limit: process.env.BODY_LIMIT ?? "64mb" })); // dataset rows travel once at upload
+  // Migration façade (goal 6): the pipeline as composite tools + OpenAPI for
+  // platform import. Correctness stays inside; the flow carries state.
+  mountTools(app,
+    { listUploadDatasets: (t, p) => getStorage().listDatasets(t, p) },
+    (req) => (req as any).tenantId ?? DEV_TENANT);
 
   // P8: bearer-token-per-tenant auth on the API surface (/health stays open for liveness).
   app.use("/api", authMiddleware(parseAuthTokens(process.env.AUTH_TOKENS)));
