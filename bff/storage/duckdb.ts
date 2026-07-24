@@ -42,7 +42,35 @@ export class DuckDBStorage implements StorageEngine {
   private ready: Promise<void>;
 
   constructor(private dbPath: string) {
-    this.ready = this.init();
+    this.ready = this.guardInit();
+  }
+
+  /** Storage outages degrade, never crash (the ECONNREFUSED-kills-the-BFF
+   *  incident): init failures are CAUGHT here — an uncaught rejection parked
+   *  on a constructor field takes the whole process down on modern Node —
+   *  logged once with the actionable fix, and RETRIED lazily on next use so
+   *  bringing the database back restores service without a restart. */
+  private initFailed = false;
+  private warnedDown = false;
+  private guardInit(): Promise<void> {
+    return this.init().then(
+      () => { this.initFailed = false; },
+      (err: any) => {
+        this.initFailed = true;
+        if (!this.warnedDown) {
+          this.warnedDown = true;
+          console.warn(`[storage] ${this.dialect} unavailable (${err?.code ?? err?.message ?? err}) — persistence degraded, requests that need it will fail with a clear error. Is 'docker compose up -d db' running? Retrying on next use.`);
+        }
+      },
+    );
+  }
+  private async ensure(): Promise<void> {
+    await this.ready;
+    if (this.initFailed) {
+      this.ready = this.guardInit();
+      await this.ready;
+      if (this.initFailed) throw new Error(`${this.dialect} storage is unavailable (connection refused) — start it with 'docker compose up -d db' and retry`);
+    }
   }
 
   private async init(): Promise<void> {
@@ -79,7 +107,7 @@ export class DuckDBStorage implements StorageEngine {
   }
 
   private async connect(): Promise<DuckDBConnection> {
-    await this.ready;
+    await this.ensure();
     return this.instance.connect();
   }
 
@@ -295,7 +323,7 @@ export class DuckDBStorage implements StorageEngine {
   }
 
   async close(): Promise<void> {
-    await this.ready;
+    await this.ensure();
     this.instance.closeSync?.();
   }
 }

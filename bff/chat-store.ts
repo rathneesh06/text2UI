@@ -57,7 +57,12 @@ export class PgChatStore implements ChatStore {
 
   constructor(connectionString: string) {
     this.pool = new pg.Pool({ connectionString, max: 3 });
-    this.ready = this.init();
+    this.ready = this.init().catch((err: any) => {
+      // A dead chat store costs durability, never the process: callers already
+      // degrade ("memory unavailable"); an uncaught constructor-field rejection
+      // must not exist (the ECONNREFUSED-kills-the-BFF incident).
+      console.warn(`[chat-store] Postgres unavailable (${err?.code ?? err?.message ?? err}) — chat persistence degraded. Is 'docker compose up -d db' running?`);
+    });
   }
 
   private async init(): Promise<void> {

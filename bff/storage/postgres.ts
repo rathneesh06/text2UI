@@ -76,7 +76,35 @@ export class PostgresStorage implements StorageEngine {
 
   constructor(connectionString: string) {
     this.pool = new pg.Pool({ connectionString, max: 5 });
-    this.ready = this.init();
+    this.ready = this.guardInit();
+  }
+
+  /** Storage outages degrade, never crash (the ECONNREFUSED-kills-the-BFF
+   *  incident): init failures are CAUGHT here — an uncaught rejection parked
+   *  on a constructor field takes the whole process down on modern Node —
+   *  logged once with the actionable fix, and RETRIED lazily on next use so
+   *  bringing the database back restores service without a restart. */
+  private initFailed = false;
+  private warnedDown = false;
+  private guardInit(): Promise<void> {
+    return this.init().then(
+      () => { this.initFailed = false; },
+      (err: any) => {
+        this.initFailed = true;
+        if (!this.warnedDown) {
+          this.warnedDown = true;
+          console.warn(`[storage] ${this.dialect} unavailable (${err?.code ?? err?.message ?? err}) — persistence degraded, requests that need it will fail with a clear error. Is 'docker compose up -d db' running? Retrying on next use.`);
+        }
+      },
+    );
+  }
+  private async ensure(): Promise<void> {
+    await this.ready;
+    if (this.initFailed) {
+      this.ready = this.guardInit();
+      await this.ready;
+      if (this.initFailed) throw new Error(`${this.dialect} storage is unavailable (connection refused) — start it with 'docker compose up -d db' and retry`);
+    }
   }
 
   private async init(): Promise<void> {
@@ -154,7 +182,7 @@ export class PostgresStorage implements StorageEngine {
   }
 
   async replaceDatasets(projectId: string, datasets: DatasetUpload[]): Promise<DatasetMeta[]> {
-    await this.ready;
+    await this.ensure();
     const schema = schemaFor(projectId);
     for (const d of datasets) checkTableName(d.tableName);
 
@@ -215,7 +243,7 @@ export class PostgresStorage implements StorageEngine {
   }
 
   async listDatasets(projectId: string): Promise<DatasetMeta[]> {
-    await this.ready;
+    await this.ensure();
     schemaFor(projectId); // validates
     const r = await this.pool.query(
       `SELECT table_name, filename, row_count, profile_json
@@ -230,7 +258,7 @@ export class PostgresStorage implements StorageEngine {
   }
 
   async query(projectId: string, sql: string, opts: QueryOptions = {}): Promise<QueryResult> {
-    await this.ready;
+    await this.ensure();
     const schema = schemaFor(projectId);
     if (!opts.allowWrites) assertReadOnly(sql); // classifier first: consistent errors across engines
     const rowCap = opts.rowCap ?? DEFAULT_ROW_CAP;
@@ -262,7 +290,7 @@ export class PostgresStorage implements StorageEngine {
   }
 
   async upsertProject(projectId: string, name: string): Promise<void> {
-    await this.ready;
+    await this.ensure();
     schemaFor(projectId);
     await this.pool.query(
       `INSERT INTO public._projects (project_id, name) VALUES ($1, $2)
@@ -272,7 +300,7 @@ export class PostgresStorage implements StorageEngine {
   }
 
   async listProjects(): Promise<ProjectRecord[]> {
-    await this.ready;
+    await this.ensure();
     const r = await this.pool.query(`
       SELECT p.project_id, p.name, p.created_at, p.edited_at,
              COALESCE(v.n, 0) AS version_count,
@@ -292,7 +320,7 @@ export class PostgresStorage implements StorageEngine {
   }
 
   async getProject(projectId: string) {
-    await this.ready;
+    await this.ensure();
     schemaFor(projectId);
     const p = await this.pool.query(
       `SELECT project_id, name, created_at, edited_at FROM public._projects WHERE project_id = $1`, [projectId],
@@ -320,7 +348,7 @@ export class PostgresStorage implements StorageEngine {
   }
 
   async saveVersion(projectId: string, v: { num: number; label: string; app: unknown }): Promise<void> {
-    await this.ready;
+    await this.ensure();
     schemaFor(projectId);
     await this.pool.query(
       `INSERT INTO public._versions (project_id, version_num, label, app_json) VALUES ($1, $2, $3, $4)
@@ -331,7 +359,7 @@ export class PostgresStorage implements StorageEngine {
   }
 
   async deleteProject(projectId: string): Promise<void> {
-    await this.ready;
+    await this.ensure();
     const schema = schemaFor(projectId);
     await this.pool.query(`DROP SCHEMA IF EXISTS ${qid(schema)} CASCADE`);
     await this.pool.query(`DELETE FROM public._datasets WHERE project_id = $1`, [projectId]);
