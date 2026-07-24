@@ -112,6 +112,7 @@ export default function WorkbenchPage({ onUseWorkbenchSource, pgOnly = false }: 
   const [pgManual, setPgManual] = useState(false);
   const [pg, setPg] = useState<WbConnParts>({ dialect: "postgres", host: "", port: "5432", database: "", user: "postgres", password: "", ssl: false });
   const [connecting, setConnecting] = useState(false);
+  const [liveMode, setLiveMode] = useState(false); // goal 3: per-source live data plane (opt-in)
   const [conn, setConn] = useState<WbConnection | null>(null);
   const [connError, setConnError] = useState<string | null>(null);
 
@@ -173,9 +174,12 @@ export default function WorkbenchPage({ onUseWorkbenchSource, pgOnly = false }: 
       // Separator: ';' or newline — never legal inside mysql://, postgres://,
       // or key=value connection forms, so splitting is unambiguous.
       const lines = connStr.split(/[;\n]+/).map((l) => l.trim()).filter(Boolean);
+      // Send mode only when live is chosen — an unset mode keeps the server
+      // default, so the env flag still governs connects made outside this UI.
+      const mode = liveMode ? ("live" as const) : undefined;
       let c = manual
-        ? await wbConnectParts({ ...pg, dialect: "postgres" })
-        : await wbConnect(pgOnly ? normalizePgString(lines[0]) : lines[0]);
+        ? await wbConnectParts({ ...pg, dialect: "postgres" }, mode)
+        : await wbConnect(pgOnly ? normalizePgString(lines[0]) : lines[0], undefined, mode);
       if (!manual) {
         for (const line of lines.slice(1)) {
           c = await wbConnect(pgOnly ? normalizePgString(line) : line, c.connectionId);
@@ -190,7 +194,7 @@ export default function WorkbenchPage({ onUseWorkbenchSource, pgOnly = false }: 
     } finally {
       setConnecting(false);
     }
-  }, [pgOnly, pgManual, pg, connStr, connecting]);
+  }, [pgOnly, pgManual, pg, connStr, connecting, liveMode]);
 
   /** pgOnly: paste a postgres:// URI to pre-fill the form (decoded, reviewable). */
   const fillFromUri = useCallback((uri: string) => {
@@ -361,6 +365,10 @@ export default function WorkbenchPage({ onUseWorkbenchSource, pgOnly = false }: 
             </button>
           </div>
         )}
+        <label className="wb-connbar__mode">
+          <input type="checkbox" checked={liveMode} onChange={(e) => setLiveMode(e.target.checked)} disabled={connecting} />
+          <span><strong>Query live</strong> — dashboards read straight from this database on every view; nothing is copied or stored. Leave off to extract a snapshot first (safer for busy production databases).</span>
+        </label>
         {connError && <div className="wb-connbar__error">{connError}</div>}
       </div>
 

@@ -31,6 +31,11 @@ export interface ConnRecord {
   allTables: DbTableInfo[];                          // every table discovered (cheap), with exact SQL refs
   datasets: Dataset[];                               // profiled tables (schema + tiny samples)
   warnings: string[];
+  /** Per-source data-plane choice (goal 3): "live" = query the database
+   *  directly through the attach, store NOTHING; "snapshot" = extract-then-
+   *  query (today's default path). Unset → the T2SQL_LIVE_SOURCE env default.
+   *  Set at connect time or via POST /api/sql/:id/mode. */
+  mode?: "live" | "snapshot";
   /** Lightweight circuit state (blueprint: "mark degraded, force reconnect"). */
   status: "active" | "degraded";
   consecutiveFailures: number;
@@ -225,6 +230,7 @@ export function publicView(rec: ConnRecord) {
   return {
     connectionId: rec.id,
     status: rec.status,
+    mode: rec.mode ?? null,
     label: rec.label,
     allTables: rec.allTables,
     datasets: rec.datasets,

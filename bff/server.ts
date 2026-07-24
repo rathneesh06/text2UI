@@ -21,7 +21,7 @@ import { buildExportZip, buildConnectedZip } from "./export";
 import { generateReport } from "./report";
 import { COLO_PROJECT_ID, COLO_LABEL, coloAvailable, coloProfiles, coloQuery } from "./sources/colo";
 import { isWorkbenchProject, listWorkbenchSources, wbQuery, removeWorkbenchSource } from "./sources/workbench-store";
-import { handleSqlConnect, handleSqlSchema, handleSqlChat, handleSqlExtract, handleSqlExtractDb, handleSqlStageGet, handleSqlStageDiscard, handleSourceChat, handleCombineSources, liveQuery, LIVE_PREFIX } from "./text2sql/handler";
+import { handleSqlConnect, handleSqlSchema, handleSqlMode, handleSqlChat, handleSqlExtract, handleSqlExtractDb, handleSqlStageGet, handleSqlStageDiscard, handleSourceChat, handleCombineSources, liveQuery, LIVE_PREFIX } from "./text2sql/handler";
 import { handleDashboardBuild } from "./dashboard/handler";
 import { buildWidgetSql } from "./dashboard/filters";
 import { handleDeckBuild, handleDeckEdit } from "./deck/handler";
@@ -1034,6 +1034,10 @@ export function createServer() {
   });
   app.get("/api/sql/:connectionId/schema", (req, res) => {
     const { status, body } = handleSqlSchema(String(req.params.connectionId), req.tenantId ?? DEV_TENANT);
+    res.status(status).json(body);
+  });
+  app.post("/api/sql/:connectionId/mode", (req, res) => {
+    const { status, body } = handleSqlMode(String(req.params.connectionId), req.body, req.tenantId ?? DEV_TENANT);
     res.status(status).json(body);
   });
   app.post("/api/sql/chat", async (req, res) => {

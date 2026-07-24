@@ -75,12 +75,14 @@ export interface WbChatResponse {
 
 /** Connect + introspect. The connection string is sent once over the wire and the
  *  BFF never echoes credentials back. */
-export function wbConnect(connectionString: string, addTo?: string): Promise<WbConnection> {
+export function wbConnect(connectionString: string, addTo?: string, mode?: "live" | "snapshot"): Promise<WbConnection> {
   return request<WbConnection>("/api/sql/connect", {
     method: "POST",
     // al3: addTo binds this DB with an existing connection/group into ONE group
     // (merged schema, cross-DB joins) — the response's connectionId is the group.
-    body: JSON.stringify({ connectionString, ...(addTo ? { addTo } : {}) }),
+    // mode (goal 3): "live" reads straight from the database and stores nothing;
+    // omitted → the server default (snapshot unless T2SQL_LIVE_SOURCE=1).
+    body: JSON.stringify({ connectionString, ...(addTo ? { addTo } : {}), ...(mode ? { mode } : {}) }),
   });
 }
 
@@ -149,10 +151,10 @@ export interface WbConnParts {
 
 /** Connect from structured fields — every value is sent literally, so passwords
  *  with @ % # $ ! need zero escaping. The BFF never echoes credentials back. */
-export function wbConnectParts(parts: WbConnParts): Promise<WbConnection> {
+export function wbConnectParts(parts: WbConnParts, mode?: "live" | "snapshot"): Promise<WbConnection> {
   return request<WbConnection>("/api/sql/connect", {
     method: "POST",
-    body: JSON.stringify({ parts }),
+    body: JSON.stringify({ parts, ...(mode ? { mode } : {}) }),
   });
 }
 

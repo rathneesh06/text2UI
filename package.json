@@ -33,7 +33,7 @@
     "test:semantic": "tsx bff/datasources/semantic.test.ts",
     "test:filters": "tsx bff/dashboard/filters.test.ts",
     "test:derived": "tsx bff/dashboard/derived.test.ts",
-    "test": "npm run test:errors && npm run test:sandbox && npm run test:domain && npm run test:design && npm run test:heal && npm run test:markitdown && npm run test:export && npm run test:eval && npm run test:dbexport && npm run test:exemplars && npm run test:metrics && npm run test:report && npm run test:slides && npm run test:security && npm run test:auth && npm run test:tenancy && npm run test:ratelimit && npm run test:designrag && npm run test:deck-edit && npm run test:t2sql-guard && npm run test:t2sql-planner && npm run test:db-conn && npm run test:conversational && npm run test:source-chat && npm run test:analyst && npm run test:live && npm run test:group && npm run test:agents && npm run test:semantic && npm run test:filters && npm run test:enrich && npm run test:schemacache && npm run test:pipeline && npm run test:joins && npm run test:derived",
+    "test": "npm run test:errors && npm run test:sandbox && npm run test:domain && npm run test:design && npm run test:heal && npm run test:markitdown && npm run test:export && npm run test:eval && npm run test:dbexport && npm run test:exemplars && npm run test:metrics && npm run test:report && npm run test:slides && npm run test:security && npm run test:auth && npm run test:tenancy && npm run test:ratelimit && npm run test:designrag && npm run test:deck-edit && npm run test:t2sql-guard && npm run test:t2sql-planner && npm run test:db-conn && npm run test:conversational && npm run test:source-chat && npm run test:analyst && npm run test:live && npm run test:sourcemode && npm run test:group && npm run test:agents && npm run test:semantic && npm run test:filters && npm run test:enrich && npm run test:schemacache && npm run test:pipeline && npm run test:joins && npm run test:derived",
     "test:heal": "tsx bff/heal.test.ts",
     "test:errors": "tsx shared/errors.test.ts",
     "test:report": "tsx bff/report.test.ts",
@@ -64,6 +64,7 @@
     "test:group": "tsx bff/text2sql/live-group.test.ts",
     "test:enrich": "tsx bff/sources/enrich.test.ts",
     "test:schemacache": "tsx bff/sources/schema-cache.test.ts",
+    "test:sourcemode": "tsx bff/text2sql/source-mode.test.ts",
     "test:pipeline": "tsx bff/dashboard/pipeline.test.ts",
     "test:joins": "tsx bff/dashboard/joins.test.ts"
   },

@@ -75,6 +75,13 @@ export async function handleSqlConnect(body: unknown, tenantId: string): Promise
     const rec = hasParts
       ? await openConnectionWith(tenantId, connFromParts(b.parts as DbConnParts))
       : await openConnection(tenantId, b.connectionString);
+    // Per-source data-plane choice (goal 3): "live" queries the DB directly and
+    // stores NOTHING; "snapshot" extracts first. Validated here, defaulted by
+    // the T2SQL_LIVE_SOURCE env flag when unset.
+    if (b.mode !== undefined) {
+      if (b.mode !== "live" && b.mode !== "snapshot") return bad('mode must be "live" or "snapshot"');
+      rec.mode = b.mode;
+    }
     // al3: addTo binds this database with an existing connection (or group) into
     // ONE group record — merged schema, one attach, cross-DB joins. The chat,
     // analyst, and live source then run over the union via the group's id.
@@ -84,6 +91,7 @@ export async function handleSqlConnect(body: unknown, tenantId: string): Promise
       const asPart = (r: ConnRecord): GroupPart[] =>
         r.groupParts?.length ? r.groupParts : [{ conn: r.conn, label: r.label, allTables: r.allTables, datasets: r.datasets }];
       const group = openGroup(tenantId, [...asPart(base), ...asPart(rec)]);
+      group.mode = rec.mode ?? base.mode;
       console.log(`[text2sql] grouped ${group.groupParts!.length} databases as ${group.id}`);
       return { status: 200, body: publicView(group) };
     }
@@ -98,6 +106,19 @@ export async function handleSqlConnect(body: unknown, tenantId: string): Promise
 export function handleSqlSchema(connectionId: string, tenantId: string): Out {
   const rec = getConnection(tenantId, String(connectionId ?? ""));
   if (!rec) return { status: 404, body: { error: "unknown or expired connection — reconnect" } };
+  return { status: 200, body: publicView(rec) };
+}
+
+// ---- POST /api/sql/:connectionId/mode --------------------------------------------
+// Deterministic per-source toggle between the live and snapshot data planes.
+// Takes effect on the NEXT build; already-published sources are untouched.
+export function handleSqlMode(connectionId: string, body: unknown, tenantId: string): Out {
+  const rec = getConnection(tenantId, String(connectionId ?? ""));
+  if (!rec) return { status: 404, body: { error: "unknown or expired connection — reconnect" } };
+  const mode = (body as any)?.mode;
+  if (mode !== "live" && mode !== "snapshot") return bad('mode must be "live" or "snapshot"');
+  rec.mode = mode;
+  console.log(`[text2sql] ${rec.id}: data-plane mode set to ${mode}`);
   return { status: 200, body: publicView(rec) };
 }
 
@@ -400,7 +421,7 @@ export async function handleSqlChat(body: unknown, tenantId: string, deps: SqlHa
       // query the live DB through per-table views; nothing survives a restart.
       // Setup failure falls back to the snapshot path below (the product keeps
       // working; the log says why the live path was skipped).
-      if (LIVE_SOURCE_ENABLED()) {
+      if (sourceIsLive(rec)) {
         try {
           const want = plan.tables?.length ? plan.tables : rec.datasets.map((d) => d.tableName);
           let liveDatasets = await profileTables(rec, want).catch(() => [] as Dataset[]);
@@ -499,6 +520,8 @@ async function runOnLiveAttach(rec: ConnRecord, sql: string, timeoutMs = QUERY_T
 // (BFF restart / TTL) — by design; a 410 tells the client to reconnect.
 export const LIVE_PREFIX = "live_";
 const LIVE_SOURCE_ENABLED = () => (process.env.T2SQL_LIVE_SOURCE ?? "0") === "1";
+/** Goal 3, surfaced: the per-source mode wins; the env flag is only the default. */
+const sourceIsLive = (rec: ConnRecord) => (rec.mode ?? (LIVE_SOURCE_ENABLED() ? "live" : "snapshot")) === "live";
 const viewsApplied = new WeakMap<object, number>();
 
 function liveViewDefs(rec: ConnRecord): { name: string; ref: string }[] {
