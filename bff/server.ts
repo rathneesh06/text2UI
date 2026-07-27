@@ -39,6 +39,8 @@ import { generateDeck } from "./slides";
 import { orchestrate, composePrompt, gateTurn, ORCHESTRATOR_ENABLED } from "./orchestrator";
 import { getChatStore, type ChatStore } from "./chat-store";
 import { mountTools } from "./tools";
+import { compileSpec } from "./dashboard/compile";
+import { renderPlanToApp } from "./dashboard/renderer";
 import type { OrchestratorResult, ChatMessage } from "../shared/types";
 import { parseAllowedOrigins, corsOptions, securityHeaders, validateConfig, applyConfigCheck } from "./security";
 import { parseAuthTokens, authMiddleware, DEV_TENANT } from "./auth";
@@ -897,6 +899,25 @@ export function createServer() {
   // (2) writes BOTH sides of the turn into conversation memory — the user's ask
   // (deduped: /api/gate and /api/orchestrate may have appended it already) and the
   // assistant's change summary, which previously never entered memory at all.
+  // DURABLE PROJECTS: reopen a project — the saved chat + the last dashboard,
+  // recompiled DETERMINISTICALLY from the stored spec + stored profiles (no
+  // model call, no live data needed to RENDER; reconnect refreshes numbers).
+  app.get("/api/project/:projectId/state", async (req, res) => {
+    try {
+      const pid = String(req.params.projectId ?? "");
+      const state = await getChatStore().getProjectState(pid);
+      if (!state?.spec) { res.status(404).json({ error: "no saved state for this project" }); return; }
+      let app_: unknown = null;
+      try {
+        if (Array.isArray(state.datasets) && (state.datasets as any[]).length) {
+          app_ = renderPlanToApp(compileSpec(state.spec as any, state.datasets as any));
+        }
+      } catch (err: any) { console.warn(`[durable] recompile failed for ${pid}: ${err?.message ?? err}`); }
+      const chat = state.conversationId ? await getChatStore().getHistory(state.conversationId, 50).catch(() => []) : [];
+      res.json({ spec: state.spec, app: app_, conversationId: state.conversationId, chat, savedAt: state.savedAt });
+    } catch (err: any) { res.status(500).json({ error: err?.message ?? "state load failed" }); }
+  });
+
   app.post("/api/dashboard/build", async (req, res) => {
     const convId = typeof (req.body as any)?.conversationId === "string" ? (req.body as any).conversationId : "";
     const store = getChatStore();
@@ -916,6 +937,18 @@ export function createServer() {
         }
       : undefined;
     const { status, body } = await handleDashboardBuild(buildBody, { readAll });
+    // DURABLE PROJECTS: persist the validated spec + the profiles it was
+    // validated against + the chat link, keyed by projectId. Best-effort —
+    // persistence can slow nothing and break nothing.
+    if (status === 200 && (body as any)?.spec && pid) {
+      try {
+        await getChatStore().saveProjectState(pid, {
+          spec: (body as any).spec,
+          datasets: (buildBody as any).datasets ?? undefined,
+          conversationId: typeof (buildBody as any).conversationId === "string" ? (buildBody as any).conversationId : null,
+        });
+      } catch (err: any) { console.warn(`[durable] state save failed for ${pid}: ${err?.message ?? err}`); }
+    }
     if (status === 200 && convId) {
       try {
         const prompt = String((req.body as any).userPrompt ?? "");

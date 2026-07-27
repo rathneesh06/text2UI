@@ -178,8 +178,25 @@ export default function ChatPage({
     let wasReload = false;
     try { wasReload = sessionStorage.getItem(RELOAD_FLAG) === "1"; sessionStorage.removeItem(RELOAD_FLAG); } catch {}
     if (!wasReload) {
-      // Fresh entry into the project → start a brand-new session, don't resurrect old chat.
+      // Fresh entry into the project: DURABLE PROJECTS — restore the saved
+      // dashboard + chat link from the SERVER (the local snapshot is only for
+      // reloads). The board renders deterministically from the stored spec;
+      // live numbers refresh once the data source is reconnected.
       try { localStorage.removeItem(SESSION_KEY); } catch {}
+      (async () => {
+        try {
+          const r = await fetch(`${BFF_URL}/api/project/${encodeURIComponent(projectId)}/state`);
+          if (!r.ok) return;
+          const st = await r.json();
+          if (!st?.spec) return;
+          if (st.conversationId) adoptConvId(st.conversationId);
+          setSpec(st.spec);
+          if (st.app) { setResult({ kind: "dashboard", app: st.app }); setDashVersion((v) => v + 1); }
+          const n = Array.isArray(st.chat) ? st.chat.length : 0;
+          setTurns([{ id: Date.now(), prompt: "(project reopened)", phase: "done", stages: [], hydrated: true,
+            assistantText: `Restored your saved dashboard${n ? ` — ${n} earlier chat messages are remembered for edits` : ""}. If this project uses a live database, reconnect it to refresh the numbers; everything else works right away.` } as any]);
+        } catch { /* no saved state / server unreachable — start clean */ }
+      })();
       return;
     }
     try {
