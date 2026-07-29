@@ -325,4 +325,20 @@ const plan = (obj: unknown) => async () => ({ text: JSON.stringify(obj), finishR
   assert.deepEqual(set.body.columns.shipments, ["id"], "clicking and chatting edit one projection");
 }
 
+// An extract that throws an Error with NO message must still tell the user
+// something. This is the "Extraction failed:" bug: `??` let "" through.
+{
+  const empty = await handleSelectionCommit(
+    { connectionId: rec.id, conversationId: CONV, tables: ["orders"] },
+    TENANT,
+    { chatStore: store },
+  );
+  // No DuckDB/MySQL here, so the extract genuinely fails — what matters is that
+  // the message is non-empty, names the phase, and carries the elapsed time.
+  assert.equal(empty.status, 500, JSON.stringify(empty.body));
+  assert.ok(empty.body.error.trim().length > 20, `error too vague: "${empty.body.error}"`);
+  assert.ok(Array.isArray(empty.body.phases) && empty.body.phases.length, "phases are reported");
+  assert.equal(typeof empty.body.elapsedSeconds, "number");
+}
+
 console.log("selection.test.ts: all assertions passed ✅");

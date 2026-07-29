@@ -309,7 +309,7 @@ export async function handleTableProfile(connectionId: string, body: unknown, te
       },
     };
   } catch (err: any) {
-    return { status: 502, body: { error: `couldn't read the schema for ${wanted.join(", ")}: ${err?.message ?? err}` } };
+    return { status: 502, body: { error: `couldn't read the schema for ${wanted.join(", ")}: ${(err?.message || String(err)).trim() || "no error message reported"}` } };
   }
 }
 
@@ -363,11 +363,22 @@ export async function handleSelectionCommit(body: unknown, tenantId: string, dep
   // snapshot and published as a source. (There used to be a "query live" option
   // here — removed, because a selection the user curated should not silently
   // depend on the database still being reachable at render time.)
+  // Extraction is the slowest thing this page does and the most likely to fail
+  // on a big server. Record where it got to, so a failure names the step it died
+  // on rather than surfacing an empty message.
+  const started = Date.now();
+  const phases: string[] = [];
+  const onPhase = (msg: string) => {
+    phases.push(msg);
+    console.log(`[selection-commit] ${rec.id}: ${msg}`);
+  };
+
   try {
     // Snapshot: read the selected tables once into this conversation's staging
     // file, then publish that file as one source (the "Extract DB" mechanics,
     // driven by the selection instead of by chat intent).
-    const { staged, warnings, skipped } = await stageSnapshot(rec, tables, tenantId, conversationId);
+    onPhase(`extracting ${tables.length} table(s): ${tables.join(", ")}`);
+    const { staged, warnings, skipped } = await stageSnapshot(rec, tables, tenantId, conversationId, onPhase);
 
     // Narrow to the chosen columns. The user picked them against the DISPLAY
     // name they saw ("sales.orders"); the stage stores the physical name the
@@ -415,6 +426,17 @@ export async function handleSelectionCommit(body: unknown, tenantId: string, dep
       },
     };
   } catch (err: any) {
-    return { status: 500, body: { error: err?.message ?? "couldn't prepare the selected tables" } };
+    // `??` would let an Error with an empty message through as "" — which is
+    // how a failure reaches the user as a bare "Extraction failed:" with nothing
+    // after it. `||` falls through to something the user can act on, and the
+    // last phase says which step actually died.
+    const detail = (err?.message || "").trim();
+    const secs = Math.round((Date.now() - started) / 1000);
+    const where = phases.length ? phases[phases.length - 1] : "starting up";
+    const msg = detail
+      ? `${detail} (failed after ${secs}s, during: ${where})`
+      : `extraction failed after ${secs}s during: ${where}. No error message was reported — check the BFF log for the full trace.`;
+    console.error(`[selection-commit] ${rec.id}: FAILED after ${secs}s during "${where}"`, err);
+    return { status: 500, body: { error: msg, phases, elapsedSeconds: secs } };
   }
 }

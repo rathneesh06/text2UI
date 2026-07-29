@@ -137,6 +137,7 @@ export async function stageSnapshot(
   tables: string[],
   tenantId: string,
   conversationId: string,
+  onPhase?: (msg: string) => void,
 ): Promise<{ staged: StagedState; warnings: string[]; skipped: string[] }> {
   const cleaned = [...new Set(tables.map((t) => String(t).trim()).filter(Boolean))];
   if (!cleaned.length) throw new Error("no tables to extract");
@@ -145,7 +146,7 @@ export async function stageSnapshot(
   // snapshot writer opens the same file (re-extract into the same stage).
   await releaseInstance(stagingDbPath(conversationId));
   // Same file every time -> tables append (CREATE OR REPLACE dedupes re-extracts).
-  const result = await snapshotTables(rec.conn, { tables: cleaned, dbPath: stagingDbPath(conversationId) });
+  const result = await snapshotTables(rec.conn, { tables: cleaned, dbPath: stagingDbPath(conversationId), onPhase });
   const skipped: string[] = result.skipped;
   if (!result.datasets.length && !getStaged(conversationId)) {
     throw new Error(`extraction produced no tables (${skipped.join("; ") || "unknown reason"})`);
