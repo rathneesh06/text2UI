@@ -31,12 +31,16 @@ export type SelOpKind =
   | "all"       // select every table in the catalog
   | "clear"     // select nothing
   | "focus"     // no selection change — open a table's columns in the UI
+  | "columns"   // narrow ONE table to the listed columns ("only id and email from customers")
   | "undo";     // no change here — the handler pops its selection history
 
 export interface SelOp {
   op: SelOpKind;
-  /** Table names as the model wrote them, or catalog numbers. Resolved below. */
+  /** Table names as the model wrote them, or catalog numbers. Resolved below.
+   *  For op "columns" these are COLUMN names, and `table` says which table. */
   refs?: string[];
+  /** Only for op "columns": the table being narrowed. */
+  table?: string;
 }
 
 // ---- ref resolution: the layer the model does not get to skip ------------------
@@ -140,12 +144,19 @@ export interface ApplyResult {
   ambiguous: { ref: string; candidates: string[] }[];
   /** A "focus" op asks the UI to open this table's columns. */
   focus?: string;
+  /** Per-table column narrowing this turn produced, keyed by table name. */
+  columns: Record<string, string[]>;
   undo: boolean;
 }
 
 /** Fold ops over the current selection. Pure, catalog-ordered, and total:
  *  unknown refs surface as `unresolved` rather than throwing or guessing. */
-export function applyOps(current: string[], ops: SelOp[], catalog: string[]): ApplyResult {
+export function applyOps(
+  current: string[],
+  ops: SelOp[],
+  catalog: string[],
+  currentColumns: Record<string, string[]> = {},
+): ApplyResult {
   const order = new Map(catalog.map((t, i) => [t, i] as const));
   const known = new Set(catalog);
   let sel = new Set(current.filter((t) => known.has(t)));
@@ -154,6 +165,7 @@ export function applyOps(current: string[], ops: SelOp[], catalog: string[]): Ap
   const ambiguous: { ref: string; candidates: string[] }[] = [];
   let focus: string | undefined;
   let undo = false;
+  const columns: Record<string, string[]> = { ...currentColumns };
 
   for (const op of ops ?? []) {
     const r = op.refs?.length ? resolveRefs(op.refs, catalog) : { tables: [], unresolved: [], ambiguous: [] };
@@ -166,6 +178,13 @@ export function applyOps(current: string[], ops: SelOp[], catalog: string[]): Ap
       case "all":     sel = new Set(catalog); break;
       case "clear":   sel = new Set(); break;
       case "focus":   focus = r.tables[0] ?? focus; break;
+      case "columns": {
+        // The table must resolve; the column names are taken as written, and
+        // validated against the real schema when they're applied downstream.
+        const t = op.table ? resolveRefs([op.table], catalog).tables[0] : undefined;
+        if (t) { columns[t] = [...new Set((op.refs ?? []).map(String).filter(Boolean))]; sel.add(t); }
+        break;
+      }
       case "undo":    undo = true; break;
     }
   }
@@ -178,6 +197,8 @@ export function applyOps(current: string[], ops: SelOp[], catalog: string[]): Ap
     unresolved,
     ambiguous,
     focus,
+    // A projection only survives while its table is selected.
+    columns: Object.fromEntries(Object.entries(columns).filter(([t, c]) => selection.includes(t) && c.length)),
     undo,
   };
 }
@@ -227,7 +248,8 @@ export const SELECTION_PLAN_SCHEMA = {
       items: {
         type: "object",
         properties: {
-          op: { type: "string", enum: ["add", "remove", "replace", "all", "clear", "focus", "undo"] },
+          op: { type: "string", enum: ["add", "remove", "replace", "all", "clear", "focus", "columns", "undo"] },
+          table: { type: "string", description: "Only for op 'columns': which table to narrow. Must be an exact catalog name." },
           refs: {
             type: "array",
             items: { type: "string" },
@@ -328,7 +350,7 @@ function buildUserPrompt(input: SelectionPlanInput): string {
 
 const stripFences = (s: string) => s.replace(/^```(?:json)?\s*/i, "").replace(/\s*```\s*$/, "").trim();
 
-const VALID_OPS: SelOpKind[] = ["add", "remove", "replace", "all", "clear", "focus", "undo"];
+const VALID_OPS: SelOpKind[] = ["add", "remove", "replace", "all", "clear", "focus", "columns", "undo"];
 
 /**
  * Plan one selection turn. Returns null ONLY when the model could not be
@@ -352,8 +374,10 @@ export async function planSelectionTurn(
         const refs = Array.isArray(raw.refs) ? raw.refs.map((r: unknown) => String(r)).filter(Boolean) : undefined;
         // An op that needs targets and has none is dropped rather than applied:
         // a malformed "replace" with no refs would wipe the user's selection.
-        if (["add", "remove", "replace", "focus"].includes(raw.op) && !refs?.length) continue;
-        ops.push({ op: raw.op, ...(refs ? { refs } : {}) });
+        if (["add", "remove", "replace", "focus", "columns"].includes(raw.op) && !refs?.length) continue;
+        // A "columns" op without a table has nothing to narrow.
+        if (raw.op === "columns" && (typeof raw.table !== "string" || !raw.table.trim())) continue;
+        ops.push({ op: raw.op, ...(refs ? { refs } : {}), ...(raw.table ? { table: String(raw.table) } : {}) });
       }
       const reply = typeof parsed.reply === "string" && parsed.reply.trim() ? parsed.reply.trim() : undefined;
       // A response with neither ops nor words is indistinguishable from a failure.

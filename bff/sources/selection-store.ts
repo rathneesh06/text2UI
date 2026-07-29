@@ -23,6 +23,10 @@ export interface SelectionState {
   /** Human label of that connection, for the UI after a reconnect. */
   connectionLabel?: string;
   tables: string[];
+  /** Per-table column projection. A table ABSENT from this map (or mapped to an
+   *  empty array) means "every column" — the common case, and the one that
+   *  survives a schema change gracefully. Only narrowed tables are recorded. */
+  columns: Record<string, string[]>;
   updatedAt: number;
 }
 
@@ -30,7 +34,7 @@ const FILE = () => join(WB_DIR(), "selections.json");
 const MAX_UNDO = 25;
 
 const states = new Map<string, SelectionState>();
-const undoStacks = new Map<string, string[][]>();
+const undoStacks = new Map<string, { tables: string[]; columns: Record<string, string[]> }[]>();
 let loaded = false;
 
 function load(): void {
@@ -39,7 +43,11 @@ function load(): void {
   try {
     const parsed = JSON.parse(readFileSync(FILE(), "utf8"));
     const list: SelectionState[] = Array.isArray(parsed?.selections) ? parsed.selections : [];
-    for (const s of list) if (s?.conversationId && Array.isArray(s.tables)) states.set(s.conversationId, s);
+    for (const s of list) {
+      if (!s?.conversationId || !Array.isArray(s.tables)) continue;
+      // Selections saved before column projection existed have no `columns`.
+      states.set(s.conversationId, { ...s, columns: s.columns ?? {} });
+    }
   } catch { /* nothing saved yet */ }
 }
 
@@ -63,7 +71,7 @@ export function getSelection(conversationId: string, tenantId: string): Selectio
   load();
   const s = states.get(conversationId);
   if (s && s.tenantId === tenantId) return s;
-  return { conversationId, tenantId, connectionId: "", tables: [], updatedAt: 0 };
+  return { conversationId, tenantId, connectionId: "", tables: [], columns: {}, updatedAt: 0 };
 }
 
 /** Replace the selection, pushing the previous value onto the undo stack. */
@@ -71,21 +79,28 @@ export function setSelection(
   conversationId: string,
   tenantId: string,
   tables: string[],
-  meta: { connectionId?: string; connectionLabel?: string } = {},
+  meta: { connectionId?: string; connectionLabel?: string; columns?: Record<string, string[]> } = {},
 ): SelectionState {
   load();
   const prev = states.get(conversationId);
   if (prev && prev.tenantId === tenantId) {
     const stack = undoStacks.get(conversationId) ?? [];
-    stack.push([...prev.tables]);
+    stack.push({ tables: [...prev.tables], columns: { ...prev.columns } });
     undoStacks.set(conversationId, stack.slice(-MAX_UNDO));
   }
+  const kept = [...new Set(tables.map(String).filter(Boolean))];
+  // A column projection only means anything while its table is selected;
+  // deselecting a table forgets how it was narrowed.
+  const merged = { ...(prev?.columns ?? {}), ...(meta.columns ?? {}) };
+  const columns: Record<string, string[]> = {};
+  for (const t of kept) if (merged[t]?.length) columns[t] = [...new Set(merged[t])];
   const next: SelectionState = {
     conversationId,
     tenantId,
     connectionId: meta.connectionId ?? prev?.connectionId ?? "",
     connectionLabel: meta.connectionLabel ?? prev?.connectionLabel,
-    tables: [...new Set(tables.map(String).filter(Boolean))],
+    tables: kept,
+    columns,
     updatedAt: Date.now(),
   };
   states.set(conversationId, next);
@@ -107,7 +122,8 @@ export function undoSelection(conversationId: string, tenantId: string): Selecti
     tenantId,
     connectionId: cur?.connectionId ?? "",
     connectionLabel: cur?.connectionLabel,
-    tables: prev,
+    tables: prev.tables,
+    columns: prev.columns,
     updatedAt: Date.now(),
   };
   states.set(conversationId, next);

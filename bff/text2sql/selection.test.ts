@@ -78,6 +78,27 @@ const CATALOG = [
   assert.equal(correctionNote(applyOps([], [{ op: "add", refs: ["orders"] }], CATALOG)), "", "clean turns add no noise");
 }
 
+// ---- column narrowing --------------------------------------------------------------
+{
+  // A "columns" op narrows one table and implies selecting it.
+  const a = applyOps([], [{ op: "columns", table: "orders", refs: ["id", "total"] }], CATALOG);
+  assert.deepEqual(a.selection, ["orders"], "narrowing a table selects it");
+  assert.deepEqual(a.columns, { orders: ["id", "total"] });
+
+  // Existing narrowing carries forward across turns.
+  const b = applyOps(["orders"], [{ op: "add", refs: ["customers"] }], CATALOG, { orders: ["id"] });
+  assert.deepEqual(b.columns, { orders: ["id"] }, "a later turn doesn't lose the projection");
+
+  // Deselecting a table forgets how it was narrowed.
+  const c = applyOps(["orders", "customers"], [{ op: "remove", refs: ["orders"] }], CATALOG, { orders: ["id"] });
+  assert.deepEqual(c.columns, {}, "projection dies with its table");
+
+  // A columns op naming an unknown table is dropped, not applied to something else.
+  const d = applyOps(["orders"], [{ op: "columns", table: "ghost_table", refs: ["x"] }], CATALOG, {});
+  assert.deepEqual(d.columns, {});
+  assert.deepEqual(d.selection, ["orders"]);
+}
+
 // ---- the planner's own guards ----------------------------------------------------------
 {
   const run = (obj: unknown) => async () => ({ text: JSON.stringify(obj), finishReason: "STOP" } as any);
@@ -282,6 +303,26 @@ const plan = (obj: unknown) => async () => ({ text: JSON.stringify(obj), finishR
   );
   assert.equal(empty.status, 400);
   assert.ok(/nothing selected/i.test(empty.body.error), empty.body.error);
+}
+
+// The model can narrow columns, and the narrowing is persisted server-side.
+{
+  const r = await handleSelectionChat(
+    { connectionId: rec.id, conversationId: CONV, prompt: "from shipments keep only the id and status" },
+    TENANT,
+    { chatStore: store, plan: plan({ reply: "Narrowed shipments to id and status.", ops: [{ op: "columns", table: "shipments", refs: ["id", "status"] }] }) },
+  );
+  assert.deepEqual(r.body.columns.shipments, ["id", "status"]);
+  assert.ok(r.body.selection.includes("shipments"));
+  assert.deepEqual(getSelection(CONV, TENANT).columns.shipments, ["id", "status"], "persisted");
+
+  // A checkbox change to the same table goes through the same state.
+  const set = await handleSelectionSet(
+    { connectionId: rec.id, conversationId: CONV, tables: r.body.selection, columns: { shipments: ["id"] } },
+    TENANT,
+    { chatStore: store },
+  );
+  assert.deepEqual(set.body.columns.shipments, ["id"], "clicking and chatting edit one projection");
 }
 
 console.log("selection.test.ts: all assertions passed ✅");

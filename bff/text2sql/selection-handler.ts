@@ -25,7 +25,7 @@ import { nativeTableDetail } from "../sources/native-catalog";
 import {
   getSelection, setSelection, undoSelection, canUndo, dropSelection,
 } from "../sources/selection-store";
-import { finalizeStaged } from "../sources/workbench-store";
+import { finalizeStaged, projectStagedColumns } from "../sources/workbench-store";
 import { stageSnapshot } from "./handler";
 import {
   applyOps, correctionNote, offlineFallback, planSelectionTurn, summarizeApply,
@@ -72,7 +72,8 @@ export async function handleSelectionChat(body: unknown, tenantId: string, deps:
   await store.appendMessage(conversationId, { role: "user", content: prompt });
 
   const catalog = rec.allTables.map((t) => t.name);
-  const current = getSelection(conversationId, tenantId).tables;
+  const state = getSelection(conversationId, tenantId);
+  const current = state.tables;
 
   // The model plans EVERY turn. It sees the catalog (with columns where they've
   // been profiled), the live selection, and the conversation so far, and it
@@ -109,7 +110,7 @@ export async function handleSelectionChat(body: unknown, tenantId: string, deps:
     source = "offline";
   }
 
-  const result = applyOps(current, ops ?? [], catalog);
+  const result = applyOps(current, ops ?? [], catalog, state.columns);
 
   // "undo" rewinds the store rather than computing a new set.
   if (result.undo) {
@@ -125,8 +126,13 @@ export async function handleSelectionChat(body: unknown, tenantId: string, deps:
   }
 
   // Persist only when the set actually moved, so the undo stack stays meaningful.
-  const changed = result.added.length > 0 || result.removed.length > 0;
-  if (changed) setSelection(conversationId, tenantId, result.selection, { connectionId: rec.id, connectionLabel: rec.label });
+  const colsChanged = JSON.stringify(result.columns) !== JSON.stringify(state.columns);
+  const changed = result.added.length > 0 || result.removed.length > 0 || colsChanged;
+  if (changed) {
+    setSelection(conversationId, tenantId, result.selection, {
+      connectionId: rec.id, connectionLabel: rec.label, columns: result.columns,
+    });
+  }
 
   // The model's words are the reply — this is a conversation, not a form. The
   // server only appends what the model can actually be wrong about: names that
@@ -149,6 +155,7 @@ export async function handleSelectionChat(body: unknown, tenantId: string, deps:
       conversationId,
       reply,
       selection: result.selection,
+      columns: result.columns,
       added: result.added,
       removed: result.removed,
       unresolved: result.unresolved,
@@ -176,6 +183,7 @@ export async function handleSelectionGet(conversationId: string, tenantId: strin
     body: {
       conversationId: id,
       selection: state.tables,
+      columns: state.columns,
       connectionId: state.connectionId || null,
       connectionLabel: state.connectionLabel ?? null,
       canUndo: canUndo(id),
@@ -203,15 +211,33 @@ export async function handleSelectionSet(body: unknown, tenantId: string, deps: 
   const unknown = wanted.filter((t) => !catalog.has(t));
   const tables = rec.allTables.map((t) => t.name).filter((n) => wanted.includes(n)); // catalog order
 
-  const before = getSelection(conversationId, tenantId).tables;
+  // columns: { table: [col, ...] } — narrowing which columns of a table get
+  // stored. Sent by the middle panel's checkboxes; absent means "unchanged".
+  const columns: Record<string, string[]> | undefined =
+    b.columns && typeof b.columns === "object" && !Array.isArray(b.columns)
+      ? Object.fromEntries(
+          Object.entries(b.columns as Record<string, unknown>)
+            .filter(([t]) => catalog.has(t))
+            .map(([t, cols]) => [t, Array.isArray(cols) ? cols.map(String) : []]),
+        )
+      : undefined;
+
+  const prev = getSelection(conversationId, tenantId);
+  const before = prev.tables;
   const added = tables.filter((t) => !before.includes(t));
   const removed = before.filter((t) => !tables.includes(t));
-  if (added.length || removed.length) {
-    setSelection(conversationId, tenantId, tables, { connectionId: rec.id, connectionLabel: rec.label });
+  const colsChanged = columns
+    ? Object.entries(columns).some(([t, c]) => (prev.columns[t] ?? []).join("\u0000") !== c.join("\u0000"))
+    : false;
+  if (added.length || removed.length || colsChanged) {
+    setSelection(conversationId, tenantId, tables, { connectionId: rec.id, connectionLabel: rec.label, ...(columns ? { columns } : {}) });
     if (b.note !== false) {
       const bits = [
         added.length ? `selected ${added.join(", ")}` : "",
         removed.length ? `deselected ${removed.join(", ")}` : "",
+        colsChanged && columns
+          ? `narrowed columns: ${Object.entries(columns).filter(([, c]) => c.length).map(([t, c]) => `${t} -> ${c.join(", ")}`).join("; ")}`
+          : "",
       ].filter(Boolean).join("; ");
       try {
         await store.appendMessage(conversationId, { role: "user", content: `(clicked in the table list: ${bits})` });
@@ -220,7 +246,14 @@ export async function handleSelectionSet(body: unknown, tenantId: string, deps: 
   }
   return {
     status: 200,
-    body: { conversationId, selection: tables, added, removed, canUndo: canUndo(conversationId), ...(unknown.length ? { unknown } : {}) },
+    body: {
+      conversationId,
+      selection: tables,
+      columns: getSelection(conversationId, tenantId).columns,
+      added, removed,
+      canUndo: canUndo(conversationId),
+      ...(unknown.length ? { unknown } : {}),
+    },
   };
 }
 
@@ -312,8 +345,12 @@ export async function handleSelectionCommit(body: unknown, tenantId: string, dep
   // The client may pass the tables explicitly (belt and braces); the stored
   // selection is authoritative when it doesn't.
   const known = new Set(rec.allTables.map((t) => t.name));
-  const fromBody = Array.isArray(b.tables) ? b.tables.map(String).filter((t: string) => known.has(t)) : [];
-  const tables = fromBody.length ? fromBody : getSelection(conversationId, tenantId).tables.filter((t) => known.has(t));
+  const fromBody: string[] = Array.isArray(b.tables)
+    ? (b.tables as unknown[]).map((t) => String(t)).filter((t) => known.has(t))
+    : [];
+  const tables: string[] = fromBody.length
+    ? fromBody
+    : getSelection(conversationId, tenantId).tables.filter((t) => known.has(t));
   if (!tables.length) {
     return bad("nothing selected yet — pick at least one table (click it, or say \"select 1, 2, 3\") before continuing");
   }
@@ -331,6 +368,30 @@ export async function handleSelectionCommit(body: unknown, tenantId: string, dep
     // file, then publish that file as one source (the "Extract DB" mechanics,
     // driven by the selection instead of by chat intent).
     const { staged, warnings, skipped } = await stageSnapshot(rec, tables, tenantId, conversationId);
+
+    // Narrow to the chosen columns. The user picked them against the DISPLAY
+    // name they saw ("sales.orders"); the stage stores the physical name the
+    // snapshot writer produced — the bare table name, sanitised, with a numeric
+    // suffix if two schemas collided. Rebuild that mapping rather than relying
+    // on array order, which addStaged is free to change when it merges.
+    const chosenCols = getSelection(conversationId, tenantId).columns;
+    let colWarnings: string[] = [];
+    if (Object.keys(chosenCols).length) {
+      const sanitise = (t: string) =>
+        t.toLowerCase().replace(/[^a-z0-9_]+/g, "_").replace(/^_+|_+$/g, "").slice(0, 60) || "t";
+      const physical: Record<string, string[]> = {};
+      const missingTables: string[] = [];
+      for (const [display, cols] of Object.entries(chosenCols)) {
+        if (!cols?.length) continue;
+        const bare = display.includes(".") ? display.slice(display.lastIndexOf(".") + 1) : display;
+        const want = sanitise(bare);
+        const hit = staged.tables.find((t) => t.tableName === want)
+          ?? staged.tables.find((t) => new RegExp(`^${want}(?:_\\d+)?$`).test(t.tableName));
+        if (hit) physical[hit.tableName] = cols;
+        else missingTables.push(`${display}: extracted table not found, kept all columns`);
+      }
+      colWarnings = [...missingTables, ...(await projectStagedColumns(conversationId, physical))];
+    }
     // Keep only what was asked for: a stage reused across several commits could
     // still hold tables the user has since deselected.
     const wanted = new Set(tables);
@@ -350,7 +411,7 @@ export async function handleSelectionCommit(body: unknown, tenantId: string, dep
         label: source.label,
         tables: source.tables,
         mode: "snapshot" as const,
-        warnings: [...warnings, ...skipped],
+        warnings: [...warnings, ...skipped, ...colWarnings],
       },
     };
   } catch (err: any) {

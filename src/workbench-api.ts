@@ -121,6 +121,8 @@ export interface WbSelectionReply {
   conversationId: string;
   reply: string;
   selection: string[];
+  /** Per-table column narrowing. A table absent here keeps every column. */
+  columns?: Record<string, string[]>;
   added: string[];
   removed: string[];
   unresolved?: string[];
@@ -147,12 +149,12 @@ export function wbSelect(body: { connectionId: string; conversationId?: string; 
 }
 
 /** Push the checkbox state — clicking and typing edit the SAME selection. */
-export function wbSetSelection(body: { connectionId: string; conversationId?: string; tables: string[]; note?: boolean }): Promise<{ conversationId: string; selection: string[]; added: string[]; removed: string[]; canUndo: boolean }> {
+export function wbSetSelection(body: { connectionId: string; conversationId?: string; tables: string[]; columns?: Record<string, string[]>; note?: boolean }): Promise<{ conversationId: string; selection: string[]; columns: Record<string, string[]>; added: string[]; removed: string[]; canUndo: boolean }> {
   return request("/api/sql/selection", { method: "POST", body: JSON.stringify(body) });
 }
 
 /** Rehydrate selection + transcript after a reload. */
-export function wbGetSelection(conversationId: string): Promise<{ conversationId: string; selection: string[]; connectionId: string | null; connectionLabel: string | null; canUndo: boolean; turns: { role: string; content: string }[] }> {
+export function wbGetSelection(conversationId: string): Promise<{ conversationId: string; selection: string[]; columns: Record<string, string[]>; connectionId: string | null; connectionLabel: string | null; canUndo: boolean; turns: { role: string; content: string }[] }> {
   return request(`/api/sql/selection/${encodeURIComponent(conversationId)}`);
 }
 

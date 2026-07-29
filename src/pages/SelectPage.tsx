@@ -32,7 +32,6 @@ interface SelectPageProps {
   onUseWorkbenchSource?: (src: WbExtracted, buildPrompt?: string) => void;
 }
 
-const fmtRows = (n: number) => (n >= 1000 ? `${Math.round(n / 1000).toLocaleString()}k` : n.toLocaleString());
 const fmtCell = (v: unknown): string => {
   if (v === null || v === undefined) return "∅";
   if (typeof v === "number") return Number.isInteger(v) ? v.toLocaleString() : v.toLocaleString(undefined, { maximumFractionDigits: 3 });
@@ -51,6 +50,9 @@ export default function SelectPage({ onUseWorkbenchSource }: SelectPageProps) {
 
   const [catalog, setCatalog] = useState<WbCatalogTable[]>([]);
   const [selection, setSelection] = useState<string[]>([]);
+  // Per-table column narrowing. A table absent here stores EVERY column, which
+  // is the default and the common case — only narrowed tables are tracked.
+  const [colSel, setColSel] = useState<Record<string, string[]>>({});
   const [active, setActive] = useState<string | null>(null);
   const [details, setDetails] = useState<Record<string, WbTableDetail>>({});
   const [detailBusy, setDetailBusy] = useState(false);
@@ -95,6 +97,7 @@ export default function SelectPage({ onUseWorkbenchSource }: SelectPageProps) {
         .then((r) => {
           setConversationId(savedConv);
           setSelection(r.selection);
+          setColSel(r.columns ?? {});
           setTurns(
             r.turns
               .filter((t) => t.role === "user" || t.role === "assistant")
@@ -126,6 +129,7 @@ export default function SelectPage({ onUseWorkbenchSource }: SelectPageProps) {
       const cat = await wbCatalog(c.connectionId);
       setCatalog(cat.tables);
       setSelection([]);
+      setColSel({});
       setActive(null);
       setDetails({});
       setTurns([{
@@ -171,13 +175,19 @@ export default function SelectPage({ onUseWorkbenchSource }: SelectPageProps) {
   }, [connectionId, details]);
 
   // ---- checkbox <-> server selection ------------------------------------------
-  const pushSelection = useCallback(async (tables: string[]) => {
+  const pushSelection = useCallback(async (tables: string[], columns?: Record<string, string[]>) => {
     if (!connectionId) return;
     setSelection(tables); // optimistic: the rail must feel instant
+    if (columns) setColSel(columns);
     try {
-      const r = await wbSetSelection({ connectionId, tables, ...(conversationId ? { conversationId } : {}) });
+      const r = await wbSetSelection({
+        connectionId, tables,
+        ...(columns ? { columns } : {}),
+        ...(conversationId ? { conversationId } : {}),
+      });
       remember(r.conversationId);
       setSelection(r.selection);
+      setColSel(r.columns ?? {});
     } catch (e: any) {
       setNotice(e?.message ?? "couldn't save that selection");
     }
@@ -201,6 +211,7 @@ export default function SelectPage({ onUseWorkbenchSource }: SelectPageProps) {
       const r = await wbSelect({ connectionId, prompt: p, ...(conversationId ? { conversationId } : {}) });
       remember(r.conversationId);
       setSelection(r.selection);
+      if (r.columns) setColSel(r.columns);
       setTurns((prev) => [...prev, { role: "assistant", text: r.reply }]);
       if (r.focus) void openTable(r.focus);
     } catch (e: any) {
@@ -232,6 +243,34 @@ export default function SelectPage({ onUseWorkbenchSource }: SelectPageProps) {
       setCommitting(false);
     }
   }, [committing, connectionId, selection, conversationId, onUseWorkbenchSource, navigate]);
+
+  /** Columns stored for a table. Absent from colSel = all of them. */
+  const colsFor = useCallback((table: string): string[] | null => colSel[table]?.length ? colSel[table] : null, [colSel]);
+
+  const toggleColumn = useCallback((table: string, column: string) => {
+    const all = details[table]?.columns.map((c) => c.name) ?? [];
+    const cur = colSel[table]?.length ? colSel[table] : all;
+    const next = cur.includes(column) ? cur.filter((c) => c !== column) : [...cur, column];
+    if (!next.length) { setNotice("Keep at least one column — deselect the whole table instead."); return; }
+    // Back to everything? Drop the entry rather than storing a full list, so a
+    // later schema change doesn't silently pin an old column set.
+    const narrowed = next.length === all.length ? {} : { [table]: all.filter((c) => next.includes(c)) };
+    const rest = { ...colSel };
+    delete rest[table];
+    const merged = { ...rest, ...narrowed };
+    // Narrowing a table implies wanting it.
+    const tables = selection.includes(table) ? selection : [...selection, table];
+    const order = new Map(catalog.map((t, i) => [t.name, i] as const));
+    void pushSelection(tables.sort((a, b) => (order.get(a) ?? 0) - (order.get(b) ?? 0)), merged);
+  }, [colSel, details, selection, catalog, pushSelection]);
+
+  const setAllColumns = useCallback((table: string, on: boolean) => {
+    const all = details[table]?.columns.map((c) => c.name) ?? [];
+    const rest = { ...colSel };
+    delete rest[table];
+    // "none" would store an empty table; the honest reading is "all".
+    void pushSelection(selection, on || !all.length ? rest : { ...rest, [table]: [all[0]] });
+  }, [colSel, details, selection, pushSelection]);
 
   const shown = useMemo(() => {
     const q = filter.trim().toLowerCase();
@@ -322,9 +361,6 @@ export default function SelectPage({ onUseWorkbenchSource }: SelectPageProps) {
                     />
                     <span className="sel-row__n">{t.index}</span>
                     <span className="sel-row__name">{t.name}</span>
-                    <span className="sel-row__meta">
-                      ~{fmtRows(t.approxRows)}{t.columnCount != null ? ` · ${t.columnCount}c` : ""}
-                    </span>
                   </div>
                 ))}
                 {!shown.length && <div className="sel-empty">No table matches “{filter}”.</div>}
@@ -349,7 +385,10 @@ export default function SelectPage({ onUseWorkbenchSource }: SelectPageProps) {
                   <h2 className="sel-detail__title">{active}</h2>
                   {detail && (
                     <div className="sel-detail__meta">
-                      {detail.rowCount.toLocaleString()} rows · {detail.columns.length} columns
+                      {colsFor(active)
+                        ? `${colsFor(active)!.length} of ${detail.columns.length} columns stored`
+                        : `${detail.columns.length} columns`}
+                      {detail.rowCount > 0 ? ` · ~${detail.rowCount.toLocaleString()} rows` : ""}
                     </div>
                   )}
                 </div>
@@ -367,20 +406,37 @@ export default function SelectPage({ onUseWorkbenchSource }: SelectPageProps) {
 
               {detail && (
                 <div className="sel-cols">
+                  <div className="sel-cols__bar">
+                    <span>Columns to store</span>
+                    <button type="button" className="sel-linkbtn" onClick={() => setAllColumns(active, true)}>select all</button>
+                  </div>
                   <table>
                     <thead>
-                      <tr><th>Column</th><th>Type</th><th>Null</th><th>Distinct</th><th>Sample values</th></tr>
+                      <tr>
+                        <th className="sel-cols__pick"> </th>
+                        <th>Column</th><th>Type</th><th>Null</th><th>Sample values</th>
+                      </tr>
                     </thead>
                     <tbody>
-                      {detail.columns.map((c) => (
-                        <tr key={c.name}>
+                      {detail.columns.map((c) => {
+                        const on = !colsFor(active) || colsFor(active)!.includes(c.name);
+                        return (
+                        <tr key={c.name} className={on ? "" : "sel-cols__off"}>
+                          <td className="sel-cols__pick">
+                            <input
+                              type="checkbox"
+                              checked={on}
+                              onChange={() => toggleColumn(active, c.name)}
+                              aria-label={`store column ${c.name}`}
+                            />
+                          </td>
                           <td className="sel-cols__name">{c.name}</td>
                           <td className="sel-cols__type">{c.type ?? "—"}</td>
                           <td>{c.nullable === null ? "—" : c.nullable ? "yes" : "no"}</td>
-                          <td>{c.uniqueCount != null ? c.uniqueCount.toLocaleString() : "—"}</td>
                           <td className="sel-cols__sample">{c.sampleValues.map(fmtCell).join(", ") || "—"}</td>
                         </tr>
-                      ))}
+                        );
+                      })}
                     </tbody>
                   </table>
                 </div>
@@ -395,7 +451,9 @@ export default function SelectPage({ onUseWorkbenchSource }: SelectPageProps) {
             <span className="sel-chips__label">Selected</span>
             {selection.map((t) => (
               <button key={t} type="button" className="sel-chip" onClick={() => toggle(t)} title="Remove from selection">
-                {t}<span className="sel-chip__x">×</span>
+                {t}
+                {colSel[t]?.length ? <span className="sel-chip__cols">{colSel[t].length} cols</span> : null}
+                <span className="sel-chip__x">×</span>
               </button>
             ))}
             <button type="button" className="sel-chip sel-chip--clear" onClick={() => pushSelection([])}>clear all</button>

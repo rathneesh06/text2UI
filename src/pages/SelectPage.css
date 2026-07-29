@@ -185,3 +185,26 @@
   .sel-rail { width: 100%; max-height: 30vh; border-right: none; border-bottom: 1px solid var(--border-color, #1f2937); }
   .sel-chat { width: 100%; height: 44vh; border-left: none; border-top: 1px solid var(--border-color, #1f2937); }
 }
+
+/* ---- column picking (middle panel) ---- */
+.sel-cols__bar {
+  display: flex; align-items: center; justify-content: space-between;
+  padding: 10px 0 6px;
+  font-size: 11px; text-transform: uppercase; letter-spacing: 0.06em;
+  color: var(--text-tertiary);
+}
+.sel-linkbtn {
+  background: none; border: none; padding: 0; cursor: pointer;
+  color: var(--accent-purple-light); font-size: 11px; text-transform: none; letter-spacing: 0;
+}
+.sel-linkbtn:hover { text-decoration: underline; }
+.sel-cols__pick { width: 28px; }
+.sel-cols__pick input { accent-color: var(--accent-purple); }
+/* A deselected column stays visible — you need to see what you're excluding —
+   but reads as inactive. */
+.sel-cols__off td:not(.sel-cols__pick) { opacity: 0.38; }
+.sel-chip__cols {
+  font-size: 10px; padding: 0 5px; border-radius: 8px;
+  background: rgba(139, 92, 246, 0.25); color: var(--accent-purple-light);
+  font-family: inherit;
+}
