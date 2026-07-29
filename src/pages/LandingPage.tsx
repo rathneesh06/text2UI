@@ -46,13 +46,9 @@ export default function LandingPage({ onStartBuild, onFiles, onRemoveSource, tab
           </div>
         </div>
         <div style={{ display: "flex", gap: 8 }}>
-          <Link to="/workbench" className="landing__colo-btn" style={{ textDecoration: "none" }}>
+          <Link to="/select" className="landing__colo-btn" style={{ textDecoration: "none" }}>
             <span className="landing__colo-dot">◈</span>
-            SQL Workbench
-          </Link>
-          <Link to="/postgres" className="landing__colo-btn" style={{ textDecoration: "none" }}>
-            <span className="landing__colo-dot">◆</span>
-            Postgres
+            Connect a database
           </Link>
         </div>
       </header>

@@ -13,7 +13,6 @@ import DashboardPage from "./pages/DashboardPage";
 import ChatPage from "./pages/ChatPage";
 import ProjectsPage from "./pages/ProjectsPage";
 import StyleGuidePage from "./pages/StyleGuidePage";
-import WorkbenchPage from "./pages/WorkbenchPage";
 import SelectPage from "./pages/SelectPage";
 import { assignTableNames, ingestFile, newId, type Source, type Table } from "./lib/datasets";
 import { COLO_PROJECT_ID, listSources, sourceTablesToTables, type SourceInfo } from "./api";
@@ -367,10 +366,6 @@ function AppRoutes() {
           />
         }
       />
-      <Route
-        path="/workbench"
-        element={<WorkbenchPage onUseWorkbenchSource={handleUseWorkbenchSource} />}
-      />
       {/* Pick-your-tables: connection string -> browse the schema -> narrow it by
           clicking or chatting -> "Continue to text2UI" publishes the selection as
           the active source, which is exactly what the landing page builds from. */}
@@ -378,10 +373,11 @@ function AppRoutes() {
         path="/select"
         element={<SelectPage onUseWorkbenchSource={handleUseWorkbenchSource} />}
       />
-      <Route
-        path="/postgres"
-        element={<WorkbenchPage pgOnly onUseWorkbenchSource={handleUseWorkbenchSource} />}
-      />
+      {/* /select supersedes the old SQL Workbench and Postgres pages. Redirect
+          rather than 404 so existing links, bookmarks and stale dev-server tabs
+          land somewhere useful. */}
+      <Route path="/workbench" element={<Navigate to="/select" replace />} />
+      <Route path="/postgres" element={<Navigate to="/select" replace />} />
       <Route
         path="/dashboard"
         element={

@@ -166,23 +166,6 @@ function stagedView(st: StagedState) {
   };
 }
 
-// ---- POST /api/sql/extract ------------------------------------------------------
-export async function handleSqlExtract(body: unknown, tenantId: string, deps: SqlHandlerDeps = {}): Promise<Out> {
-  const b = body as any;
-  if (!b || typeof b !== "object") return bad("body must be a JSON object");
-  const rec = getConnection(tenantId, String(b.connectionId ?? ""));
-  if (!rec) return { status: 404, body: { error: "unknown or expired connection — reconnect" } };
-  if (!Array.isArray(b.tables) || !b.tables.length) return bad("tables[] is required");
-  try {
-    const store = deps.chatStore ?? getChatStore();
-    const conversationId = await store.createConversation(`Workbench: ${rec.conn.database}`, b.conversationId || undefined);
-    const { staged, warnings, skipped } = await stageSnapshot(rec, b.tables, tenantId, conversationId);
-    return { status: 200, body: { conversationId, staged: stagedView(staged), warnings: [...warnings, ...skipped] } };
-  } catch (err: any) {
-    return { status: 500, body: { error: err?.message ?? "extraction failed" } };
-  }
-}
-
 // ---- POST /api/source/chat — data questions INSIDE the build chat -----------------
 // The pipeline join the workbench was built for: once a source is published (or
 // colo is active), the main build conversation can ANSWER data questions by
@@ -256,15 +239,6 @@ export async function handleSourceChat(body: unknown, tenantId: string, deps: Sq
   return say({ answer, sql: guarded.sql, rows: rows.slice(0, 50), columns: rows.length ? Object.keys(rows[0]) : [], executionMeta });
 }
 
-// ---- GET /api/sql/stage/:conversationId — rehydrate the staged panel ------------
-// Pairs with durable staging: after a page reload (or BFF restart) the client can
-// restore the right panel and still press "Extract DB" without reconnecting.
-export function handleSqlStageGet(conversationId: string, tenantId: string): Out {
-  const st = getStaged(String(conversationId ?? ""));
-  if (!st || st.tenantId !== tenantId) return { status: 200, body: { staged: { count: 0, tables: [] } } };
-  return { status: 200, body: { conversationId: st.conversationId, staged: stagedView(st) } };
-}
-
 // ---- POST /api/sources/combine — merge published extracts into ONE source --------
 // Multi-connection builds: extract from string A, build; extract from string B,
 // "Build with B" while A's session is active → the app combines A+B here and the
@@ -290,22 +264,6 @@ export async function handleCombineSources(body: unknown, tenantId: string): Pro
 export function handleSqlStageDiscard(conversationId: string, tenantId: string): Out {
   const removed = discardStaged(String(conversationId ?? ""), tenantId);
   return { status: 200, body: { discarded: removed } };
-}
-
-// ---- POST /api/sql/extract-db — the "Extract DB" button: publish the stage ------
-export async function handleSqlExtractDb(body: unknown, tenantId: string): Promise<Out> {
-  const b = body as any;
-  if (!b || typeof b !== "object") return bad("body must be a JSON object");
-  if (typeof b.conversationId !== "string" || !b.conversationId) return bad("conversationId is required");
-  const st = getStaged(b.conversationId);
-  if (!st) return bad("nothing staged in this conversation yet — extract some tables first");
-  if (st.tenantId !== tenantId) return { status: 404, body: { error: "unknown conversation" } };
-  try {
-    const source = finalizeStaged(b.conversationId, typeof b.label === "string" ? b.label : undefined);
-    return { status: 200, body: { projectId: source.projectId, label: source.label, tables: source.tables } };
-  } catch (err: any) {
-    return bad(err?.message ?? "extract DB failed");
-  }
 }
 
 // ---- POST /api/sql/chat -----------------------------------------------------------

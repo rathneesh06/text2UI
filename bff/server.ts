@@ -21,7 +21,7 @@ import { buildExportZip, buildConnectedZip } from "./export";
 import { generateReport } from "./report";
 import { COLO_PROJECT_ID, COLO_LABEL, coloAvailable, coloProfiles, coloQuery } from "./sources/colo";
 import { isWorkbenchProject, listWorkbenchSources, wbQuery, removeWorkbenchSource } from "./sources/workbench-store";
-import { handleSqlConnect, handleSqlSchema, handleSqlMode, handleSqlChat, handleSqlExtract, handleSqlExtractDb, handleSqlStageGet, handleSqlStageDiscard, handleSourceChat, handleCombineSources, liveQuery, LIVE_PREFIX } from "./text2sql/handler";
+import { handleSqlConnect, handleSqlSchema, handleSqlStageDiscard, handleSourceChat, handleCombineSources, liveQuery, LIVE_PREFIX } from "./text2sql/handler";
 import { handleSelectionChat, handleSelectionGet, handleSelectionSet, handleSelectionCommit, handleTableProfile, handleCatalog } from "./text2sql/selection-handler";
 import { handleDashboardBuild } from "./dashboard/handler";
 import { buildWidgetSql } from "./dashboard/filters";
@@ -1076,23 +1076,6 @@ export function createServer() {
     const { status, body } = handleSqlSchema(String(req.params.connectionId), req.tenantId ?? DEV_TENANT);
     res.status(status).json(body);
   });
-  app.post("/api/sql/:connectionId/mode", (req, res) => {
-    const { status, body } = handleSqlMode(String(req.params.connectionId), req.body, req.tenantId ?? DEV_TENANT);
-    res.status(status).json(body);
-  });
-  app.post("/api/sql/chat", async (req, res) => {
-    const { status, body } = await handleSqlChat(req.body, req.tenantId ?? DEV_TENANT);
-    res.status(status).json(body);
-  });
-  app.post("/api/sql/extract", async (req, res) => {
-    const { status, body } = await handleSqlExtract(req.body, req.tenantId ?? DEV_TENANT);
-    res.status(status).json(body);
-  });
-  app.post("/api/sql/extract-db", async (req, res) => {
-    const { status, body } = await handleSqlExtractDb(req.body, req.tenantId ?? DEV_TENANT);
-    res.status(status).json(body);
-  });
-
   // ---- Table selection: pick the tables that matter BEFORE building the UI ----
   // A large database makes text2SQL guess. This page narrows the catalog by
   // clicking OR by chatting; every route below reads and writes the ONE
@@ -1153,10 +1136,7 @@ export function createServer() {
     res.status(status).json(body);
   });
 
-  app.get("/api/sql/stage/:conversationId", (req, res) => {
-    const { status, body } = handleSqlStageGet(String(req.params.conversationId), req.tenantId ?? DEV_TENANT);
-    res.status(status).json(body);
-  });
+  // App.tsx calls this on boot to clean up stages orphaned by a reload.
   app.delete("/api/sql/stage/:conversationId", (req, res) => {
     const { status, body } = handleSqlStageDiscard(String(req.params.conversationId), req.tenantId ?? DEV_TENANT);
     res.status(status).json(body);

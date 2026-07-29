@@ -50,29 +50,6 @@ export interface WbExtracted {
   evidence?: string;
 }
 
-export interface WbStagedTable {
-  tableName: string;
-  rowCount: number;
-  columns: { name: string; type?: string }[];
-}
-export interface WbStaged { count: number; tables: WbStagedTable[] }
-
-export interface WbChatResponse {
-  conversationId: string;
-  intent: "query" | "preview" | "extract" | "build" | "chat";
-  answer: string;
-  sql?: string;
-  rows?: Record<string, unknown>[];
-  columns?: string[];
-  truncated?: boolean;
-  /** extract intent: the accumulated stage for the right panel */
-  staged?: WbStaged;
-  executionMeta?: { durationMs: number; rowsReturned: number; sourceType: string };
-  policy?: { outcome: "allowed" | "capped" | "rejected"; reason?: string };
-  extracted?: WbExtracted;
-  handoff?: WbExtracted & { artifact: "dashboard" | "ppt"; buildPrompt: string };
-}
-
 /** Connect + introspect. The connection string is sent once over the wire and the
  *  BFF never echoes credentials back. */
 export function wbConnect(connectionString: string, addTo?: string, mode?: "live" | "snapshot", opts: { fast?: boolean } = {}): Promise<WbConnection> {
@@ -93,17 +70,6 @@ export function wbSchema(connectionId: string): Promise<WbConnection> {
   return request<WbConnection>(`/api/sql/${encodeURIComponent(connectionId)}/schema`);
 }
 
-/** One conversational turn against the connected database. */
-export function wbChat(body: { connectionId: string; conversationId?: string; prompt: string }): Promise<WbChatResponse> {
-  return request<WbChatResponse>("/api/sql/chat", { method: "POST", body: JSON.stringify(body) });
-}
-
-/** Stage tables (the schema-tree button). Staged tables accumulate in the
- *  conversation until wbExtractDb publishes them as ONE source. */
-export function wbExtract(body: { connectionId: string; tables: string[]; conversationId?: string }): Promise<{ conversationId: string; staged: WbStaged; warnings: string[] }> {
-  return request("/api/sql/extract", { method: "POST", body: JSON.stringify(body) });
-}
-
 /** Answer a data question inside the BUILD chat by querying the published
  *  snapshot (or colo) through the text2SQL loop. */
 export function sourceChat(body: { projectId: string; conversationId?: string; prompt: string }): Promise<{
@@ -112,11 +78,6 @@ export function sourceChat(body: { projectId: string; conversationId?: string; p
   executionMeta?: { durationMs: number; rowsReturned: number; sourceType: string };
 }> {
   return request("/api/source/chat", { method: "POST", body: JSON.stringify(body) });
-}
-
-/** Rehydrate the staged panel (after page reload / BFF restart). */
-export function wbStage(conversationId: string): Promise<{ conversationId?: string; staged: WbStaged }> {
-  return request(`/api/sql/stage/${encodeURIComponent(conversationId)}`);
 }
 
 /** Merge published extracts into ONE combined source (multi-connection builds). */
@@ -200,11 +161,6 @@ export function wbCommitSelection(body: { connectionId: string; conversationId?:
   return request("/api/sql/selection/commit", { method: "POST", body: JSON.stringify(body) });
 }
 
-/** "Extract DB": publish everything staged in this conversation as one source. */
-export function wbExtractDb(body: { conversationId: string; label?: string }): Promise<WbExtracted> {
-  return request("/api/sql/extract-db", { method: "POST", body: JSON.stringify(body) });
-}
-
 /* ---- dedicated Postgres page: structured connect (no URL parsing pitfalls) ---- */
 
 export interface WbConnParts {
@@ -215,15 +171,6 @@ export interface WbConnParts {
   user?: string;
   password?: string;
   ssl?: boolean;
-}
-
-/** Connect from structured fields — every value is sent literally, so passwords
- *  with @ % # $ ! need zero escaping. The BFF never echoes credentials back. */
-export function wbConnectParts(parts: WbConnParts, mode?: "live" | "snapshot"): Promise<WbConnection> {
-  return request<WbConnection>("/api/sql/connect", {
-    method: "POST",
-    body: JSON.stringify({ parts, ...(mode ? { mode } : {}) }),
-  });
 }
 
 /** Best-effort client-side parse of a postgres:// URI into form fields (the
