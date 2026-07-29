@@ -14,6 +14,7 @@ import ChatPage from "./pages/ChatPage";
 import ProjectsPage from "./pages/ProjectsPage";
 import StyleGuidePage from "./pages/StyleGuidePage";
 import WorkbenchPage from "./pages/WorkbenchPage";
+import SelectPage from "./pages/SelectPage";
 import { assignTableNames, ingestFile, newId, type Source, type Table } from "./lib/datasets";
 import { COLO_PROJECT_ID, listSources, sourceTablesToTables, type SourceInfo } from "./api";
 import { isWorkbenchProject, isLiveProject, isServerSource, wbDeleteSource, wbDiscardStage, wbCombineSources, type WbExtracted } from "./workbench-api";
@@ -189,6 +190,7 @@ function AppRoutes() {
     for (const { key, route } of [
       { key: "t2ui:wb:conv", route: "/workbench" },
       { key: "t2ui:wb:pg:conv", route: "/postgres" },
+      { key: "t2ui:sel:conv", route: "/select" },
     ]) {
       if (path.startsWith(route)) continue; // reloaded on that page -> keep its stage
       try {
@@ -368,6 +370,13 @@ function AppRoutes() {
       <Route
         path="/workbench"
         element={<WorkbenchPage onUseWorkbenchSource={handleUseWorkbenchSource} />}
+      />
+      {/* Pick-your-tables: connection string -> browse the schema -> narrow it by
+          clicking or chatting -> "Continue to text2UI" publishes the selection as
+          the active source, which is exactly what the landing page builds from. */}
+      <Route
+        path="/select"
+        element={<SelectPage onUseWorkbenchSource={handleUseWorkbenchSource} />}
       />
       <Route
         path="/postgres"

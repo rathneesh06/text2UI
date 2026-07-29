@@ -75,14 +75,16 @@ export interface WbChatResponse {
 
 /** Connect + introspect. The connection string is sent once over the wire and the
  *  BFF never echoes credentials back. */
-export function wbConnect(connectionString: string, addTo?: string, mode?: "live" | "snapshot"): Promise<WbConnection> {
+export function wbConnect(connectionString: string, addTo?: string, mode?: "live" | "snapshot", opts: { fast?: boolean } = {}): Promise<WbConnection> {
   return request<WbConnection>("/api/sql/connect", {
     method: "POST",
     // al3: addTo binds this DB with an existing connection/group into ONE group
     // (merged schema, cross-DB joins) — the response's connectionId is the group.
     // mode (goal 3): "live" reads straight from the database and stores nothing;
     // omitted → the server default (snapshot unless T2SQL_LIVE_SOURCE=1).
-    body: JSON.stringify({ connectionString, ...(addTo ? { addTo } : {}), ...(mode ? { mode } : {}) }),
+    // fast: list table names only — the selection page profiles on click, so it
+    // skips the connect-time sampling that dominates latency on big servers.
+    body: JSON.stringify({ connectionString, ...(addTo ? { addTo } : {}), ...(mode ? { mode } : {}), ...(opts.fast ? { fast: true } : {}) }),
   });
 }
 
@@ -130,6 +132,72 @@ export function wbDiscardStage(conversationId: string): Promise<{ discarded: boo
 /** Delete a published workbench source (removes it from the start page). */
 export function wbDeleteSource(projectId: string): Promise<{ deleted: boolean }> {
   return request(`/api/sources/${encodeURIComponent(projectId)}`, { method: "DELETE" });
+}
+
+/* ---- table selection: the pick-your-tables page (/select) ---- */
+
+export interface WbCatalogTable {
+  index: number;          // 1-based, exactly the number shown in the rail
+  name: string;
+  approxRows: number;
+  profiled: boolean;      // false -> clicking it needs a wbProfile round-trip
+  columnCount: number | null;
+}
+export interface WbColumn {
+  name: string;
+  type: string | null;
+  nullable: boolean | null;
+  uniqueCount: number | null;
+  sampleValues: unknown[];
+}
+export interface WbTableDetail {
+  tableName: string;
+  rowCount: number;
+  columns: WbColumn[];
+  sampleRows: Record<string, unknown>[];
+}
+export interface WbSelectionReply {
+  conversationId: string;
+  reply: string;
+  selection: string[];
+  added: string[];
+  removed: string[];
+  unresolved?: string[];
+  ambiguous?: { ref: string; candidates: string[] }[];
+  focus?: string;         // the assistant asked to OPEN a table's columns
+  canUndo: boolean;
+  understood: boolean;
+  source?: "model" | "offline";   // "offline" = the model was unreachable
+}
+
+/** The rail's list: every table, numbered as the user sees it. */
+export function wbCatalog(connectionId: string): Promise<{ connectionId: string; label: string; tables: WbCatalogTable[]; warnings: string[] }> {
+  return request(`/api/sql/${encodeURIComponent(connectionId)}/catalog`);
+}
+
+/** Columns for the middle panel; profiles on demand for big schemas. */
+export function wbProfile(connectionId: string, tables: string[]): Promise<{ tables: WbTableDetail[]; warnings: string[] }> {
+  return request(`/api/sql/${encodeURIComponent(connectionId)}/profile`, { method: "POST", body: JSON.stringify({ tables }) });
+}
+
+/** One conversational selection turn ("select 1, 2, 3", "drop the audit ones"). */
+export function wbSelect(body: { connectionId: string; conversationId?: string; prompt: string }): Promise<WbSelectionReply> {
+  return request("/api/sql/select", { method: "POST", body: JSON.stringify(body) });
+}
+
+/** Push the checkbox state — clicking and typing edit the SAME selection. */
+export function wbSetSelection(body: { connectionId: string; conversationId?: string; tables: string[]; note?: boolean }): Promise<{ conversationId: string; selection: string[]; added: string[]; removed: string[]; canUndo: boolean }> {
+  return request("/api/sql/selection", { method: "POST", body: JSON.stringify(body) });
+}
+
+/** Rehydrate selection + transcript after a reload. */
+export function wbGetSelection(conversationId: string): Promise<{ conversationId: string; selection: string[]; connectionId: string | null; connectionLabel: string | null; canUndo: boolean; turns: { role: string; content: string }[] }> {
+  return request(`/api/sql/selection/${encodeURIComponent(conversationId)}`);
+}
+
+/** "Continue to text2UI": the selection becomes a build source. */
+export function wbCommitSelection(body: { connectionId: string; conversationId?: string; tables?: string[]; label?: string; mode?: "live" | "snapshot" }): Promise<WbExtracted & { conversationId: string; mode: "live" | "snapshot"; warnings?: string[] }> {
+  return request("/api/sql/selection/commit", { method: "POST", body: JSON.stringify(body) });
 }
 
 /** "Extract DB": publish everything staged in this conversation as one source. */

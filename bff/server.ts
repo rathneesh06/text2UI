@@ -22,6 +22,7 @@ import { generateReport } from "./report";
 import { COLO_PROJECT_ID, COLO_LABEL, coloAvailable, coloProfiles, coloQuery } from "./sources/colo";
 import { isWorkbenchProject, listWorkbenchSources, wbQuery, removeWorkbenchSource } from "./sources/workbench-store";
 import { handleSqlConnect, handleSqlSchema, handleSqlMode, handleSqlChat, handleSqlExtract, handleSqlExtractDb, handleSqlStageGet, handleSqlStageDiscard, handleSourceChat, handleCombineSources, liveQuery, LIVE_PREFIX } from "./text2sql/handler";
+import { handleSelectionChat, handleSelectionGet, handleSelectionSet, handleSelectionCommit, handleTableProfile, handleCatalog } from "./text2sql/selection-handler";
 import { handleDashboardBuild } from "./dashboard/handler";
 import { buildWidgetSql } from "./dashboard/filters";
 import { handleDeckBuild, handleDeckEdit } from "./deck/handler";
@@ -1089,6 +1090,35 @@ export function createServer() {
   });
   app.post("/api/sql/extract-db", async (req, res) => {
     const { status, body } = await handleSqlExtractDb(req.body, req.tenantId ?? DEV_TENANT);
+    res.status(status).json(body);
+  });
+
+  // ---- Table selection: pick the tables that matter BEFORE building the UI ----
+  // A large database makes text2SQL guess. This page narrows the catalog by
+  // clicking OR by chatting; every route below reads and writes the ONE
+  // selection stored against the conversation.
+  app.post("/api/sql/select", async (req, res) => {
+    const { status, body } = await handleSelectionChat(req.body, req.tenantId ?? DEV_TENANT);
+    res.status(status).json(body);
+  });
+  app.get("/api/sql/selection/:conversationId", async (req, res) => {
+    const { status, body } = await handleSelectionGet(String(req.params.conversationId), req.tenantId ?? DEV_TENANT);
+    res.status(status).json(body);
+  });
+  app.post("/api/sql/selection", async (req, res) => {
+    const { status, body } = await handleSelectionSet(req.body, req.tenantId ?? DEV_TENANT);
+    res.status(status).json(body);
+  });
+  app.post("/api/sql/selection/commit", async (req, res) => {
+    const { status, body } = await handleSelectionCommit(req.body, req.tenantId ?? DEV_TENANT);
+    res.status(status).json(body);
+  });
+  app.get("/api/sql/:connectionId/catalog", (req, res) => {
+    const { status, body } = handleCatalog(String(req.params.connectionId), req.tenantId ?? DEV_TENANT);
+    res.status(status).json(body);
+  });
+  app.post("/api/sql/:connectionId/profile", async (req, res) => {
+    const { status, body } = await handleTableProfile(String(req.params.connectionId), req.body, req.tenantId ?? DEV_TENANT);
     res.status(status).json(body);
   });
   // Follow-up gate: once an artifact exists, classify each turn (edit vs answer)

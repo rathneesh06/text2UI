@@ -72,9 +72,14 @@ export async function handleSqlConnect(body: unknown, tenantId: string): Promise
   }
   try {
     // Structured parts (the dedicated Postgres page): every field taken literally.
+    // `fast`: the selection page connects to LIST tables, nothing more — it
+    // profiles a table when the user clicks it. Skipping the connect-time
+    // sampling, catalog-wide column metadata and information_schema row counts
+    // is the difference between seconds and minutes on a large server.
+    const fast = b.fast === true;
     const rec = hasParts
-      ? await openConnectionWith(tenantId, connFromParts(b.parts as DbConnParts))
-      : await openConnection(tenantId, b.connectionString);
+      ? await openConnectionWith(tenantId, connFromParts(b.parts as DbConnParts), undefined, { fast })
+      : await openConnection(tenantId, b.connectionString, undefined, { fast });
     // Per-source data-plane choice (goal 3): "live" queries the DB directly and
     // stores NOTHING; "snapshot" extracts first. Validated here, defaulted by
     // the T2SQL_LIVE_SOURCE env flag when unset.
@@ -127,7 +132,7 @@ export function handleSqlMode(connectionId: string, body: unknown, tenantId: str
 // into the conversation's single staging DuckDB file. Publishing to the build
 // page happens only via finalizeStaged() ("Extract DB") — or implicitly on a
 // build intent, which needs a queryable source immediately.
-async function stageSnapshot(
+export async function stageSnapshot(
   rec: ConnRecord,
   tables: string[],
   tenantId: string,

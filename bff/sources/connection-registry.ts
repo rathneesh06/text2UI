@@ -15,9 +15,10 @@ import { randomUUID } from "node:crypto";
 import { Socket } from "node:net";
 import type { AttachHandle } from "./mysql";
 import {
-  parseDbUrl, describeDbConn, introspectDb, attachDb, attachGroup,
+  parseDbUrl, describeDbConn, introspectDb, attachDb, attachGroup, refFor,
   type DbConn, type DbTableInfo,
 } from "./db-conn";
+import { nativeListTables } from "./native-catalog";
 import type { Dataset } from "../../shared/types";
 import { cacheEnabled, cacheLookup, cacheStore, catalogSignatures, connFingerprint, type SigReadAll } from "./schema-cache";
 
@@ -76,9 +77,16 @@ export async function openConnection(
   tenantId: string,
   connectionString: string,
   onPhase?: (msg: string) => void,
+  opts: OpenOptions = {},
 ): Promise<ConnRecord> {
-  return openConnectionWith(tenantId, parseDbUrl(connectionString), onPhase);
+  return openConnectionWith(tenantId, parseDbUrl(connectionString), onPhase, opts);
 }
+
+/** `fast`: list table NAMES only — no per-table sampling, no whole-catalog column
+ *  metadata, no information_schema row counts. On a big MySQL server those three
+ *  steps are the entire connect latency, and the selection page needs none of
+ *  them up front: it profiles a table the moment you click it. */
+export interface OpenOptions { fast?: boolean }
 
 /** Fail-fast reachability probe BEFORE the (slow) extension/attach machinery.
  *  A silent drop (firewall / no route / VPN off) surfaces in ~4s with a
@@ -108,11 +116,36 @@ export async function openConnectionWith(
   tenantId: string,
   conn: DbConn,
   onPhase?: (msg: string) => void,
+  opts: OpenOptions = {},
 ): Promise<ConnRecord> {
   sweep();
   onPhase?.(`checking ${conn.host}:${conn.port} is reachable…`);
   await preflightTcp(conn.host, conn.port);
-  const result = await introspectDb(conn, { sampleRows: 5, maxTables: 40, onPhase });
+  // FAST: browse natively (one protocol connection, one catalog query) instead
+  // of going through DuckDB's ATTACH, which materialises the whole remote
+  // catalog before it returns — minutes on a 12k-table server. See
+  // native-catalog.ts for the full reasoning.
+  const result = opts.fast
+    ? await (async () => {
+        onPhase?.("listing tables…");
+        const tables = await nativeListTables(conn);
+        onPhase?.(`discovered ${tables.length} table(s).`);
+        return {
+          datasets: [],
+          warnings: [],
+          allTables: tables.map((t) => ({
+            name: t.name,
+            schema: conn.dialect === "mysql" ? conn.database : (t.name.includes(".") ? t.name.slice(0, t.name.indexOf(".")) : "public"),
+            table: t.name.includes(".") ? t.name.slice(t.name.indexOf(".") + 1) : t.name,
+            ref: refFor(
+              conn.dialect === "mysql" ? conn.database : (t.name.includes(".") ? t.name.slice(0, t.name.indexOf(".")) : "public"),
+              t.name.includes(".") ? t.name.slice(t.name.indexOf(".") + 1) : t.name,
+            ),
+            approxRows: t.approxRows ?? 0,
+          })),
+        };
+      })()
+    : await introspectDb(conn, { sampleRows: 5, maxTables: 40, onPhase });
   const rec: ConnRecord = {
     id: "conn_" + randomUUID().replace(/-/g, "").slice(0, 12),
     tenantId,

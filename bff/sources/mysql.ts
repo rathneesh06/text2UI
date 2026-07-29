@@ -138,11 +138,15 @@ function pickDateColumn(cols: { col: string; type: string }[], preferred?: strin
   return dateCols[0].col;
 }
 
+/** Schemas the MySQL attach may expose that are never user data. */
+export const MYSQL_SYSTEM_SCHEMAS = new Set(["information_schema", "performance_schema", "mysql", "sys"]);
+
 export interface IntrospectOptions {
   sampleRows?: number;   // rows to LIMIT-sample per profiled table (default 5)
   maxTables?: number;    // cap number of tables PROFILED (default 25)
   tables?: string[];     // profile only these specific tables (overrides maxTables)
   listOnly?: boolean;    // just list table names + approx counts; skip sampling
+  skipRowCounts?: boolean; // skip information_schema TABLE_ROWS (slow on big MySQL servers)
   windowDays?: number;   // only consider rows from the last N days (needs a date column)
   dateColumn?: string;   // the date/timestamp column to window on (auto-detected if omitted)
   onPhase?: (msg: string) => void;     // progress callback (which step we're on)
@@ -247,39 +251,48 @@ export async function introspectMysql(conn: MysqlConn, opts: IntrospectOptions =
   const h = await attachMysql(conn, opts);
   const { readAll } = h;
   try {
-    // Tables + columns from DuckDB's catalog view of the attached MySQL db.
-    log("listing tables and columns…");
+    // Tables from DuckDB's catalog view of the attached MySQL db.
+    log("listing tables…");
     const tableRows = await readAll(
       `SELECT schema_name AS schema, table_name AS name FROM duckdb_tables() WHERE database_name = 'src' ORDER BY table_name`,
       "list tables",
     );
-    const colRows = await readAll(
-      `SELECT table_name AS name, column_name AS col, data_type AS type FROM duckdb_columns() WHERE database_name = 'src' ORDER BY table_name, column_index`,
-      "list columns",
-    );
-    const colsByTable = new Map<string, { col: string; type: string }[]>();
-    for (const r of colRows) {
-      const n = String(r.name);
-      if (!colsByTable.has(n)) colsByTable.set(n, []);
-      colsByTable.get(n)!.push({ col: String(r.col), type: String(r.type) });
-    }
 
-    // Approximate row counts straight from MySQL's information_schema — cheap,
-    // avoids a count(*) scan over production tables.
+    // The MySQL attach can surface the server's system schemas alongside the
+    // one the user connected to. They're never data, and on a big server they
+    // bury the real tables (12k-entry rails are mostly INNODB_SYS_* noise), so
+    // keep the connected database when it's identifiable and drop the rest.
+    const own = tableRows.filter((t) => String(t.schema).toLowerCase() === conn.database.toLowerCase());
+    const visibleRows = own.length
+      ? own
+      : tableRows.filter((t) => !MYSQL_SYSTEM_SCHEMAS.has(String(t.schema).toLowerCase()));
+    const dropped = tableRows.length - visibleRows.length;
+    if (dropped > 0) log(`ignoring ${dropped} table(s) in system schemas.`);
+
+    // Approximate row counts from information_schema. Cheaper than count(*), but
+    // NOT free: reading TABLE_ROWS makes InnoDB refresh statistics per table
+    // unless innodb_stats_on_metadata is off, which on a schema this size is
+    // minutes, not milliseconds. skipRowCounts trades the "~N rows" hint for a
+    // connect that returns immediately; the counts arrive per table on demand.
     const counts = new Map<string, number>();
-    try {
-      const innerSql = `SELECT table_name, table_rows FROM information_schema.tables WHERE table_schema = ${qstr(conn.database).replace(/'/g, "''")}`;
-      const cr = await readAll(`SELECT * FROM mysql_query('src', ${qstr(innerSql)})`, "row counts");
-      for (const r of cr) {
-        const tn = String((r.table_name ?? (r as any).TABLE_NAME) ?? "");
-        counts.set(tn, Number((r.table_rows ?? (r as any).TABLE_ROWS) ?? 0));
+    if (!opts.skipRowCounts) {
+      try {
+        // Best-effort: ask InnoDB not to recompute stats just because we read
+        // metadata. Ignored by servers that don't allow the session variable.
+        try { await readAll(`SELECT * FROM mysql_query('src', 'SET SESSION innodb_stats_on_metadata = 0')`, "stats hint"); } catch { /* not permitted — proceed */ }
+        const innerSql = `SELECT table_name, table_rows FROM information_schema.tables WHERE table_schema = ${qstr(conn.database).replace(/'/g, "''")}`;
+        const cr = await readAll(`SELECT * FROM mysql_query('src', ${qstr(innerSql)})`, "row counts");
+        for (const r of cr) {
+          const tn = String((r.table_name ?? (r as any).TABLE_NAME) ?? "");
+          counts.set(tn, Number((r.table_rows ?? (r as any).TABLE_ROWS) ?? 0));
+        }
+      } catch (e) {
+        warnings.push(`approximate row counts unavailable (${(e as Error).message}); falling back to sample size`);
       }
-    } catch (e) {
-      warnings.push(`approximate row counts unavailable (${(e as Error).message}); falling back to sample size`);
     }
 
     // Every discovered table (cheap; no per-table queries) — used for selection.
-    const allTables = tableRows.map((t) => ({ name: String(t.name), approxRows: counts.get(String(t.name)) ?? 0 }));
+    const allTables = visibleRows.map((t) => ({ name: String(t.name), approxRows: counts.get(String(t.name)) ?? 0 }));
     log(`discovered ${allTables.length} table(s).`);
 
     // Decide WHICH tables to actually profile (sample). Sampling is one query per
@@ -289,7 +302,7 @@ export async function introspectMysql(conn: MysqlConn, opts: IntrospectOptions =
       toProfile = [];
     } else if (opts.tables && opts.tables.length) {
       const wanted = new Set(opts.tables.map((s) => s.toLowerCase()));
-      toProfile = tableRows
+      toProfile = visibleRows
         .filter((t) => wanted.has(String(t.name).toLowerCase()))
         .map((t) => ({ name: String(t.name), schema: String(t.schema) }));
       for (const w of opts.tables) {
@@ -297,8 +310,29 @@ export async function introspectMysql(conn: MysqlConn, opts: IntrospectOptions =
       }
     } else {
       const cap = opts.maxTables ?? 25;
-      toProfile = tableRows.slice(0, cap).map((t) => ({ name: String(t.name), schema: String(t.schema) }));
+      toProfile = visibleRows.slice(0, cap).map((t) => ({ name: String(t.name), schema: String(t.schema) }));
       if (allTables.length > cap) warnings.push(`profiled the first ${cap} of ${allTables.length} tables — pass specific table names to profile others`);
+    }
+
+    // Column metadata, scoped to the tables actually being profiled. Reading the
+    // whole catalog here — duckdb_columns() with no filter — is the single most
+    // expensive step against a large server, because it forces the scanner to
+    // materialise every table's definition. Profiling six tables should cost six
+    // tables' worth of metadata, not twelve thousand.
+    const colsByTable = new Map<string, { col: string; type: string }[]>();
+    if (toProfile.length) {
+      log("listing columns…");
+      const names = toProfile.map((t) => qstr(t.name)).join(", ");
+      const colRows = await readAll(
+        `SELECT table_name AS name, column_name AS col, data_type AS type FROM duckdb_columns() ` +
+        `WHERE database_name = 'src' AND table_name IN (${names}) ORDER BY table_name, column_index`,
+        "list columns",
+      );
+      for (const r of colRows) {
+        const n = String(r.name);
+        if (!colsByTable.has(n)) colsByTable.set(n, []);
+        colsByTable.get(n)!.push({ col: String(r.col), type: String(r.type) });
+      }
     }
 
     const datasets: Dataset[] = [];

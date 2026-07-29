@@ -1,0 +1,359 @@
+// bff/text2sql/selection-handler.ts — the routes behind the table-selection page.
+//
+//   POST /api/sql/select              handleSelectionChat    one conversational turn
+//   GET  /api/sql/selection/:convId   handleSelectionGet     rehydrate after a reload
+//   POST /api/sql/selection           handleSelectionSet     the rail's checkboxes
+//   POST /api/sql/selection/commit    handleSelectionCommit  → a text2UI source
+//   POST /api/sql/:connectionId/profile  handleTableProfile  columns on demand
+//
+// The point of the page: a 400-table production database makes text2SQL guess.
+// Narrowing to the six tables the user actually cares about — by clicking OR by
+// typing — makes every downstream stage (planner, dashboard build, deck) work
+// against a small, deliberate catalog.
+//
+// Memory: every turn (typed or clicked) is appended to the same ChatStore the
+// rest of the app uses, with the resulting selection recorded in briefJson. So
+// "put back the two you dropped" has something real to read, and the transcript
+// survives a page reload.
+//
+// Every typed turn is planned by the MODEL (see selection.ts). The only thing
+// the server decides for itself is whether the names the model emitted exist —
+// resolution and the correction note, never the intent.
+import { getChatStore, type ChatStore } from "../chat-store";
+import { getConnection } from "../sources/connection-registry";
+import { nativeTableDetail } from "../sources/native-catalog";
+import {
+  getSelection, setSelection, undoSelection, canUndo, dropSelection,
+} from "../sources/selection-store";
+import { finalizeStaged } from "../sources/workbench-store";
+import { stageSnapshot } from "./handler";
+import {
+  applyOps, correctionNote, offlineFallback, planSelectionTurn, summarizeApply,
+  type PlanSelectionRun, type SelOp,
+} from "./selection";
+import type { Dataset } from "../../shared/types";
+
+type Out = { status: number; body: any };
+const bad = (error: string): Out => ({ status: 400, body: { error } });
+
+export interface SelectionDeps {
+  plan?: PlanSelectionRun;
+  chatStore?: ChatStore;
+}
+
+/** Max tables a single /profile call will introspect (each one is a query). */
+const PROFILE_BATCH = Number(process.env.T2SQL_PROFILE_BATCH ?? 12);
+
+/** The catalog as the client renders it: display order, 1-based numbers, and a
+ *  `profiled` flag so the UI knows whether clicking needs a round-trip. */
+function catalogView(rec: { allTables: { name: string; approxRows: number }[]; datasets: Dataset[] }) {
+  const profiled = new Set(rec.datasets.map((d) => d.tableName));
+  return rec.allTables.map((t, i) => ({
+    index: i + 1,
+    name: t.name,
+    approxRows: t.approxRows,
+    profiled: profiled.has(t.name),
+    columnCount: rec.datasets.find((d) => d.tableName === t.name)?.profile.columns.length ?? null,
+  }));
+}
+
+// ---- POST /api/sql/select — one conversational selection turn ---------------------
+export async function handleSelectionChat(body: unknown, tenantId: string, deps: SelectionDeps = {}): Promise<Out> {
+  const b = body as any;
+  if (!b || typeof b !== "object") return bad("body must be a JSON object");
+  if (typeof b.prompt !== "string" || !b.prompt.trim()) return bad("prompt is required");
+  const rec = getConnection(tenantId, String(b.connectionId ?? ""));
+  if (!rec) return { status: 404, body: { error: "unknown or expired connection — reconnect" } };
+
+  const store = deps.chatStore ?? getChatStore();
+  const conversationId = await store.createConversation(`Select tables: ${rec.conn.database}`, b.conversationId || undefined);
+  const history = await store.getHistory(conversationId, 24);
+  const prompt = b.prompt.trim();
+  await store.appendMessage(conversationId, { role: "user", content: prompt });
+
+  const catalog = rec.allTables.map((t) => t.name);
+  const current = getSelection(conversationId, tenantId).tables;
+
+  // The model plans EVERY turn. It sees the catalog (with columns where they've
+  // been profiled), the live selection, and the conversation so far, and it
+  // writes both the ops and the words the user reads.
+  const planned = await planSelectionTurn(
+    {
+      prompt,
+      catalog: rec.allTables.map((t) => ({
+        name: t.name,
+        approxRows: t.approxRows,
+        columns: rec.datasets.find((d) => d.tableName === t.name)?.profile.columns.map((c: any) => String(c.name)),
+      })),
+      selection: current,
+      history,
+    },
+    deps.plan,
+  );
+
+  let ops: SelOp[] | null = planned?.ops ?? null;
+  let modelReply: string | undefined = planned?.reply;
+  let source: "model" | "offline" = "model";
+
+  // planSelectionTurn returns null only for an outage (unreachable, timed out,
+  // unparseable). Bare "1, 4, 9" still works in that state; anything with intent
+  // in it does not, and the user is told why rather than half-obeyed.
+  if (!planned) {
+    const offline = offlineFallback(prompt, catalog);
+    if (!offline) {
+      const answer = `I can't reach the model right now, so I can't work out what you meant. You can still tick tables in the list on the left — or send just the numbers (“1, 4, 9”) and I'll add those.`;
+      await store.appendMessage(conversationId, { role: "assistant", content: answer });
+      return { status: 200, body: { conversationId, reply: answer, selection: current, added: [], removed: [], canUndo: canUndo(conversationId), understood: false, source: "offline" } };
+    }
+    ops = offline;
+    source = "offline";
+  }
+
+  const result = applyOps(current, ops ?? [], catalog);
+
+  // "undo" rewinds the store rather than computing a new set.
+  if (result.undo) {
+    const undone = undoSelection(conversationId, tenantId);
+    const answer = modelReply?.trim() || (undone
+      ? `Undone — back to ${undone.tables.length} selected table${undone.tables.length === 1 ? "" : "s"}${undone.tables.length ? `: ${undone.tables.slice(0, 12).join(", ")}${undone.tables.length > 12 ? ", …" : ""}` : ""}.`
+      : "There's nothing to undo yet.");
+    await store.appendMessage(conversationId, {
+      role: "assistant", content: answer,
+      briefJson: JSON.stringify({ intent: "selection", op: "undo", selection: undone?.tables ?? current }),
+    });
+    return { status: 200, body: { conversationId, reply: answer, selection: undone?.tables ?? current, added: [], removed: [], canUndo: canUndo(conversationId), understood: true, source } };
+  }
+
+  // Persist only when the set actually moved, so the undo stack stays meaningful.
+  const changed = result.added.length > 0 || result.removed.length > 0;
+  if (changed) setSelection(conversationId, tenantId, result.selection, { connectionId: rec.id, connectionLabel: rec.label });
+
+  // The model's words are the reply — this is a conversation, not a form. The
+  // server only appends what the model can actually be wrong about: names that
+  // don't exist and names that matched several tables.
+  let reply = modelReply?.trim() || summarizeApply(result, catalog.length);
+  if (modelReply?.trim()) {
+    const note = correctionNote(result);
+    if (note) reply = `${reply}\n\n${note}`;
+  }
+
+  await store.appendMessage(conversationId, {
+    role: "assistant",
+    content: reply,
+    briefJson: JSON.stringify({ intent: "selection", ops, selection: result.selection, source }),
+  });
+
+  return {
+    status: 200,
+    body: {
+      conversationId,
+      reply,
+      selection: result.selection,
+      added: result.added,
+      removed: result.removed,
+      unresolved: result.unresolved,
+      ambiguous: result.ambiguous,
+      ...(result.focus ? { focus: result.focus } : {}),
+      canUndo: canUndo(conversationId),
+      understood: true,
+      source,
+    },
+  };
+}
+
+// ---- GET /api/sql/selection/:conversationId — rehydrate after a reload -------------
+export async function handleSelectionGet(conversationId: string, tenantId: string, deps: SelectionDeps = {}): Promise<Out> {
+  const id = String(conversationId ?? "");
+  if (!id) return bad("conversationId is required");
+  const state = getSelection(id, tenantId);
+  let turns: { role: string; content: string }[] = [];
+  try {
+    const store = deps.chatStore ?? getChatStore();
+    turns = await store.getHistory(id, 40);
+  } catch { /* memory is best-effort; the selection itself is the payload */ }
+  return {
+    status: 200,
+    body: {
+      conversationId: id,
+      selection: state.tables,
+      connectionId: state.connectionId || null,
+      connectionLabel: state.connectionLabel ?? null,
+      canUndo: canUndo(id),
+      turns,
+    },
+  };
+}
+
+// ---- POST /api/sql/selection — the rail's checkboxes ---------------------------------
+// Clicking and typing edit ONE selection. A click is also written into the
+// transcript (as a user turn), so the next typed message — "actually drop the
+// last one" — has the click in its history to refer to.
+export async function handleSelectionSet(body: unknown, tenantId: string, deps: SelectionDeps = {}): Promise<Out> {
+  const b = body as any;
+  if (!b || typeof b !== "object") return bad("body must be a JSON object");
+  if (!Array.isArray(b.tables)) return bad("tables[] is required");
+  const rec = getConnection(tenantId, String(b.connectionId ?? ""));
+  if (!rec) return { status: 404, body: { error: "unknown or expired connection — reconnect" } };
+
+  const store = deps.chatStore ?? getChatStore();
+  const conversationId = await store.createConversation(`Select tables: ${rec.conn.database}`, b.conversationId || undefined);
+
+  const catalog = new Set(rec.allTables.map((t) => t.name));
+  const wanted: string[] = [...new Set((b.tables as unknown[]).map((t) => String(t)))];
+  const unknown = wanted.filter((t) => !catalog.has(t));
+  const tables = rec.allTables.map((t) => t.name).filter((n) => wanted.includes(n)); // catalog order
+
+  const before = getSelection(conversationId, tenantId).tables;
+  const added = tables.filter((t) => !before.includes(t));
+  const removed = before.filter((t) => !tables.includes(t));
+  if (added.length || removed.length) {
+    setSelection(conversationId, tenantId, tables, { connectionId: rec.id, connectionLabel: rec.label });
+    if (b.note !== false) {
+      const bits = [
+        added.length ? `selected ${added.join(", ")}` : "",
+        removed.length ? `deselected ${removed.join(", ")}` : "",
+      ].filter(Boolean).join("; ");
+      try {
+        await store.appendMessage(conversationId, { role: "user", content: `(clicked in the table list: ${bits})` });
+      } catch { /* memory best-effort */ }
+    }
+  }
+  return {
+    status: 200,
+    body: { conversationId, selection: tables, added, removed, canUndo: canUndo(conversationId), ...(unknown.length ? { unknown } : {}) },
+  };
+}
+
+// ---- POST /api/sql/:connectionId/profile — columns on demand -------------------------
+// Native, per table, the way a GUI client expands a tree node: one protocol
+// connection, one columns query, one 5-row sample, one row estimate. It does NOT
+// go through DuckDB's ATTACH, which would materialise the whole remote catalog
+// just to describe one table.
+export async function handleTableProfile(connectionId: string, body: unknown, tenantId: string): Promise<Out> {
+  const rec = getConnection(tenantId, String(connectionId ?? ""));
+  if (!rec) return { status: 404, body: { error: "unknown or expired connection — reconnect" } };
+  const b = (body ?? {}) as any;
+  const known = new Set(rec.allTables.map((t) => t.name));
+  const wanted = (Array.isArray(b.tables) ? b.tables : [b.table])
+    .map((t: unknown) => String(t ?? "").trim())
+    .filter((t: string) => t && known.has(t))
+    .slice(0, PROFILE_BATCH);
+  if (!wanted.length) return bad("tables[] must name at least one table from this connection");
+  try {
+    const details = await nativeTableDetail(rec.conn, wanted);
+    // Cache what we learned on the record so the selection planner can see real
+    // column names when it reasons about "the ones with an email address".
+    for (const d of details) {
+      if (rec.datasets.some((x) => x.tableName === d.tableName)) continue;
+      rec.datasets.push({
+        tableName: d.tableName,
+        profile: {
+          source: { filename: `${rec.conn.dialect}:${rec.conn.database}.${d.tableName}`, format: "json" },
+          rowCount: d.rowCount ?? 0,
+          columns: d.columns.map((c) => ({ name: c.name, type: c.type, nullable: c.nullable })),
+          sampleRows: d.sampleRows,
+        },
+      } as any);
+    }
+    return {
+      status: 200,
+      body: {
+        tables: details.map((d) => ({
+          tableName: d.tableName,
+          rowCount: d.rowCount ?? 0,
+          columns: d.columns.map((c) => ({
+            name: c.name,
+            type: c.type,
+            nullable: c.nullable,
+            uniqueCount: null,
+            // A column's first few values, read off the sample we already have —
+            // no extra query per column.
+            sampleValues: d.sampleRows.map((r) => r[c.name]).filter((v) => v !== undefined).slice(0, 4),
+          })),
+          sampleRows: d.sampleRows.slice(0, 5),
+        })),
+        warnings: rec.warnings.slice(-3),
+      },
+    };
+  } catch (err: any) {
+    return { status: 502, body: { error: `couldn't read the schema for ${wanted.join(", ")}: ${err?.message ?? err}` } };
+  }
+}
+
+// ---- GET /api/sql/:connectionId/catalog — the rail's list -----------------------------
+export function handleCatalog(connectionId: string, tenantId: string): Out {
+  const rec = getConnection(tenantId, String(connectionId ?? ""));
+  if (!rec) return { status: 404, body: { error: "unknown or expired connection — reconnect" } };
+  return {
+    status: 200,
+    body: {
+      connectionId: rec.id,
+      label: rec.label,
+      mode: rec.mode ?? null,
+      status: rec.status,
+      tables: catalogView(rec),
+      warnings: rec.warnings,
+    },
+  };
+}
+
+// ---- POST /api/sql/selection/commit — "Continue to text2UI" -----------------------------
+// Turns the selection into exactly what the build page already understands: a
+// named source (snapshot) or a live source. Nothing new downstream — the
+// dashboard/deck pipelines see the same shape they see from "Extract DB".
+export async function handleSelectionCommit(body: unknown, tenantId: string, deps: SelectionDeps = {}): Promise<Out> {
+  const b = body as any;
+  if (!b || typeof b !== "object") return bad("body must be a JSON object");
+  const rec = getConnection(tenantId, String(b.connectionId ?? ""));
+  if (!rec) return { status: 404, body: { error: "unknown or expired connection — reconnect" } };
+  const store = deps.chatStore ?? getChatStore();
+  const conversationId = await store.createConversation(`Select tables: ${rec.conn.database}`, b.conversationId || undefined);
+
+  // The client may pass the tables explicitly (belt and braces); the stored
+  // selection is authoritative when it doesn't.
+  const known = new Set(rec.allTables.map((t) => t.name));
+  const fromBody = Array.isArray(b.tables) ? b.tables.map(String).filter((t: string) => known.has(t)) : [];
+  const tables = fromBody.length ? fromBody : getSelection(conversationId, tenantId).tables.filter((t) => known.has(t));
+  if (!tables.length) {
+    return bad("nothing selected yet — pick at least one table (click it, or say \"select 1, 2, 3\") before continuing");
+  }
+
+  const label = typeof b.label === "string" && b.label.trim()
+    ? b.label.trim()
+    : `${rec.conn.database} (${tables.slice(0, 3).join(", ")}${tables.length > 3 ? `, +${tables.length - 3}` : ""})`;
+
+  // This page always STORES the data: the selected tables are read once into a
+  // snapshot and published as a source. (There used to be a "query live" option
+  // here — removed, because a selection the user curated should not silently
+  // depend on the database still being reachable at render time.)
+  try {
+    // Snapshot: read the selected tables once into this conversation's staging
+    // file, then publish that file as one source (the "Extract DB" mechanics,
+    // driven by the selection instead of by chat intent).
+    const { staged, warnings, skipped } = await stageSnapshot(rec, tables, tenantId, conversationId);
+    // Keep only what was asked for: a stage reused across several commits could
+    // still hold tables the user has since deselected.
+    const wanted = new Set(tables);
+    staged.tables = staged.tables.filter((t) => wanted.has(t.tableName));
+    const source = finalizeStaged(conversationId, label);
+    dropSelection(conversationId, tenantId); // published — the stage is now a source
+    await store.appendMessage(conversationId, {
+      role: "assistant",
+      content: `Extracted ${source.tables.map((t) => t.tableName).join(", ")} as “${source.label}”. Opening the builder…`,
+      briefJson: JSON.stringify({ intent: "selection-commit", mode: "snapshot", tables }),
+    });
+    return {
+      status: 200,
+      body: {
+        conversationId,
+        projectId: source.projectId,
+        label: source.label,
+        tables: source.tables,
+        mode: "snapshot" as const,
+        warnings: [...warnings, ...skipped],
+      },
+    };
+  } catch (err: any) {
+    return { status: 500, body: { error: err?.message ?? "couldn't prepare the selected tables" } };
+  }
+}
