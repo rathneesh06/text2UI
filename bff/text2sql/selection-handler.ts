@@ -20,16 +20,18 @@
 // the server decides for itself is whether the names the model emitted exist —
 // resolution and the correction note, never the intent.
 import { getChatStore, InMemoryChatStore, type ChatStore } from "../chat-store";
+import { describeError } from "../sources/describe-error";
 import { getConnection } from "../sources/connection-registry";
-import { nativeTableDetail } from "../sources/native-catalog";
+import { nativeTableDetail, nativeQuery } from "../sources/native-catalog";
+import { guardSelect } from "./guard";
 import {
   getSelection, setSelection, undoSelection, canUndo, dropSelection,
 } from "../sources/selection-store";
 import { finalizeStaged, projectStagedColumns } from "../sources/workbench-store";
 import { stageSnapshot } from "./handler";
 import {
-  applyOps, correctionNote, offlineFallback, planSelectionTurn, summarizeApply,
-  type PlanSelectionRun, type SelOp,
+  answerFromRows, applyOps, correctionNote, describeRows, offlineFallback,
+  planSelectionTurn, summarizeApply, type PlanSelectionRun, type SelOp,
 } from "./selection";
 import type { Dataset } from "../../shared/types";
 
@@ -48,24 +50,9 @@ const bad = (error: string): Out => ({ status: 400, body: { error } });
  * Now: the stack goes to the server log with the route that produced it, and the
  * user gets a JSON message they can quote back.
  */
-/** Node's AggregateError (what a failed pg pool throws) has an EMPTY message —
- *  `err.message || String(err)` yields the bare class name, which names what
- *  threw but not why. The cause lives in `.code` and in `.errors[0]`. Dig. */
-export function describeError(err: any, depth = 0): string {
-  if (!err || depth > 3) return "";
-  const parts: string[] = [];
-  const msg = typeof err.message === "string" ? err.message.trim() : "";
-  if (msg) parts.push(msg);
-  if (err.code) parts.push(String(err.code));
-  if (err.address || err.port) parts.push(`connecting to ${err.address ?? "?"}:${err.port ?? "?"}`);
-  // AggregateError carries the real failures in .errors
-  const inner = Array.isArray(err.errors) ? err.errors[0] : err.cause;
-  if (!parts.length || (!err.code && inner)) {
-    const nested = describeError(inner, depth + 1);
-    if (nested) parts.push(nested);
-  }
-  return [...new Set(parts)].join(" ").trim() || (err.name ? String(err.name) : "");
-}
+// Re-exported so existing importers (server.ts's global error handler) keep
+// working; the implementation moved once it gained a second consumer.
+export { describeError } from "../sources/describe-error";
 
 /** The chat store is MEMORY — valuable, but not the point of this page. When it
  *  is unreachable (Postgres down, container not up), ticking a checkbox must
@@ -128,6 +115,9 @@ async function guarded(route: string, fn: () => Promise<Out> | Out): Promise<Out
 export interface SelectionDeps {
   plan?: PlanSelectionRun;
   chatStore?: ChatStore;
+  /** Test seam for the analyst pass: run SQL / compose the answer. */
+  runQuery?: typeof nativeQuery;
+  answer?: PlanSelectionRun;
 }
 
 /** Max tables a single /profile call will introspect (each one is a query). */
@@ -165,7 +155,7 @@ async function handleSelectionChatInner(body: unknown, tenantId: string, deps: S
   await store.appendMessage(conversationId, { role: "user", content: prompt });
 
   const catalog = rec.allTables.map((t) => t.name);
-  const state = getSelection(conversationId, tenantId);
+  const state = await getSelection(conversationId, tenantId);
   const current = state.tables;
 
   // The model plans EVERY turn. It sees the catalog (with columns where they've
@@ -181,6 +171,7 @@ async function handleSelectionChatInner(body: unknown, tenantId: string, deps: S
       })),
       selection: current,
       history,
+      dialect: rec.conn.dialect,
     },
     deps.plan,
   );
@@ -203,11 +194,43 @@ async function handleSelectionChatInner(body: unknown, tenantId: string, deps: S
     source = "offline";
   }
 
+  // ---- analyst pass: the model asked to read the data ----
+  // Runs BEFORE selection ops are applied so a turn can do both ("add orders and
+  // tell me how many are open"). The query is guarded statically, then executed
+  // inside a READ ONLY transaction against the source database.
+  let dataAnswer: string | undefined;
+  let queryNote: string | undefined;
+  if (planned?.sql) {
+    const guard = guardSelect(planned.sql, Number(process.env.DB_ANALYSIS_ROW_CAP ?? 200));
+    if (!guard.ok) {
+      // The model wrote something the guard won't run. Say so rather than
+      // silently dropping the question — and never echo the rejected SQL as if
+      // it were an answer.
+      queryNote = `I couldn't run that safely (${guard.error}).`;
+      console.warn(`[selection] query rejected: ${guard.error} — ${planned.sql.slice(0, 200)}`);
+    } else {
+      try {
+        console.log(`[selection] query: ${guard.sql.replace(/\s+/g, " ").slice(0, 300)}`);
+        const rows = await (deps.runQuery ?? nativeQuery)(rec.conn, guard.sql);
+        console.log(`[selection] query returned ${rows.rows.length} row(s) in ${rows.elapsedMs}ms`);
+        dataAnswer = (await answerFromRows(
+          { prompt, sql: guard.sql, columns: rows.columns, rows: rows.rows, truncated: rows.truncated, history },
+          deps.answer,
+        )) ?? describeRows(rows);
+      } catch (err: any) {
+        // A failed query is information: usually a wrong column or a permission
+        // gap, both of which the user can act on.
+        queryNote = `That query failed: ${describeError(err)}`;
+        console.warn(`[selection] query failed:`, err?.stack ?? err);
+      }
+    }
+  }
+
   const result = applyOps(current, ops ?? [], catalog, state.columns);
 
   // "undo" rewinds the store rather than computing a new set.
   if (result.undo) {
-    const undone = undoSelection(conversationId, tenantId);
+    const undone = await undoSelection(conversationId, tenantId);
     const answer = modelReply?.trim() || (undone
       ? `Undone — back to ${undone.tables.length} selected table${undone.tables.length === 1 ? "" : "s"}${undone.tables.length ? `: ${undone.tables.slice(0, 12).join(", ")}${undone.tables.length > 12 ? ", …" : ""}` : ""}.`
       : "There's nothing to undo yet.");
@@ -222,7 +245,7 @@ async function handleSelectionChatInner(body: unknown, tenantId: string, deps: S
   const colsChanged = JSON.stringify(result.columns) !== JSON.stringify(state.columns);
   const changed = result.added.length > 0 || result.removed.length > 0 || colsChanged;
   if (changed) {
-    setSelection(conversationId, tenantId, result.selection, {
+    await setSelection(conversationId, tenantId, result.selection, {
       connectionId: rec.id, connectionLabel: rec.label, columns: result.columns,
     });
   }
@@ -230,8 +253,14 @@ async function handleSelectionChatInner(body: unknown, tenantId: string, deps: S
   // The model's words are the reply — this is a conversation, not a form. The
   // server only appends what the model can actually be wrong about: names that
   // don't exist and names that matched several tables.
-  let reply = modelReply?.trim() || summarizeApply(result, catalog.length);
-  if (modelReply?.trim()) {
+  // The data answer leads when there is one — it's what was asked. Selection
+  // changes and corrections follow, so nothing happens silently.
+  let reply = dataAnswer || modelReply?.trim() || summarizeApply(result, catalog.length);
+  if (dataAnswer && (result.added.length || result.removed.length)) {
+    reply = `${reply}\n\n${summarizeApply(result, catalog.length)}`;
+  }
+  if (queryNote) reply = `${queryNote}${reply === queryNote ? "" : `\n\n${reply}`}`;
+  if (!dataAnswer && modelReply?.trim()) {
     const note = correctionNote(result);
     if (note) reply = `${reply}\n\n${note}`;
   }
@@ -269,7 +298,7 @@ export async function handleSelectionGet(conversationId: string, tenantId: strin
 async function handleSelectionGetInner(conversationId: string, tenantId: string, deps: SelectionDeps = {}): Promise<Out> {
   const id = String(conversationId ?? "");
   if (!id) return bad("conversationId is required");
-  const state = getSelection(id, tenantId);
+  const state = await getSelection(id, tenantId);
   let turns: { role: string; content: string }[] = [];
   try {
     const store = storeFor(deps);
@@ -323,15 +352,22 @@ async function handleSelectionSetInner(body: unknown, tenantId: string, deps: Se
         )
       : undefined;
 
-  const prev = getSelection(conversationId, tenantId);
+  const prev = await getSelection(conversationId, tenantId);
   const before = prev.tables;
   const added = tables.filter((t) => !before.includes(t));
   const removed = before.filter((t) => !tables.includes(t));
-  const colsChanged = columns
-    ? Object.entries(columns).some(([t, c]) => (prev.columns[t] ?? []).join("\u0000") !== c.join("\u0000"))
-    : false;
+  // Compare the WHOLE projection, not just the keys that arrived. The old check
+  // only looked at incoming entries, so `columns: {}` — the client saying "no
+  // table is narrowed any more" — registered as no change at all, and the
+  // widened selection was never saved.
+  const sameProjection = (a: Record<string, string[]>, b: Record<string, string[]>) => {
+    const norm = (m: Record<string, string[]>) =>
+      JSON.stringify(Object.keys(m).filter((k) => m[k]?.length).sort().map((k) => [k, [...m[k]].sort()]));
+    return norm(a) === norm(b);
+  };
+  const colsChanged = columns ? !sameProjection(columns, prev.columns) : false;
   if (added.length || removed.length || colsChanged) {
-    setSelection(conversationId, tenantId, tables, { connectionId: rec.id, connectionLabel: rec.label, ...(columns ? { columns } : {}) });
+    await setSelection(conversationId, tenantId, tables, { connectionId: rec.id, connectionLabel: rec.label, ...(columns ? { columns } : {}) });
     if (b.note !== false) {
       const bits = [
         added.length ? `selected ${added.join(", ")}` : "",
@@ -350,7 +386,7 @@ async function handleSelectionSetInner(body: unknown, tenantId: string, deps: Se
     body: {
       conversationId,
       selection: tables,
-      columns: getSelection(conversationId, tenantId).columns,
+      columns: (await getSelection(conversationId, tenantId)).columns,
       added, removed,
       canUndo: canUndo(conversationId),
       ...(unknown.length ? { unknown } : {}),
@@ -459,7 +495,7 @@ async function handleSelectionCommitInner(body: unknown, tenantId: string, deps:
     : [];
   const tables: string[] = fromBody.length
     ? fromBody
-    : getSelection(conversationId, tenantId).tables.filter((t) => known.has(t));
+    : (await getSelection(conversationId, tenantId)).tables.filter((t) => known.has(t));
   if (!tables.length) {
     return bad("nothing selected yet — pick at least one table (click it, or say \"select 1, 2, 3\") before continuing");
   }
@@ -494,7 +530,7 @@ async function handleSelectionCommitInner(body: unknown, tenantId: string, deps:
     // snapshot writer produced — the bare table name, sanitised, with a numeric
     // suffix if two schemas collided. Rebuild that mapping rather than relying
     // on array order, which addStaged is free to change when it merges.
-    const chosenCols = getSelection(conversationId, tenantId).columns;
+    const chosenCols = (await getSelection(conversationId, tenantId)).columns;
     let colWarnings: string[] = [];
     if (Object.keys(chosenCols).length) {
       const sanitise = (t: string) =>
@@ -517,7 +553,7 @@ async function handleSelectionCommitInner(body: unknown, tenantId: string, deps:
     const wanted = new Set(tables);
     staged.tables = staged.tables.filter((t) => wanted.has(t.tableName));
     const source = finalizeStaged(conversationId, label);
-    dropSelection(conversationId, tenantId); // published — the stage is now a source
+    await dropSelection(conversationId, tenantId); // published — the stage is now a source
     await store.appendMessage(conversationId, {
       role: "assistant",
       content: `Extracted ${source.tables.map((t) => t.tableName).join(", ")} as “${source.label}”. Opening the builder…`,

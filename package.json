@@ -15,6 +15,7 @@
     "build": "vite build",
     "preview": "vite preview",
     "test:storage": "tsx bff/storage/storage.test.ts",
+    "verify:storage": "tsx bff/storage/verify-storage.ts",
     "test:aiflow": "tsx bff/aiflow.test.ts",
     "test:deck-edit": "tsx bff/deck/edit-planner.test.ts",
     "test:orchestrator": "tsx bff/orchestrator.test.ts",

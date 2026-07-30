@@ -17,7 +17,7 @@ process.on("exit", () => { try { rmSync(TEST_WB_DIR, { recursive: true, force: t
 
 import { InMemoryChatStore } from "../chat-store";
 import { registerConnection, type ConnRecord } from "../sources/connection-registry";
-import { getSelection } from "../sources/selection-store";
+import { getSelection, setSelection, dropSelection, canUndo, undoSelection, _resetSelectionsForTest, FileSelectionStore, type SelectionBackend } from "../sources/selection-store";
 import { applyOps, correctionNote, offlineFallback, planSelectionTurn, resolveRef, resolveRefs } from "./selection";
 import { handleSelectionChat, handleSelectionGet, handleSelectionSet, handleSelectionCommit } from "./selection-handler";
 
@@ -173,7 +173,7 @@ const plan = (obj: unknown) => async () => ({ text: JSON.stringify(obj), finishR
   assert.deepEqual(r.body.selection, ["orders", "order_items", "payments"]);
   assert.equal(r.body.reply, "Added orders, order_items and payments.", "the model's words are the reply");
   assert.equal(r.body.source, "model");
-  assert.deepEqual(getSelection(CONV, TENANT).tables, ["orders", "order_items", "payments"], "persisted server-side");
+  assert.deepEqual((await getSelection(CONV, TENANT)).tables, ["orders", "order_items", "payments"], "persisted server-side");
 }
 
 // The model is given the live selection and the history to reason over.
@@ -237,7 +237,7 @@ const plan = (obj: unknown) => async () => ({ text: JSON.stringify(obj), finishR
 
 // A question changes nothing and still gets answered.
 {
-  const before = getSelection(CONV, TENANT).tables;
+  const before = (await getSelection(CONV, TENANT)).tables;
   const r = await handleSelectionChat(
     { connectionId: rec.id, conversationId: CONV, prompt: "which of these has a region column?" },
     TENANT,
@@ -249,7 +249,7 @@ const plan = (obj: unknown) => async () => ({ text: JSON.stringify(obj), finishR
 
 // "focus" opens a table's columns without touching the selection.
 {
-  const before = getSelection(CONV, TENANT).tables;
+  const before = (await getSelection(CONV, TENANT)).tables;
   const r = await handleSelectionChat(
     { connectionId: rec.id, conversationId: CONV, prompt: "what's in shipments?" },
     TENANT,
@@ -261,7 +261,7 @@ const plan = (obj: unknown) => async () => ({ text: JSON.stringify(obj), finishR
 
 // Model outage: bare numbers still land, anything else degrades honestly.
 {
-  const before = getSelection(CONV, TENANT).tables;
+  const before = (await getSelection(CONV, TENANT)).tables;
   const dead = async () => { throw new Error("model down"); };
 
   const r = await handleSelectionChat(
@@ -286,7 +286,7 @@ const plan = (obj: unknown) => async () => ({ text: JSON.stringify(obj), finishR
 {
   const r = await handleSelectionGet(CONV, TENANT, { chatStore: store });
   assert.equal(r.status, 200);
-  assert.deepEqual(r.body.selection, getSelection(CONV, TENANT).tables);
+  assert.deepEqual(r.body.selection, (await getSelection(CONV, TENANT)).tables);
   assert.ok(r.body.turns.length > 6, "conversation memory survives");
   assert.equal(r.body.connectionLabel, rec.label);
 }
@@ -314,7 +314,7 @@ const plan = (obj: unknown) => async () => ({ text: JSON.stringify(obj), finishR
   );
   assert.deepEqual(r.body.columns.shipments, ["id", "status"]);
   assert.ok(r.body.selection.includes("shipments"));
-  assert.deepEqual(getSelection(CONV, TENANT).columns.shipments, ["id", "status"], "persisted");
+  assert.deepEqual((await getSelection(CONV, TENANT)).columns.shipments, ["id", "status"], "persisted");
 
   // A checkbox change to the same table goes through the same state.
   const set = await handleSelectionSet(
@@ -398,6 +398,190 @@ const plan = (obj: unknown) => async () => ({ text: JSON.stringify(obj), finishR
   const hist = await survivor.getHistory("conv_degraded", 10);
   assert.equal(hist[0]?.content, "still recorded", "the session transcript survives in memory");
   _resetChatFallbackForTest();
+}
+
+// REGRESSION: deselect one column of a table, then re-select it.
+// Reported from the browser: unticking `id` on an 8-column table left "7 of 8
+// columns stored", and the checkbox could never be turned back on. Two stacked
+// defects — setSelection MERGED the incoming projection over the old one (so
+// omitting a table could not widen it), and the handler's change-detection only
+// looked at incoming keys (so `columns: {}` read as "no change" and never even
+// reached the store).
+{
+  const CONV_C = "conv_colwiden";
+  const ALL = ["id", "ci_item_name", "ci_module_id", "ci_status", "ci_created_by", "ci_created_on", "ci_updated_by", "ci_updated_on"];
+  const narrowed = ALL.filter((c) => c !== "id"); // 7 of 8 — untick `id`
+
+  const step1 = await handleSelectionSet(
+    { connectionId: rec.id, conversationId: CONV_C, tables: ["orders"], columns: { orders: narrowed } },
+    TENANT,
+    { chatStore: store },
+  );
+  assert.deepEqual(step1.body.columns.orders, narrowed, "narrowing to 7 of 8 sticks");
+
+  // Re-tick `id`: the client is back to every column, which it signals by
+  // OMITTING the table from the map entirely.
+  const step2 = await handleSelectionSet(
+    { connectionId: rec.id, conversationId: CONV_C, tables: ["orders"], columns: {} },
+    TENANT,
+    { chatStore: store },
+  );
+  assert.deepEqual(step2.body.columns, {}, "widening back to all columns must clear the projection");
+  assert.deepEqual((await getSelection(CONV_C, TENANT)).columns, {}, "…and must be persisted, not just echoed");
+
+  // Partial widening still narrows: drop two, put one back -> 7 remain.
+  const two = ALL.filter((c) => c !== "id" && c !== "ci_status");
+  await handleSelectionSet(
+    { connectionId: rec.id, conversationId: CONV_C, tables: ["orders"], columns: { orders: two } },
+    TENANT, { chatStore: store },
+  );
+  const step4 = await handleSelectionSet(
+    { connectionId: rec.id, conversationId: CONV_C, tables: ["orders"], columns: { orders: narrowed } },
+    TENANT, { chatStore: store },
+  );
+  assert.deepEqual(step4.body.columns.orders, narrowed, "a smaller projection can be replaced by a larger one");
+
+  // Omitting `columns` altogether must NOT wipe a projection — that's what a
+  // plain table tick sends.
+  const step5 = await handleSelectionSet(
+    { connectionId: rec.id, conversationId: CONV_C, tables: ["orders", "customers"] },
+    TENANT, { chatStore: store },
+  );
+  assert.deepEqual(step5.body.columns.orders, narrowed, "a table tick leaves column choices alone");
+}
+
+// ---- the analyst pass: answering questions about the DATA ----------------------------
+{
+  const ask = (sql: string) => async () => ({ text: JSON.stringify({ reply: "Let me check.", ops: [], sql }), finishReason: "STOP" } as any);
+  const compose = async () => ({ text: "There are 8,423 system IPs across 190 customers.", finishReason: "STOP" } as any);
+
+  // Happy path: SQL is guarded, executed, and the rows become a sentence.
+  let ranSql = "";
+  const exec: any = async (_conn: unknown, sql: string) => {
+    ranSql = sql;
+    return { columns: ["n"], rows: [{ n: 8423 }], truncated: false, elapsedMs: 12 };
+  };
+  const r = await handleSelectionChat(
+    { connectionId: rec.id, conversationId: "conv_analyst", prompt: "how many system IPs are there?" },
+    TENANT,
+    { chatStore: store, plan: ask("SELECT count(*) AS n FROM orders"), runQuery: exec, answer: compose },
+  );
+  assert.equal(r.status, 200, JSON.stringify(r.body));
+  assert.ok(/8,423/.test(r.body.reply), `answer not surfaced: "${r.body.reply}"`);
+  assert.ok(/LIMIT/i.test(ranSql), "the guard's row cap is applied before execution");
+
+  // A write attempt must never reach the database.
+  let touched = false;
+  const blocked = await handleSelectionChat(
+    { connectionId: rec.id, conversationId: "conv_analyst", prompt: "delete the old rows" },
+    TENANT,
+    {
+      chatStore: store,
+      plan: ask("DELETE FROM orders WHERE id > 0"),
+      runQuery: (async () => { touched = true; throw new Error("should never run"); }) as any,
+      answer: compose,
+    },
+  );
+  assert.equal(touched, false, "a non-SELECT must be rejected before execution");
+  assert.ok(/couldn't run that safely/i.test(blocked.body.reply), blocked.body.reply);
+
+  // A failed query explains itself instead of vanishing.
+  const failed = await handleSelectionChat(
+    { connectionId: rec.id, conversationId: "conv_analyst", prompt: "count the widgets" },
+    TENANT,
+    {
+      chatStore: store,
+      plan: ask("SELECT count(*) FROM orders"),
+      runQuery: (async () => { throw Object.assign(new Error('column "widget" does not exist'), { code: "42703" }); }) as any,
+      answer: compose,
+    },
+  );
+  assert.ok(/query failed/i.test(failed.body.reply), failed.body.reply);
+  assert.ok(/does not exist/.test(failed.body.reply), "the database's own explanation reaches the user");
+
+  // Analysis and selection in one turn: both must land.
+  const both = await handleSelectionChat(
+    { connectionId: rec.id, conversationId: "conv_analyst_2", prompt: "add customers and tell me the count" },
+    TENANT,
+    {
+      chatStore: store,
+      plan: async () => ({ text: JSON.stringify({ reply: "ok", ops: [{ op: "add", refs: ["customers"] }], sql: "SELECT count(*) AS n FROM customers" }), finishReason: "STOP" } as any),
+      runQuery: exec,
+      answer: compose,
+    },
+  );
+  assert.ok(both.body.selection.includes("customers"), "the selection op still applies");
+  assert.ok(/8,423/.test(both.body.reply) && /Added/.test(both.body.reply), `both halves missing: "${both.body.reply}"`);
+
+  // If the composer is down, the rows are still shown rather than swallowed.
+  const rawRows = await handleSelectionChat(
+    { connectionId: rec.id, conversationId: "conv_analyst_3", prompt: "top customers" },
+    TENANT,
+    {
+      chatStore: store,
+      plan: ask("SELECT region, count(*) AS n FROM orders GROUP BY region"),
+      runQuery: (async () => ({ columns: ["region", "n"], rows: [{ region: "APAC", n: 5 }], truncated: false, elapsedMs: 3 })) as any,
+      answer: (async () => { throw new Error("model down"); }) as any,
+    },
+  );
+  assert.ok(/APAC/.test(rawRows.body.reply), `fallback lost the rows: "${rawRows.body.reply}"`);
+}
+
+// ---- the pluggable selection backend ---------------------------------------------
+// Selections now go to Postgres when STORAGE=postgres (so two BFF instances see
+// each other's writes) and to a local file otherwise. What matters is that a
+// backend outage degrades instead of breaking the page — the same lesson as the
+// chat store, on a different table.
+{
+  // A backend that records what it was asked to do.
+  const calls: string[] = [];
+  const mem = new Map<string, any>();
+  const fake: SelectionBackend = {
+    async load(c, t) { calls.push(`load:${c}`); const s = mem.get(c); return s && s.tenantId === t ? s : null; },
+    async save(st) { calls.push(`save:${st.conversationId}`); mem.set(st.conversationId, st); },
+    async remove(c) { calls.push(`remove:${c}`); return mem.delete(c); },
+  };
+  _resetSelectionsForTest(fake);
+
+  const CONV_B = "conv_backend";
+  await setSelection(CONV_B, TENANT, ["orders", "customers"], { connectionId: "c1", columns: { orders: ["id"] } });
+  assert.deepEqual((await getSelection(CONV_B, TENANT)).tables, ["orders", "customers"], "round-trips through the backend");
+  assert.deepEqual((await getSelection(CONV_B, TENANT)).columns, { orders: ["id"] });
+  assert.ok(calls.some((c) => c.startsWith("save:")), "the backend was actually written to");
+
+  // Tenancy is enforced on read, not assumed.
+  assert.deepEqual((await getSelection(CONV_B, "other-tenant")).tables, [], "another tenant sees nothing");
+
+  // Undo is in-memory and stays synchronous. Nothing to undo until there IS a
+  // previous value — the first selection on a fresh conversation has no history.
+  assert.equal(canUndo(CONV_B), false, "no history before the first change");
+  await setSelection(CONV_B, TENANT, ["orders"], {});
+  assert.equal(canUndo(CONV_B), true, "the second change is undoable");
+  const undone = await undoSelection(CONV_B, TENANT);
+  assert.deepEqual(undone?.tables, ["orders", "customers"], "undo restores the previous set through the backend");
+
+  assert.equal(await dropSelection(CONV_B, TENANT), true);
+  assert.deepEqual((await getSelection(CONV_B, TENANT)).tables, [], "dropped");
+
+  // ---- the degrade path: a failing backend must not break selecting ----
+  const dead: SelectionBackend = {
+    async load() { throw Object.assign(new Error(""), { code: "ECONNREFUSED", address: "10.222.0.155", port: 5432 }); },
+    async save() { throw new Error("pg gone"); },
+    async remove() { throw new Error("pg gone"); },
+  };
+  _resetSelectionsForTest(dead);
+  const CONV_D = "conv_degrade";
+  // Must not throw — it falls through to the local file store.
+  const saved = await setSelection(CONV_D, TENANT, ["orders"], { connectionId: "c2" });
+  assert.deepEqual(saved.tables, ["orders"], "a dead backend degrades instead of throwing");
+  assert.deepEqual((await getSelection(CONV_D, TENANT)).tables, ["orders"], "and the selection is still readable");
+
+  // The file backend on its own still satisfies the same contract.
+  _resetSelectionsForTest(new FileSelectionStore());
+  await setSelection("conv_file", TENANT, ["payments"], {});
+  assert.deepEqual((await getSelection("conv_file", TENANT)).tables, ["payments"], "file backend round-trips");
+
+  _resetSelectionsForTest();
 }
 
 console.log("selection.test.ts: all assertions passed ✅");

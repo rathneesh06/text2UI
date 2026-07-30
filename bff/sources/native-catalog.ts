@@ -251,6 +251,76 @@ export async function nativeTableDetailPostgres(conn: DbConn, tables: string[]):
   }
 }
 
+// ---- read-only query execution (for the analyst chat) --------------------------------
+//
+// The selection page answers questions about data the user has NOT extracted
+// yet, so the query has to run against the source database. Three independent
+// layers keep that safe, because one is not enough on someone's production box:
+//   1. the caller passes SQL through guardSelect() first — static check + row cap
+//   2. the transaction is opened READ ONLY, so the server itself refuses writes
+//   3. a statement timeout, so a careless join can't pin a production CPU
+// Layer 2 is the one that matters: it holds even if a clever string slips past
+// the parser, because the database enforces it rather than us.
+
+export interface NativeQueryResult {
+  columns: string[];
+  rows: Record<string, unknown>[];
+  truncated: boolean;
+  elapsedMs: number;
+}
+
+const ANALYSIS_TIMEOUT_MS = Number(process.env.DB_ANALYSIS_TIMEOUT_MS ?? 20_000);
+
+export async function nativeQuery(
+  conn: DbConn,
+  sql: string,
+  rowCap = Number(process.env.DB_ANALYSIS_ROW_CAP ?? 200),
+): Promise<NativeQueryResult> {
+  const started = Date.now();
+  if (conn.dialect === "mysql") {
+    const c = await withTimeout(mysqlConnect(conn), CONNECT_TIMEOUT_MS + 1_000, "MySQL connect");
+    try {
+      await c.query("SET SESSION TRANSACTION ISOLATION LEVEL READ COMMITTED");
+      await c.query(`SET SESSION max_execution_time = ${Math.max(1000, ANALYSIS_TIMEOUT_MS)}`).catch(() => { /* MariaDB / older MySQL */ });
+      await c.query("START TRANSACTION READ ONLY");
+      try {
+        const [rows] = await withTimeout(c.query(sql), ANALYSIS_TIMEOUT_MS, "query");
+        const list = (rows as Record<string, unknown>[]) ?? [];
+        return {
+          columns: list.length ? Object.keys(list[0]) : [],
+          rows: list.slice(0, rowCap),
+          truncated: list.length > rowCap,
+          elapsedMs: Date.now() - started,
+        };
+      } finally {
+        await c.query("ROLLBACK").catch(() => { /* nothing to undo — it was read only */ });
+      }
+    } finally {
+      await c.end().catch(() => { /* socket gone */ });
+    }
+  }
+
+  const c = await withTimeout(pgClient(conn), CONNECT_TIMEOUT_MS + 1_000, "Postgres connect");
+  try {
+    await c.query("BEGIN READ ONLY");
+    try {
+      await c.query(`SET LOCAL statement_timeout = ${Math.max(1000, ANALYSIS_TIMEOUT_MS)}`);
+      const r = await withTimeout(c.query(sql), ANALYSIS_TIMEOUT_MS, "query");
+      const list = (r.rows as Record<string, unknown>[]) ?? [];
+      return {
+        columns: r.fields?.map((f: any) => String(f.name)) ?? (list.length ? Object.keys(list[0]) : []),
+        rows: list.slice(0, rowCap),
+        truncated: list.length > rowCap,
+        elapsedMs: Date.now() - started,
+      };
+    } finally {
+      await c.query("ROLLBACK").catch(() => { /* read only */ });
+    }
+  } finally {
+    await c.end().catch(() => { /* already closed */ });
+  }
+}
+
 // ---- dialect dispatch --------------------------------------------------------------
 
 export function nativeListTables(conn: DbConn): Promise<NativeTable[]> {

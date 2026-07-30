@@ -242,6 +242,10 @@ export const SELECTION_PLAN_SCHEMA = {
       type: "string",
       description: "What you say to the user. Always present. Natural, brief, specific — this IS the conversation.",
     },
+    sql: {
+      type: "string",
+      description: "A single read-only SELECT answering a data question the user asked. Only set this when they asked about the DATA, not the schema. Leave unset otherwise.",
+    },
     ops: {
       type: "array",
       description: "Selection changes this turn asks for, in order. Empty when the user asked a question or you need to clarify.",
@@ -285,6 +289,16 @@ BE SMART ABOUT WHAT THEY MEAN
 - Plurals mean every match: "the audit ones" means both audit tables, not a question about which.
 - Follow-on questions ("which of these has an email column?", "how big is orders?") deserve a real answer from the catalog, with ops empty.
 
+ANSWERING QUESTIONS ABOUT THE DATA
+You can read the data, not just the schema. When the user asks something only the rows can answer — "how many tickets per priority?", "which customers have the most hosts?", "is ci_status ever false?", "what date range does this cover?" — put a single read-only SELECT in "sql" and leave ops empty (unless the question also implies a selection change).
+
+Rules for that SQL:
+- ONE statement, SELECT only. No semicolons, no CTE writes, no DDL/DML — it runs inside a READ ONLY transaction and will be rejected outright.
+- Use the dialect of the database you are shown. Quote identifiers the way that dialect needs; table names are exactly as they appear in the catalog, including any schema prefix.
+- Aggregate rather than dumping rows. Prefer COUNT/SUM/AVG with GROUP BY and ORDER BY over SELECT *, and add your own LIMIT (20 or so) for "top N" questions. A row cap is enforced regardless, so an unbounded query just gets truncated and tells the user less.
+- If you cannot answer from the columns you can see, say so in "reply" and leave sql unset. Do not guess at column names — you will be told when one does not exist, but a wrong guess wastes the user's turn.
+- You will be shown the result rows and asked to write the final answer. Your "reply" on THIS turn is only used if the query fails, so make it a sentence that still helps.
+
 JUDGEMENT
 - Prefer acting on a reasonable reading over interrogating the user. One clarifying question is fine when a request is truly ambiguous; three rounds of questions is not.
 - Never select everything as a way of coping with uncertainty. If you're unsure, pick the strong candidates and say what you left out and why.
@@ -296,6 +310,8 @@ Brief and concrete. Name the tables you touched. No preamble, no restating their
 
 export interface SelectionPlanInput {
   prompt: string;
+  /** So the model writes SQL in the right dialect. */
+  dialect?: "mysql" | "postgres";
   /** Catalog in display order — index+1 is the number the user sees. */
   catalog: { name: string; approxRows?: number; columns?: string[] }[];
   selection: string[];
@@ -345,7 +361,8 @@ function buildUserPrompt(input: SelectionPlanInput): string {
   const sel = input.selection.length
     ? `Currently selected (${input.selection.length}): ${input.selection.join(", ")}`
     : "Currently selected: nothing yet";
-  return `${hist}Database catalog (${cat.count} tables, numbered exactly as the user sees them):\n${cat.line}\n\n${sel}\n\nUser message: ${input.prompt}`;
+  const dia = input.dialect ? `Database dialect: ${input.dialect}\n\n` : "";
+  return `${dia}${hist}Database catalog (${cat.count} tables, numbered exactly as the user sees them):\n${cat.line}\n\n${sel}\n\nUser message: ${input.prompt}`;
 }
 
 const stripFences = (s: string) => s.replace(/^```(?:json)?\s*/i, "").replace(/\s*```\s*$/, "").trim();
@@ -361,12 +378,12 @@ export async function planSelectionTurn(
   input: SelectionPlanInput,
   run: PlanSelectionRun = callGemini,
   timeoutMs = PLAN_TIMEOUT_MS,
-): Promise<{ ops: SelOp[]; reply?: string } | null> {
+): Promise<{ ops: SelOp[]; reply?: string; sql?: string } | null> {
   const timeout = new Promise<null>((resolve) => setTimeout(() => resolve(null), timeoutMs));
-  const call = (async (): Promise<{ ops: SelOp[]; reply?: string } | null> => {
+  const call = (async (): Promise<{ ops: SelOp[]; reply?: string; sql?: string } | null> => {
     try {
       const { text } = await run(SYSTEM, buildUserPrompt(input), { ...ORCHESTRATE_OPTS, responseSchema: SELECTION_PLAN_SCHEMA });
-      const parsed = JSON.parse(stripFences(text)) as { ops?: unknown; reply?: unknown };
+      const parsed = JSON.parse(stripFences(text)) as { ops?: unknown; reply?: unknown; sql?: unknown };
       if (!parsed || typeof parsed !== "object") return null;
       const ops: SelOp[] = [];
       for (const raw of (Array.isArray(parsed.ops) ? parsed.ops : []) as any[]) {
@@ -380,16 +397,75 @@ export async function planSelectionTurn(
         ops.push({ op: raw.op, ...(refs ? { refs } : {}), ...(raw.table ? { table: String(raw.table) } : {}) });
       }
       const reply = typeof parsed.reply === "string" && parsed.reply.trim() ? parsed.reply.trim() : undefined;
-      // A response with neither ops nor words is indistinguishable from a failure.
-      if (!ops.length && !reply) return null;
-      console.log(`[selection] plan: ${ops.map((o) => `${o.op}(${o.refs?.join("|") ?? ""})`).join(" ") || "reply only"}`);
-      return { ops, reply };
+      const sql = typeof parsed.sql === "string" && parsed.sql.trim() ? parsed.sql.trim() : undefined;
+      // A response with no ops, no words and no query is indistinguishable from a failure.
+      if (!ops.length && !reply && !sql) return null;
+      console.log(`[selection] plan: ${ops.map((o) => `${o.op}(${o.refs?.join("|") ?? ""})`).join(" ") || (sql ? "query" : "reply only")}`);
+      return { ops, reply, sql };
     } catch (err: any) {
       console.warn(`[selection] planner failed: ${err?.message ?? err}`);
       return null;
     }
   })();
   return Promise.race([call, timeout]);
+}
+
+// ---- composing an answer from query rows ---------------------------------------------
+
+const ANSWER_SYSTEM = `You are answering a question about a database, using rows that were just fetched for you.
+
+- Answer the question directly, in one or two sentences. Lead with the number or the name they asked for.
+- Then, if the shape of the result warrants it, list the rows compactly — one per line, "label: value". Up to about 10; say how many more there are.
+- Round sensibly. Say "8,423" not "8423.0". Keep units and currency if the column implies them.
+- If the rows are empty, say so plainly and suggest why (an empty table, a filter that matched nothing, the wrong column).
+- If the rows clearly don't answer what was asked, say that rather than dressing them up.
+- No preamble, no "Based on the data provided", no restating the question. No markdown tables.`;
+
+/** Second pass: turn result rows into the sentence the user actually reads. */
+export async function answerFromRows(
+  input: { prompt: string; sql: string; columns: string[]; rows: Record<string, unknown>[]; truncated: boolean; history?: ChatMessage[] },
+  run: PlanSelectionRun = callGemini,
+  timeoutMs = PLAN_TIMEOUT_MS,
+): Promise<string | null> {
+  // Rows go in as compact JSON — cheaper than a formatted table and the model
+  // reads it just as well. Cap hard: a wide 200-row result would dominate the
+  // prompt and buy nothing.
+  const shown = input.rows.slice(0, 60);
+  const body = [
+    input.history?.length ? "Recent conversation:\n" + input.history.slice(-6).map((m) => `${m.role}: ${m.content}`).join("\n") + "\n" : "",
+    `Question: ${input.prompt}`,
+    `Query that ran:\n${input.sql}`,
+    `Columns: ${input.columns.join(", ") || "(none)"}`,
+    `Rows (${input.rows.length}${input.truncated ? "+, truncated" : ""}${shown.length < input.rows.length ? `, showing ${shown.length}` : ""}):`,
+    JSON.stringify(shown),
+  ].filter(Boolean).join("\n\n");
+
+  const timeout = new Promise<null>((resolve) => setTimeout(() => resolve(null), timeoutMs));
+  const call = (async () => {
+    try {
+      const { text } = await run(ANSWER_SYSTEM, body, ORCHESTRATE_OPTS);
+      const out = String(text ?? "").trim();
+      return out || null;
+    } catch (err: any) {
+      console.warn(`[selection] answer composition failed: ${err?.message ?? err}`);
+      return null;
+    }
+  })();
+  return Promise.race([call, timeout]);
+}
+
+/** Deterministic fallback when the model can't write the sentence: show the
+ *  result rather than swallowing it. Never pretty, always honest. */
+export function describeRows(r: { columns: string[]; rows: Record<string, unknown>[]; truncated: boolean }): string {
+  if (!r.rows.length) return "That query returned no rows.";
+  const head = r.rows.slice(0, 10).map((row) =>
+    r.columns.map((c) => `${c}: ${row[c] ?? "—"}`).join(", "));
+  const more = r.rows.length - head.length;
+  return [
+    `${r.rows.length}${r.truncated ? "+" : ""} row${r.rows.length === 1 ? "" : "s"}:`,
+    ...head,
+    more > 0 ? `…and ${more} more.` : "",
+  ].filter(Boolean).join("\n");
 }
 
 // ---- outage path ---------------------------------------------------------------------
