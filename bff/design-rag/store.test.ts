@@ -31,7 +31,7 @@ const vec = (n: number, fill = 0.5) => new Array(n).fill(fill);
   });
   assert.equal(ok, true, "RETURNING a row -> inserted");
   const c = db.last();
-  assert.ok(c.text.includes("INSERT INTO public._design_refs"), "insert SQL");
+  assert.ok(c.text.includes("INSERT INTO public.text2ui_design_refs"), "insert SQL");
   assert.ok(c.text.includes("ON CONFLICT (phash) DO NOTHING"), "dedup on phash");
   assert.equal(c.params[0], "ref_1");
   assert.equal(c.params[6], JSON.stringify({ layout: "grid" }), "tags serialized to jsonb");

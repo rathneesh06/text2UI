@@ -19,7 +19,7 @@
 // Every typed turn is planned by the MODEL (see selection.ts). The only thing
 // the server decides for itself is whether the names the model emitted exist —
 // resolution and the correction note, never the intent.
-import { getChatStore, type ChatStore } from "../chat-store";
+import { getChatStore, InMemoryChatStore, type ChatStore } from "../chat-store";
 import { getConnection } from "../sources/connection-registry";
 import { nativeTableDetail } from "../sources/native-catalog";
 import {
@@ -48,11 +48,70 @@ const bad = (error: string): Out => ({ status: 400, body: { error } });
  * Now: the stack goes to the server log with the route that produced it, and the
  * user gets a JSON message they can quote back.
  */
+/** Node's AggregateError (what a failed pg pool throws) has an EMPTY message —
+ *  `err.message || String(err)` yields the bare class name, which names what
+ *  threw but not why. The cause lives in `.code` and in `.errors[0]`. Dig. */
+export function describeError(err: any, depth = 0): string {
+  if (!err || depth > 3) return "";
+  const parts: string[] = [];
+  const msg = typeof err.message === "string" ? err.message.trim() : "";
+  if (msg) parts.push(msg);
+  if (err.code) parts.push(String(err.code));
+  if (err.address || err.port) parts.push(`connecting to ${err.address ?? "?"}:${err.port ?? "?"}`);
+  // AggregateError carries the real failures in .errors
+  const inner = Array.isArray(err.errors) ? err.errors[0] : err.cause;
+  if (!parts.length || (!err.code && inner)) {
+    const nested = describeError(inner, depth + 1);
+    if (nested) parts.push(nested);
+  }
+  return [...new Set(parts)].join(" ").trim() || (err.name ? String(err.name) : "");
+}
+
+/** The chat store is MEMORY — valuable, but not the point of this page. When it
+ *  is unreachable (Postgres down, container not up), ticking a checkbox must
+ *  still work. `getChatStore()` can't protect us: pg's Pool constructs lazily,
+ *  so its own try/catch fallback never fires and the failure lands on the first
+ *  awaited query, deep inside a handler.
+ *
+ *  So: first failure swaps this process over to an in-memory store and logs once.
+ *  The user keeps their selection and loses only the persisted transcript. */
+let memoryFallback: ChatStore | null = null;
+let warnedDegraded = false;
+/** Test seam: forget that we degraded. */
+export function _resetChatFallbackForTest(): void { memoryFallback = null; warnedDegraded = false; }
+
+export function resilientStore(real: ChatStore): ChatStore {
+  const useFallback = (err: unknown): ChatStore => {
+    if (!warnedDegraded) {
+      warnedDegraded = true;
+      console.warn(`[selection] chat persistence unavailable (${describeError(err)}) — continuing in memory for this process. Selections still work; the transcript won't survive a restart.`);
+    }
+    memoryFallback ??= new InMemoryChatStore();
+    return memoryFallback;
+  };
+  const call = async <T>(pick: (s: ChatStore) => Promise<T>): Promise<T> => {
+    if (memoryFallback) return pick(memoryFallback);
+    try { return await pick(real); }
+    catch (err) { return pick(useFallback(err)); }
+  };
+  return new Proxy(real, {
+    get(target, prop: string) {
+      const orig = (target as any)[prop];
+      if (typeof orig !== "function") return orig;
+      return (...args: unknown[]) => call((s) => (s as any)[prop](...args));
+    },
+  }) as ChatStore;
+}
+
+/** The store a handler should use: the caller's (tests inject one), else the
+ *  real one wrapped so an outage degrades instead of 500ing. */
+const storeFor = (deps: SelectionDeps): ChatStore => deps.chatStore ?? resilientStore(getChatStore());
+
 async function guarded(route: string, fn: () => Promise<Out> | Out): Promise<Out> {
   try {
     return await fn();
   } catch (err: any) {
-    const detail = (err?.message || String(err) || "").trim();
+    const detail = describeError(err);
     console.error(`[selection] ${route} FAILED:`, err?.stack ?? err);
     return {
       status: 500,
@@ -99,7 +158,7 @@ async function handleSelectionChatInner(body: unknown, tenantId: string, deps: S
   const rec = getConnection(tenantId, String(b.connectionId ?? ""));
   if (!rec) return { status: 404, body: { error: "unknown or expired connection — reconnect" } };
 
-  const store = deps.chatStore ?? getChatStore();
+  const store = storeFor(deps);
   const conversationId = await store.createConversation(`Select tables: ${rec.conn.database}`, b.conversationId || undefined);
   const history = await store.getHistory(conversationId, 24);
   const prompt = b.prompt.trim();
@@ -213,7 +272,7 @@ async function handleSelectionGetInner(conversationId: string, tenantId: string,
   const state = getSelection(id, tenantId);
   let turns: { role: string; content: string }[] = [];
   try {
-    const store = deps.chatStore ?? getChatStore();
+    const store = storeFor(deps);
     turns = await store.getHistory(id, 40);
   } catch { /* memory is best-effort; the selection itself is the payload */ }
   return {
@@ -245,7 +304,7 @@ async function handleSelectionSetInner(body: unknown, tenantId: string, deps: Se
   const rec = getConnection(tenantId, String(b.connectionId ?? ""));
   if (!rec) return { status: 404, body: { error: "unknown or expired connection — reconnect" } };
 
-  const store = deps.chatStore ?? getChatStore();
+  const store = storeFor(deps);
   const conversationId = await store.createConversation(`Select tables: ${rec.conn.database}`, b.conversationId || undefined);
 
   const catalog = new Set(rec.allTables.map((t) => t.name));
@@ -389,7 +448,7 @@ async function handleSelectionCommitInner(body: unknown, tenantId: string, deps:
   if (!b || typeof b !== "object") return bad("body must be a JSON object");
   const rec = getConnection(tenantId, String(b.connectionId ?? ""));
   if (!rec) return { status: 404, body: { error: "unknown or expired connection — reconnect" } };
-  const store = deps.chatStore ?? getChatStore();
+  const store = storeFor(deps);
   const conversationId = await store.createConversation(`Select tables: ${rec.conn.database}`, b.conversationId || undefined);
 
   // The client may pass the tables explicitly (belt and braces); the stored

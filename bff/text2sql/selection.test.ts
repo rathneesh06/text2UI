@@ -366,4 +366,38 @@ const plan = (obj: unknown) => async () => ({ text: JSON.stringify(obj), finishR
   assert.ok(r2.body.error.length > 20, `too vague: "${r2.body.error}"`);
 }
 
+// An unreachable chat store must NOT break selecting. This is the real-world
+// failure: PG_URL pointed at a container that wasn't running, pg's Pool
+// constructs lazily so getChatStore()'s own fallback never fired, and the
+// rejection landed inside the handler. Ticking a checkbox shouldn't need a
+// chat database.
+{
+  const { describeError, resilientStore, _resetChatFallbackForTest } = await import("./selection-handler");
+  // AggregateError has an empty message — the cause is in .code / .errors.
+  // Shaped like what a failed pg Pool throws: empty message, cause in .errors.
+  const agg: any = Object.assign(new Error(""), {
+    name: "AggregateError",
+    errors: [Object.assign(new Error(""), { code: "ECONNREFUSED", address: "localhost", port: 5433 })],
+  });
+  const described = describeError(agg);
+  assert.ok(/ECONNREFUSED/.test(described), `cause lost: "${described}"`);
+  assert.ok(/5433/.test(described), `address lost: "${described}"`);
+  assert.ok(!/^AggregateError$/.test(described), "must say more than the class name");
+
+  // A store that always rejects must not take the page down with it.
+  _resetChatFallbackForTest();
+  const dead: any = {
+    createConversation: async () => { throw agg; },
+    getHistory: async () => { throw agg; },
+    appendMessage: async () => { throw agg; },
+  };
+  const survivor = resilientStore(dead);
+  const cid = await survivor.createConversation("x", "conv_degraded");
+  assert.equal(cid, "conv_degraded", "degrades to memory instead of throwing");
+  await survivor.appendMessage("conv_degraded", { role: "user", content: "still recorded" });
+  const hist = await survivor.getHistory("conv_degraded", 10);
+  assert.equal(hist[0]?.content, "still recorded", "the session transcript survives in memory");
+  _resetChatFallbackForTest();
+}
+
 console.log("selection.test.ts: all assertions passed ✅");

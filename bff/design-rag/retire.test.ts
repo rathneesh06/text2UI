@@ -39,7 +39,7 @@ import { PgVectorStore, type Queryable } from "./store";
   const store = new PgVectorStore(db, 4);
   const out = await store.retireRefs({ minQuality: 0.6, graceDays: 30 });
   const sql = calls[0].text;
-  assert.ok(sql.includes("DELETE FROM public._design_refs"), "is a delete");
+  assert.ok(sql.includes("DELETE FROM public.text2ui_design_refs"), "is a delete");
   assert.ok(sql.includes("source <> ALL($1)"), "protects listed sources");
   assert.ok(sql.includes("quality < $2"), "quality floor condition");
   assert.ok(sql.includes("retrievals = 0") && sql.includes("interval"), "stale-and-unretrieved condition");

@@ -178,7 +178,7 @@ if (process.env.PG_URL) {
   await admin.connect();
   await admin.query(`DROP SCHEMA IF EXISTS p_alpha CASCADE`);
   await admin.query(`DROP SCHEMA IF EXISTS p_beta CASCADE`);
-  await admin.query(`DROP TABLE IF EXISTS public._datasets`);
+  await admin.query(`DROP TABLE IF EXISTS public.text2ui_datasets`);
   await admin.end();
   const { PostgresStorage } = await import("./postgres");
   await runEngineSuite("postgres", new PostgresStorage(process.env.PG_URL), `SELECT * FROM generate_series(1, 100)`);

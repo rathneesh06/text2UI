@@ -83,23 +83,23 @@ export class PgChatStore implements ChatStore {
   }
 
   private async init(): Promise<void> {
-    await this.pool.query(`CREATE TABLE IF NOT EXISTS public._conversations (
+    await this.pool.query(`CREATE TABLE IF NOT EXISTS public.text2ui_conversations (
       id         TEXT PRIMARY KEY,
       title      TEXT,
       created_at TIMESTAMPTZ DEFAULT now(),
       updated_at TIMESTAMPTZ DEFAULT now()
     )`);
-    await this.pool.query(`CREATE TABLE IF NOT EXISTS public._messages (
+    await this.pool.query(`CREATE TABLE IF NOT EXISTS public.text2ui_messages (
       id              BIGSERIAL PRIMARY KEY,
-      conversation_id TEXT NOT NULL REFERENCES public._conversations(id) ON DELETE CASCADE,
+      conversation_id TEXT NOT NULL REFERENCES public.text2ui_conversations(id) ON DELETE CASCADE,
       role            TEXT NOT NULL,
       content         TEXT NOT NULL,
       brief_json      TEXT,
       output_mode     TEXT,
       created_at      TIMESTAMPTZ DEFAULT now()
     )`);
-    await this.pool.query(`CREATE INDEX IF NOT EXISTS idx_messages_conv ON public._messages (conversation_id, id)`);
-    await this.pool.query(`CREATE TABLE IF NOT EXISTS public._project_state (
+    await this.pool.query(`CREATE INDEX IF NOT EXISTS idx_text2ui_messages_conv ON public.text2ui_messages (conversation_id, id)`);
+    await this.pool.query(`CREATE TABLE IF NOT EXISTS public.text2ui_project_state (
       project_id      TEXT PRIMARY KEY,
       spec_json       TEXT NOT NULL,
       datasets_json   TEXT,
@@ -111,7 +111,7 @@ export class PgChatStore implements ChatStore {
   async saveProjectState(projectId: string, s: { spec: unknown; conversationId?: string | null; datasets?: unknown }): Promise<void> {
     await this.ready;
     await this.pool.query(
-      `INSERT INTO public._project_state (project_id, spec_json, datasets_json, conversation_id, saved_at)
+      `INSERT INTO public.text2ui_project_state (project_id, spec_json, datasets_json, conversation_id, saved_at)
        VALUES ($1, $2, $3, $4, now())
        ON CONFLICT (project_id) DO UPDATE SET spec_json = EXCLUDED.spec_json,
          datasets_json = EXCLUDED.datasets_json, conversation_id = EXCLUDED.conversation_id, saved_at = now()`,
@@ -122,7 +122,7 @@ export class PgChatStore implements ChatStore {
     await this.ready;
     const { rows } = await this.pool.query(
       `SELECT spec_json, datasets_json, conversation_id, EXTRACT(EPOCH FROM saved_at) * 1000 AS saved_ms
-       FROM public._project_state WHERE project_id = $1`, [projectId]);
+       FROM public.text2ui_project_state WHERE project_id = $1`, [projectId]);
     if (!rows.length) return null;
     return { spec: JSON.parse(rows[0].spec_json), datasets: rows[0].datasets_json ? JSON.parse(rows[0].datasets_json) : undefined,
       conversationId: rows[0].conversation_id ?? null, savedAt: Number(rows[0].saved_ms) };
@@ -132,7 +132,7 @@ export class PgChatStore implements ChatStore {
     await this.ready;
     const cid = id ?? randomUUID();
     await this.pool.query(
-      `INSERT INTO public._conversations (id, title) VALUES ($1, $2) ON CONFLICT (id) DO NOTHING`,
+      `INSERT INTO public.text2ui_conversations (id, title) VALUES ($1, $2) ON CONFLICT (id) DO NOTHING`,
       [cid, title ?? null],
     );
     return cid;
@@ -140,15 +140,15 @@ export class PgChatStore implements ChatStore {
   async appendMessage(conversationId: string, msg: StoredMessage): Promise<void> {
     await this.ready;
     await this.pool.query(
-      `INSERT INTO public._messages (conversation_id, role, content, brief_json, output_mode) VALUES ($1,$2,$3,$4,$5)`,
+      `INSERT INTO public.text2ui_messages (conversation_id, role, content, brief_json, output_mode) VALUES ($1,$2,$3,$4,$5)`,
       [conversationId, msg.role, msg.content, msg.briefJson ?? null, msg.outputMode ?? null],
     );
-    await this.pool.query(`UPDATE public._conversations SET updated_at = now() WHERE id = $1`, [conversationId]);
+    await this.pool.query(`UPDATE public.text2ui_conversations SET updated_at = now() WHERE id = $1`, [conversationId]);
   }
   async getHistory(conversationId: string, limit = 20): Promise<ChatMessage[]> {
     await this.ready;
     const { rows } = await this.pool.query(
-      `SELECT role, content FROM public._messages WHERE conversation_id = $1 ORDER BY id ASC LIMIT $2`,
+      `SELECT role, content FROM public.text2ui_messages WHERE conversation_id = $1 ORDER BY id ASC LIMIT $2`,
       [conversationId, limit],
     );
     return rows.map((r) => ({ role: r.role, content: r.content }));
@@ -157,7 +157,7 @@ export class PgChatStore implements ChatStore {
     await this.ready;
     const { rows } = await this.pool.query(
       `SELECT id, title, EXTRACT(EPOCH FROM updated_at) * 1000 AS updated_ms
-       FROM public._conversations ORDER BY updated_at DESC LIMIT $1`,
+       FROM public.text2ui_conversations ORDER BY updated_at DESC LIMIT $1`,
       [limit],
     );
     return rows.map((r) => ({ id: r.id, title: r.title, updatedAt: Number(r.updated_ms) }));
@@ -273,7 +273,10 @@ export function getChatStore(): ChatStore {
   if ((process.env.STORAGE ?? "").toLowerCase() === "postgres" && url) {
     try { singleton = new PgChatStore(url); } catch { singleton = new InMemoryChatStore(); }
   } else {
-    const p = process.env.T2UI_CHAT_DB ?? path.join(path.dirname(process.env.STORAGE_PATH ?? "bff/data/text2ui.duckdb"), "chat.duckdb");
+    // `||` not `??`: an empty STORAGE_PATH= in .env is a string, not nullish, so
+    // `??` kept it and path.dirname("") is ".", resolving the chat DB to
+    // ./chat.duckdb in whatever the process CWD happens to be.
+    const p = process.env.T2UI_CHAT_DB || path.join(path.dirname(process.env.STORAGE_PATH || "bff/data/text2ui.duckdb"), "chat.duckdb");
     try { singleton = new DuckDbChatStore(p); } catch { singleton = new InMemoryChatStore(); }
   }
   return singleton;

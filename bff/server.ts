@@ -22,7 +22,7 @@ import { generateReport } from "./report";
 import { COLO_PROJECT_ID, COLO_LABEL, coloAvailable, coloProfiles, coloQuery } from "./sources/colo";
 import { isWorkbenchProject, listWorkbenchSources, wbQuery, removeWorkbenchSource } from "./sources/workbench-store";
 import { handleSqlConnect, handleSqlSchema, handleSqlStageDiscard, handleSourceChat, handleCombineSources, liveQuery, LIVE_PREFIX } from "./text2sql/handler";
-import { handleSelectionChat, handleSelectionGet, handleSelectionSet, handleSelectionCommit, handleTableProfile, handleCatalog } from "./text2sql/selection-handler";
+import { handleSelectionChat, handleSelectionGet, handleSelectionSet, handleSelectionCommit, handleTableProfile, handleCatalog, describeError } from "./text2sql/selection-handler";
 import { handleDashboardBuild } from "./dashboard/handler";
 import { buildWidgetSql } from "./dashboard/filters";
 import { handleDeckBuild, handleDeckEdit } from "./deck/handler";
@@ -1199,6 +1199,21 @@ export function createServer() {
     } catch (err: any) {
       res.status(500).json({ error: err?.message ?? "deleting project failed" });
     }
+  });
+
+  // ---- last resort: anything that throws past a route handler ---------------------
+  // Without this, Express's default handler replies with an HTML body. The client
+  // can't parse it, so the user gets "Request failed (HTTP 500)" and the server
+  // log says nothing — which is what made the selection-page ECONNREFUSED take
+  // three rounds to find. Must be registered AFTER the routes, and must keep all
+  // four parameters or Express treats it as ordinary middleware.
+  app.use((err: any, _req: express.Request, res: express.Response, _next: express.NextFunction) => {
+    const detail = describeError(err);
+    console.error("[bff] UNHANDLED:", err?.stack ?? err);
+    if (res.headersSent) return;
+    res.status(err?.status ?? err?.statusCode ?? 500).json({
+      error: detail || "the server hit an unexpected error — check the BFF log for the stack",
+    });
   });
 
   return app;
