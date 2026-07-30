@@ -341,4 +341,29 @@ const plan = (obj: unknown) => async () => ({ text: JSON.stringify(obj), finishR
   assert.equal(typeof empty.body.elapsedSeconds, "number");
 }
 
+// A handler that throws must never escape as an unparseable 500. This is the
+// "Request failed (HTTP 500)" bug: the route had no guard, so Express replied
+// with HTML and the client had nothing to show or log.
+{
+  const exploding = async () => { throw new Error("chat store unreachable"); };
+  const r = await handleSelectionChat(
+    { connectionId: rec.id, conversationId: CONV, prompt: "select 1" },
+    TENANT,
+    { chatStore: { createConversation: exploding } as any },
+  );
+  assert.equal(r.status, 500);
+  assert.ok(/chat store unreachable/.test(r.body.error), `message lost: "${r.body.error}"`);
+  assert.equal(r.body.route, "/api/sql/select", "the failing route is named");
+
+  // And a throw with NO message still says something actionable.
+  const silent = async () => { throw new Error(""); };
+  const r2 = await handleSelectionSet(
+    { connectionId: rec.id, tables: ["orders"] },
+    TENANT,
+    { chatStore: { createConversation: silent } as any },
+  );
+  assert.equal(r2.status, 500);
+  assert.ok(r2.body.error.length > 20, `too vague: "${r2.body.error}"`);
+}
+
 console.log("selection.test.ts: all assertions passed ✅");

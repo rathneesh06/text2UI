@@ -36,6 +36,36 @@ import type { Dataset } from "../../shared/types";
 type Out = { status: number; body: any };
 const bad = (error: string): Out => ({ status: 400, body: { error } });
 
+/**
+ * Every selection route runs inside this.
+ *
+ * Without it, anything that throws — a chat-store connection, a bad env path, a
+ * driver error — reaches Express's default handler, which replies with an HTML
+ * body. The client can't parse that, so the user sees a bare
+ * "Request failed (HTTP 500)" and the server log says nothing. That is a dead
+ * end for whoever has to debug it, which turned out to be me.
+ *
+ * Now: the stack goes to the server log with the route that produced it, and the
+ * user gets a JSON message they can quote back.
+ */
+async function guarded(route: string, fn: () => Promise<Out> | Out): Promise<Out> {
+  try {
+    return await fn();
+  } catch (err: any) {
+    const detail = (err?.message || String(err) || "").trim();
+    console.error(`[selection] ${route} FAILED:`, err?.stack ?? err);
+    return {
+      status: 500,
+      body: {
+        error: detail
+          ? `${route} failed: ${detail}`
+          : `${route} failed with no error message — check the BFF log for the stack.`,
+        route,
+      },
+    };
+  }
+}
+
 export interface SelectionDeps {
   plan?: PlanSelectionRun;
   chatStore?: ChatStore;
@@ -59,6 +89,10 @@ function catalogView(rec: { allTables: { name: string; approxRows: number }[]; d
 
 // ---- POST /api/sql/select — one conversational selection turn ---------------------
 export async function handleSelectionChat(body: unknown, tenantId: string, deps: SelectionDeps = {}): Promise<Out> {
+  return guarded("/api/sql/select", () => handleSelectionChatInner(body, tenantId, deps));
+}
+
+async function handleSelectionChatInner(body: unknown, tenantId: string, deps: SelectionDeps = {}): Promise<Out> {
   const b = body as any;
   if (!b || typeof b !== "object") return bad("body must be a JSON object");
   if (typeof b.prompt !== "string" || !b.prompt.trim()) return bad("prompt is required");
@@ -170,6 +204,10 @@ export async function handleSelectionChat(body: unknown, tenantId: string, deps:
 
 // ---- GET /api/sql/selection/:conversationId — rehydrate after a reload -------------
 export async function handleSelectionGet(conversationId: string, tenantId: string, deps: SelectionDeps = {}): Promise<Out> {
+  return guarded("/api/sql/selection/:id", () => handleSelectionGetInner(conversationId, tenantId, deps));
+}
+
+async function handleSelectionGetInner(conversationId: string, tenantId: string, deps: SelectionDeps = {}): Promise<Out> {
   const id = String(conversationId ?? "");
   if (!id) return bad("conversationId is required");
   const state = getSelection(id, tenantId);
@@ -197,6 +235,10 @@ export async function handleSelectionGet(conversationId: string, tenantId: strin
 // transcript (as a user turn), so the next typed message — "actually drop the
 // last one" — has the click in its history to refer to.
 export async function handleSelectionSet(body: unknown, tenantId: string, deps: SelectionDeps = {}): Promise<Out> {
+  return guarded("/api/sql/selection", () => handleSelectionSetInner(body, tenantId, deps));
+}
+
+async function handleSelectionSetInner(body: unknown, tenantId: string, deps: SelectionDeps = {}): Promise<Out> {
   const b = body as any;
   if (!b || typeof b !== "object") return bad("body must be a JSON object");
   if (!Array.isArray(b.tables)) return bad("tables[] is required");
@@ -263,6 +305,10 @@ export async function handleSelectionSet(body: unknown, tenantId: string, deps: 
 // go through DuckDB's ATTACH, which would materialise the whole remote catalog
 // just to describe one table.
 export async function handleTableProfile(connectionId: string, body: unknown, tenantId: string): Promise<Out> {
+  return guarded("/api/sql/:id/profile", () => handleTableProfileInner(connectionId, body, tenantId));
+}
+
+async function handleTableProfileInner(connectionId: string, body: unknown, tenantId: string): Promise<Out> {
   const rec = getConnection(tenantId, String(connectionId ?? ""));
   if (!rec) return { status: 404, body: { error: "unknown or expired connection — reconnect" } };
   const b = (body ?? {}) as any;
@@ -335,6 +381,10 @@ export function handleCatalog(connectionId: string, tenantId: string): Out {
 // named source (snapshot) or a live source. Nothing new downstream — the
 // dashboard/deck pipelines see the same shape they see from "Extract DB".
 export async function handleSelectionCommit(body: unknown, tenantId: string, deps: SelectionDeps = {}): Promise<Out> {
+  return guarded("/api/sql/selection/commit", () => handleSelectionCommitInner(body, tenantId, deps));
+}
+
+async function handleSelectionCommitInner(body: unknown, tenantId: string, deps: SelectionDeps = {}): Promise<Out> {
   const b = body as any;
   if (!b || typeof b !== "object") return bad("body must be a JSON object");
   const rec = getConnection(tenantId, String(b.connectionId ?? ""));
