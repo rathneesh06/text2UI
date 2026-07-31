@@ -22,7 +22,8 @@ import { generateReport } from "./report";
 import { COLO_PROJECT_ID, COLO_LABEL, coloAvailable, coloProfiles, coloQuery } from "./sources/colo";
 import { isWorkbenchProject, listWorkbenchSources, wbQuery, removeWorkbenchSource } from "./sources/workbench-store";
 import { handleSqlConnect, handleSqlSchema, handleSqlStageDiscard, handleSourceChat, handleCombineSources, liveQuery, LIVE_PREFIX } from "./text2sql/handler";
-import { handleSelectionChat, handleSelectionGet, handleSelectionSet, handleSelectionCommit, handleTableProfile, handleCatalog, describeError } from "./text2sql/selection-handler";
+import { handleSelectionChat, handleSelectionGet, handleSelectionSet, handleSelectionCommit, handleTableProfile, handleCatalog, describeError, chatStoreDegraded } from "./text2sql/selection-handler";
+import { selectionStoreDegraded } from "./sources/selection-store";
 import { handleDashboardBuild } from "./dashboard/handler";
 import { buildWidgetSql } from "./dashboard/filters";
 import { handleDeckBuild, handleDeckEdit } from "./deck/handler";
@@ -55,6 +56,12 @@ const STORAGE_PATH = process.env.STORAGE_PATH ?? "bff/data/text2ui.duckdb";
 const QUERY_ROW_CAP = Number(process.env.QUERY_ROW_CAP ?? 10_000);
 const QUERY_ROW_CAP_MAX = Number(process.env.QUERY_ROW_CAP_MAX ?? 200_000); // ceiling for explicit rowCap requests (project restore)
 const QUERY_TIMEOUT_MS = Number(process.env.QUERY_TIMEOUT_MS ?? 15_000);
+// Captured ONCE at module load, not per request: /health reports this so a
+// restart is provable. On Windows `tsx watch` + Ctrl-C often orphans the child
+// node process, which keeps holding :8787 — the "new" instance never binds and
+// you carry on talking to the old one. Identical pid/bootedAt across a supposed
+// restart means the process never actually restarted.
+const BOOTED_AT = new Date().toISOString();
 // Cached result of the startup Gemini key check (see the isDirectRun block).
 let modelHealth: { ok: boolean; detail: string; checkedAt: number } | null = null;
 let _rawStorage: StorageEngine | null = null;
@@ -738,7 +745,20 @@ export function createServer() {
     // ?model=1: re-verify the Gemini key LIVE (one tiny call). Otherwise return
     // the cached startup result so liveness probes stay free.
     if (req.query.model === "1") modelHealth = { ...(await checkModelHealth()), checkedAt: Date.now() };
-    res.json({ ok: true, model: modelHealth ?? { ok: null, detail: "not checked yet — GET /health?model=1" } });
+    res.json({
+      ok: true,
+      model: modelHealth ?? { ok: null, detail: "not checked yet — GET /health?model=1" },
+      // Restart evidence — see BOOTED_AT.
+      pid: process.pid,
+      bootedAt: BOOTED_AT,
+      uptimeSec: Math.round(process.uptime()),
+      // Which backend is LIVE, not which one was configured: a store that fell
+      // back still reports STORAGE=postgres, so `degraded` is the honest bit.
+      storage: {
+        engine: process.env.STORAGE ?? "duckdb",
+        degraded: selectionStoreDegraded() || chatStoreDegraded(),
+      },
+    });
   });
 
   app.post("/api/generate", async (req, res) => {

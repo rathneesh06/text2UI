@@ -67,6 +67,12 @@ let warnedDegraded = false;
 /** Test seam: forget that we degraded. */
 export function _resetChatFallbackForTest(): void { memoryFallback = null; warnedDegraded = false; }
 
+/** Read-only: has chat persistence fallen back to memory in this process?
+ *  Surfaced by /health. Reports the degrade, never causes it. */
+export function chatStoreDegraded(): boolean {
+  return warnedDegraded;
+}
+
 export function resilientStore(real: ChatStore): ChatStore {
   const useFallback = (err: unknown): ChatStore => {
     if (!warnedDegraded) {

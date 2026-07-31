@@ -1,0 +1,60 @@
+/* src/components/ChatMarkdown.css — chat prose.
+ *
+ * Uses the variables the rest of the app already defines (--text-secondary,
+ * --text-muted, --bg-card, --border-color). Nothing new is introduced: this is
+ * the existing chat bubble's typography, given block structure.
+ *
+ * NOTE: `.sel-msg` sets `white-space: pre-wrap`, which double-spaces rendered
+ * blocks. SelectPage must use `.sel-msg--md` (see SHARED-FILE-CHANGES.md) on
+ * bubbles that render markdown; that class resets white-space to `normal`.
+ */
+
+.md { display: flex; flex-direction: column; gap: 8px; }
+.md > :first-child { margin-top: 0; }
+.md > :last-child { margin-bottom: 0; }
+
+.md-p { margin: 0; line-height: 1.55; white-space: pre-wrap; }
+
+.md-h {
+  margin: 2px 0 0; font-size: 13px; font-weight: 650;
+  letter-spacing: 0.01em; color: var(--text-primary, #e5e7eb);
+}
+
+.md-list { margin: 0; padding-left: 18px; display: flex; flex-direction: column; gap: 3px; }
+.md-list li { line-height: 1.5; }
+.md-list li::marker { color: var(--text-muted); }
+
+.md-quote {
+  margin: 0; padding: 2px 0 2px 10px;
+  border-left: 2px solid var(--border-color, #1f2937);
+  color: var(--text-muted); font-style: normal;
+}
+
+.md-code {
+  font-family: ui-monospace, Menlo, monospace; font-size: 12px;
+  padding: 1px 4px; border-radius: 4px;
+  background: rgba(255, 255, 255, 0.06); color: var(--text-primary, #e5e7eb);
+}
+
+.md-pre {
+  margin: 0; padding: 9px 11px; border-radius: 7px; overflow-x: auto;
+  background: rgba(0, 0, 0, 0.28);
+  border: 1px solid var(--border-color, #1f2937);
+}
+.md-pre code {
+  font-family: ui-monospace, Menlo, monospace; font-size: 11.5px;
+  line-height: 1.5; color: var(--text-secondary); white-space: pre;
+}
+
+.md a { color: var(--accent-purple, #a78bfa); text-decoration: underline; text-underline-offset: 2px; }
+.md a:focus-visible { outline: 2px solid var(--accent-purple, #a78bfa); outline-offset: 2px; border-radius: 2px; }
+
+/* The cursor that shows a reply is still arriving. Paused for reduced motion —
+ * the caret stays visible, it just stops blinking. */
+.md-caret {
+  display: inline-block; width: 6px; height: 13px; margin-left: 2px;
+  vertical-align: -2px; background: var(--text-muted);
+  animation: md-blink 1s steps(2, start) infinite;
+}
+@keyframes md-blink { to { visibility: hidden; } }
+@media (prefers-reduced-motion: reduce) { .md-caret { animation: none; } }

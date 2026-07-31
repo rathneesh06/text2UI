@@ -18,8 +18,14 @@ export function describeError(err: any, depth = 0): string {
   const parts: string[] = [];
   const msg = typeof err.message === "string" ? err.message.trim() : "";
   if (msg) parts.push(msg);
-  if (err.code) parts.push(String(err.code));
-  if (err.address || err.port) parts.push(`connecting to ${err.address ?? "?"}:${err.port ?? "?"}`);
+  // Only ADD what the message doesn't already say. pg's own message is
+  // "connect ECONNREFUSED 127.0.0.1:5499" — appending the code and address again
+  // produced "connect ECONNREFUSED 127.0.0.1:5499 ECONNREFUSED connecting to
+  // 127.0.0.1:5499". This function exists to fill silence, not to restate.
+  const code = err.code ? String(err.code) : "";
+  if (code && !msg.includes(code)) parts.push(code);
+  const where = err.address || err.port ? `${err.address ?? "?"}:${err.port ?? "?"}` : "";
+  if (where && !msg.includes(where)) parts.push(`connecting to ${where}`);
   // AggregateError carries the real failures in .errors; wrapped errors use .cause.
   const inner = Array.isArray(err.errors) ? err.errors[0] : err.cause;
   if (!parts.length || (!err.code && inner)) {

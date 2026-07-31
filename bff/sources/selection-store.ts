@@ -236,6 +236,13 @@ function fileStore(): FileSelectionStore {
   return fileFallback;
 }
 
+/** Read-only: has this process fallen back to the local file? Surfaced by
+ *  /health so a degraded config is visible without grepping the log. Does not
+ *  touch the degrade logic — it only reports it. */
+export function selectionStoreDegraded(): boolean {
+  return warnedDegraded;
+}
+
 function resolveBackend(): SelectionBackend {
   if (backend) return backend;
   const kind = (process.env.STORAGE ?? "duckdb").toLowerCase();

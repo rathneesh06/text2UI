@@ -35,6 +35,17 @@ import { guardSelect } from "./guard";
 import { runAnalystLoop, formatEvidenceDirective, compactEvidence, type AnalystRun } from "./analyst";
 import { planSqlTurn, type PlanSqlRun, type SqlTurnPlan } from "./planner";
 import { composeAnswer, composeFallback, type ComposeRun } from "./composer";
+import { runAnalyst, fallbackSummary } from "./interpret";
+import { callGemini, PLAN_OPTS } from "../aiflow";
+
+// The main chat's analyst caps. Separate env vars from the /select analyst's
+// T2SQL_ANALYST_* on purpose: that one queries whatever production database a
+// user pasted a string for and stays tight; this one queries a local DuckDB
+// snapshot, so it can afford to look around. Read per call so a test or an
+// operator can change them without a restart.
+const SOURCE_MAX_QUERIES = () => Math.max(1, Number(process.env.T2SQL_SOURCE_MAX_QUERIES ?? 5));
+const SOURCE_MAX_ROUNDS = () => Math.max(1, Number(process.env.T2SQL_SOURCE_MAX_ROUNDS ?? 3));
+const SOURCE_BUDGET_MS = () => Math.max(5_000, Number(process.env.T2SQL_SOURCE_BUDGET_MS ?? 60_000));
 import type { Dataset } from "../../shared/types";
 import { enrichColumns } from "../../shared/profile-enrich";
 import { exactColumnStats } from "../sources/exact-stats";
@@ -223,21 +234,51 @@ export async function handleSourceChat(body: unknown, tenantId: string, deps: Sq
     return say({ answer: fallback });
   }
 
+  // Pre-validate so an unsafe plan still gets the specific, actionable message
+  // rather than being explained by the composer. runAnalyst guards again through
+  // this same guardSelect — one guard, applied twice, never a second one.
   const guarded = guardSelect(plan.sql ?? "", 500);
   if (!guarded.ok) return say({ answer: `I couldn't form a safe query for that (${guarded.error}). Try rephrasing.` });
+
   const t0 = Date.now();
-  let rows: Record<string, unknown>[];
-  try {
-    rows = await runQuery(guarded.sql);
-  } catch (err: any) {
-    return say({ answer: `The lookup failed: ${err?.message ?? err}`, sql: guarded.sql });
-  }
-  const executionMeta = { durationMs: Date.now() - t0, rowsReturned: rows.length, sourceType: "snapshot" as const };
-  const simple = rows.length === 0 || (rows.length === 1 && Object.keys(rows[0]).length === 1);
-  const answer = simple
-    ? composeFallback({ question: prompt, sql: guarded.sql, rows })
-    : await composeAnswer({ question: prompt, sql: guarded.sql, rows }, deps.compose);
-  return say({ answer, sql: guarded.sql, rows: rows.slice(0, 50), columns: rows.length ? Object.keys(rows[0]) : [], executionMeta });
+  const analyst = await runAnalyst(
+    { prompt, plannedSql: [plan.sql ?? ""], history },
+    {
+      runQuery: async (sql) => {
+        const started = Date.now();
+        const r = await runQuery(sql);
+        return {
+          columns: r.length ? Object.keys(r[0]) : [], rows: r,
+          truncated: false, elapsedMs: Date.now() - started,
+        };
+      },
+      guard: (sql, rowCap) => guardSelect(sql, rowCap ?? 500),
+      model: (system, user) => (deps.compose ?? callGemini)(system, user, PLAN_OPTS),
+      rowCap: 500,
+      // Deliberately looser than the /select analyst's T2SQL_ANALYST_* caps: this
+      // runs against a local DuckDB snapshot, where an extra query costs
+      // milliseconds and cannot put anyone's production database under load.
+      maxQueries: SOURCE_MAX_QUERIES(),
+      maxRounds: SOURCE_MAX_ROUNDS(),
+      budgetMs: SOURCE_BUDGET_MS(),
+    },
+  );
+
+  // The first successful query backs the result grid the client renders. A turn
+  // may have run several; the rest live in the prose.
+  const primary = analyst.outcomes.find((o) => o.ok) ?? analyst.outcomes[0];
+  if (!primary) return say({ answer: "I couldn't run a query for that.", sql: guarded.sql });
+  if (!primary.ok) return say({ answer: `The lookup failed: ${primary.error}`, sql: primary.sql });
+
+  const rows = primary.rows;
+  const executionMeta = {
+    durationMs: Date.now() - t0, rowsReturned: rows.length, sourceType: "snapshot" as const,
+    queriesRun: analyst.outcomes.length, stoppedBy: analyst.stoppedBy,
+  };
+  // fallbackSummary (not composeFallback) because a turn here may hold several
+  // result sets, and it already explains WHY it is terse.
+  const answer = analyst.answer ?? fallbackSummary(analyst.outcomes);
+  return say({ answer, sql: primary.sql, rows: rows.slice(0, 50), columns: primary.columns, executionMeta });
 }
 
 // ---- POST /api/sources/combine — merge published extracts into ONE source --------
@@ -331,7 +372,8 @@ export async function handleSqlChat(body: unknown, tenantId: string, deps: SqlHa
       // shapes"): previews, empty results, and single-cell answers need no model.
       const simpleShape = rows.length === 0 || (rows.length === 1 && Object.keys(rows[0]).length === 1);
       const answer = plan.intent === "preview" || simpleShape
-        ? composeFallback({ question: prompt, sql: guarded.sql, rows, truncated })
+        // false: the model was skipped on purpose here, so don't apologise for it.
+        ? composeFallback({ question: prompt, sql: guarded.sql, rows, truncated }, false)
         : await composeAnswer({ question: prompt, sql: guarded.sql, rows, truncated }, deps.compose);
       return reply({
         intent: plan.intent, answer, sql: guarded.sql,
