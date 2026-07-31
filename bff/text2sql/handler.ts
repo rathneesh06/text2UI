@@ -19,15 +19,20 @@
 import { getChatStore, type ChatStore } from "../chat-store";
 import {
   openConnection, openConnectionWith, getConnection, getHandle, closeConnectionHandle, publicView, profileTables,
-  markExecution, openGroup, type ConnRecord, type GroupPart,
+  markExecution, openGroup, newMemberId, memberIdForCatalog, removeGroupMember, soloMemberId,
+  type ConnRecord, type GroupPart,
 } from "../sources/connection-registry";
+import { getSelection, setSelection } from "../sources/selection-store";
+import { describeError } from "../sources/describe-error";
 import { connFromParts, type DbConnParts } from "../sources/db-conn";
 import {
   registerWorkbenchSource, getWorkbenchSource, wbSlug, wbDbPath,
   stagingDbPath, addStaged, getStaged, finalizeStaged, discardStaged, releaseInstance,
   type WorkbenchSource, type StagedState,
 } from "../sources/workbench-store";
-import { snapshotTables } from "../sources/db-conn";
+import { snapshotTables, snapshotFromHandle, attachGroup, type WbSnapshotResult } from "../sources/db-conn";
+import { mkdirSync } from "node:fs";
+import { dirname } from "node:path";
 import { COLO_PROJECT_ID, coloAvailable, coloProfiles, coloQuery } from "../sources/colo";
 import { isWorkbenchProject, wbQuery, combineSources } from "../sources/workbench-store";
 import { qid } from "../sources/mysql";
@@ -108,7 +113,12 @@ export async function handleSqlConnect(body: unknown, tenantId: string): Promise
       const base = getConnection(tenantId, b.addTo.trim());
       if (!base) return { status: 404, body: { error: "the connection to add to is unknown or expired — reconnect it first" } };
       const asPart = (r: ConnRecord): GroupPart[] =>
-        r.groupParts?.length ? r.groupParts : [{ conn: r.conn, label: r.label, allTables: r.allTables, datasets: r.datasets }];
+        // An existing group keeps its members' ids untouched — regrouping must not
+        // change anyone's identity. A plain connection becomes a member here, so
+        // this is where its id is minted, once.
+        r.groupParts?.length
+          ? r.groupParts
+          : [{ id: newMemberId(), conn: r.conn, label: r.label, allTables: r.allTables, datasets: r.datasets }];
       const group = openGroup(tenantId, [...asPart(base), ...asPart(rec)]);
       group.mode = rec.mode ?? base.mode;
       console.log(`[text2sql] grouped ${group.groupParts!.length} databases as ${group.id}`);
@@ -119,6 +129,59 @@ export async function handleSqlConnect(body: unknown, tenantId: string): Promise
     // Bad input / failed handshake / timeout — user-actionable, so a 400 with the message.
     return bad(err?.message ?? "connection failed");
   }
+}
+
+// ---- POST /api/sql/:connectionId/members/:memberId/remove -------------------------
+// Close a database tab. Keyed on the STABLE member id: every surviving member
+// keeps its identity, only attach positions shift, and nothing durable stores a
+// position. Tables that came from the removed database are pruned from the
+// selection and RETURNED, because silently un-ticking a table the user chose is
+// worse than the removal itself.
+export async function handleRemoveMember(
+  connectionId: string,
+  memberId: string,
+  body: unknown,
+  tenantId: string,
+): Promise<Out> {
+  const rec = getConnection(tenantId, String(connectionId ?? ""));
+  if (!rec) return { status: 404, body: { error: "unknown or expired connection — reconnect" } };
+  const id = String(memberId ?? "").trim();
+  if (!id) return bad("memberId is required");
+
+  const before = rec.groupParts?.map((p) => p.id) ?? [soloMemberId(rec)];
+  if (!before.includes(id)) return { status: 404, body: { error: "unknown member — it may already have been removed" } };
+
+  const { rec: survivor, removed, removedTables } = removeGroupMember(rec, id);
+
+  // Prune the selection to what still exists. Only names from the removed member
+  // go; everything else keeps its tick and its column projection.
+  let pruned: string[] = [];
+  const conversationId = String((body as any)?.conversationId ?? "").trim();
+  if (conversationId && removedTables.length) {
+    try {
+      const cur = await getSelection(conversationId, tenantId);
+      const gone = new Set(removedTables);
+      const kept = cur.tables.filter((t) => !gone.has(t));
+      pruned = cur.tables.filter((t) => gone.has(t));
+      if (pruned.length) {
+        const columns = { ...(cur.columns ?? {}) };
+        for (const t of pruned) delete columns[t];
+        await setSelection(conversationId, tenantId, kept, { columns });
+      }
+    } catch (err: any) {
+      // A pruning failure must not strand the removal — report it instead.
+      console.warn(`[text2sql] member removed but selection prune failed: ${describeError(err)}`);
+    }
+  }
+
+  console.log(`[text2sql] removed member ${id} (${removed?.label ?? "?"}) from ${rec.id}; ${survivor ? (survivor.groupParts?.length ?? 1) : 0} left`);
+  if (!survivor) {
+    return { status: 200, body: { connectionId: null, closed: true, removedLabel: removed?.label ?? null, prunedTables: pruned } };
+  }
+  return {
+    status: 200,
+    body: { ...publicView(survivor), removedLabel: removed?.label ?? null, prunedTables: pruned },
+  };
 }
 
 // ---- GET /api/sql/:connectionId/schema -----------------------------------------
@@ -159,8 +222,52 @@ export async function stageSnapshot(
   // and queried, the lazy query cache holds the file open — evict it before the
   // snapshot writer opens the same file (re-extract into the same stage).
   await releaseInstance(stagingDbPath(conversationId));
+  const dbPath = stagingDbPath(conversationId);
   // Same file every time -> tables append (CREATE OR REPLACE dedupes re-extracts).
-  const result = await snapshotTables(rec.conn, { tables: cleaned, dbPath: stagingDbPath(conversationId), onPhase });
+  //
+  // GROUPS TAKE A DIFFERENT PATH. rec.conn is only parts[0] ("placeholder for
+  // shape" — see openGroup), and a group attaches as src0, src1, … not "src", so
+  // the single-connection path resolved NOTHING against a group and silently
+  // skipped every table: a multi-database commit extracted from the first
+  // database only, or not at all.
+  const members = rec.groupParts ?? [];
+  let result: WbSnapshotResult;
+  if (members.length) {
+    // The selection speaks MERGED DISPLAY NAMES: mergeGroupParts renames
+    // collisions (access_audit_log -> access_audit_log_2), and those invented
+    // names exist in no real catalog, so resolving them directly skips the table.
+    // Each merged entry carries its true origin in `ref` (src1."public"."orders"),
+    // so translate to the fully-qualified db:schema.table form the resolver
+    // matches first. Names we can't map are passed through unchanged and fail
+    // the normal way, with a "table not found" the user can read.
+    const REF = /^([A-Za-z0-9_]+)\."([^"]+)"\."([^"]+)"$/;
+    const byName = new Map(rec.allTables.map((t) => [t.name, t]));
+    const qualified = cleaned.map((want) => {
+      const m = byName.get(want)?.ref?.match(REF);
+      return m ? `${m[1]}:${m[2]}.${m[3]}` : want;
+    });
+    mkdirSync(dirname(dbPath), { recursive: true });
+    const h = await attachGroup(members.map((p) => p.conn), { dbPath, onPhase });
+    try {
+      result = await snapshotFromHandle(h, members[0].conn.dialect, {
+        tables: qualified, dbPath, onPhase,
+        catalogs: members.map((_, i) => `src${i}`),
+      });
+      // Translate the attach-time catalog (src0/src1 — positional, valid only for
+      // THIS attach) into the stable member id before anything persists it.
+      result = {
+        ...result,
+        datasets: result.datasets.map((d) => ({
+          ...d,
+          origin: { ...d.origin, memberId: memberIdForCatalog(members, d.origin.catalog) ?? undefined },
+        })),
+      };
+    } finally {
+      h.close();
+    }
+  } else {
+    result = await snapshotTables(rec.conn, { tables: cleaned, dbPath, onPhase });
+  }
   const skipped: string[] = result.skipped;
   if (!result.datasets.length && !getStaged(conversationId)) {
     throw new Error(`extraction produced no tables (${skipped.join("; ") || "unknown reason"})`);

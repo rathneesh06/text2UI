@@ -62,6 +62,9 @@ function AppRoutes() {
   // al1: analyst-loop evidence riding a workbench build handoff — follows the
   // initialPrompt lifecycle exactly and feeds the FIRST dashboard build only.
   const [initialDirective, setInitialDirective] = useState<string | null>(null);
+  // Stage 4: join semantics for the current source. Conversation-scoped, NOT
+  // spent on the first build — see ChatPage.
+  const [combinedSchema, setCombinedSchema] = useState<string | null>(null);
   const [resetKey, setResetKey] = useState(0);
   // Restore the active project ONLY when the chat page (/build) is reloaded directly, so a
   // refresh keeps the same session while a fresh landing starts a new one.
@@ -229,6 +232,7 @@ function AppRoutes() {
     }
     setWbSources((prev) => [src, ...prev.filter((s) => s.projectId !== src.projectId)]);
     selectWbSource(src);
+    setCombinedSchema(extracted.combinedSchema ?? null);
     if (buildPrompt) { setInitialPrompt(buildPrompt); setInitialDirective(extracted.evidence ?? null); }
   }, [selectWbSource, projectId, wbSources]);
 
@@ -403,6 +407,7 @@ function AppRoutes() {
             tables={tables}
             initialPrompt={initialPrompt}
             initialDirective={initialDirective}
+            combinedSchema={combinedSchema}
             onConsumeInitialPrompt={() => { setInitialPrompt(null); setInitialDirective(null); }}
             onFiles={loadFiles}
             onRemoveSource={removeSource}

@@ -28,6 +28,7 @@ import { mkdirSync, readFileSync, renameSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { WB_DIR } from "./workbench-store";
 import { describeError } from "./describe-error";
+import { migrateDependencyMembers, type Dependency } from "../../shared/dependencies";
 
 export interface SelectionState {
   conversationId: string;
@@ -42,6 +43,11 @@ export interface SelectionState {
    *  empty array) means "every column" — the common case, and the one that
    *  survives a schema change gracefully. Only narrowed tables are recorded. */
   columns: Record<string, string[]>;
+  /** Cross-database relationships the user declared in the /select chat. Durable
+   *  for the whole conversation — across turns, reloads and commits — and cleared
+   *  only when the user clears them. Members are STABLE ids (see MemberId), so a
+   *  removed database doesn't silently re-point a join at a different one. */
+  dependencies: Dependency[];
   updatedAt: number;
 }
 
@@ -64,7 +70,7 @@ export interface SelectionBackend {
 
 const MAX_UNDO = 25;
 const empty = (conversationId: string, tenantId: string): SelectionState =>
-  ({ conversationId, tenantId, connectionId: "", tables: [], columns: {}, updatedAt: 0 });
+  ({ conversationId, tenantId, connectionId: "", tables: [], columns: {}, dependencies: [], updatedAt: 0 });
 
 // ---- file backend ---------------------------------------------------------------
 
@@ -83,7 +89,7 @@ export class FileSelectionStore implements SelectionBackend {
       for (const s of list) {
         if (!s?.conversationId || !Array.isArray(s.tables)) continue;
         // Selections saved before column projection existed have no `columns`.
-        this.states.set(s.conversationId, { ...s, columns: s.columns ?? {} });
+        this.states.set(s.conversationId, { ...s, columns: s.columns ?? {}, dependencies: Array.isArray(s.dependencies) ? s.dependencies : [] });
       }
     } catch { /* nothing saved yet */ }
   }
@@ -158,8 +164,17 @@ export class PgSelectionStore implements SelectionBackend {
       connection_label TEXT,
       tables           JSONB NOT NULL DEFAULT '[]'::jsonb,
       columns          JSONB NOT NULL DEFAULT '{}'::jsonb,
+      dependencies     JSONB NOT NULL DEFAULT '[]'::jsonb,
       updated_at       TIMESTAMPTZ NOT NULL DEFAULT now()
     )`);
+    // REQUIRED, and easy to miss: CREATE TABLE IF NOT EXISTS does nothing to a
+    // table that already exists, so the `dependencies` column above only appears
+    // on a FRESH database. flowops already has this table from an earlier
+    // deploy — without this ALTER the column is silently absent there and every
+    // read/write of it fails at runtime while passing locally.
+    await this.pool.query(
+      `ALTER TABLE public.text2ui_selections ADD COLUMN IF NOT EXISTS dependencies JSONB NOT NULL DEFAULT '[]'::jsonb`,
+    );
   }
 
   // Reads are NOT cached. A per-process cache would defeat the reason this
@@ -168,7 +183,7 @@ export class PgSelectionStore implements SelectionBackend {
     await withTimeout(this.ready, PG_TIMEOUT_MS, "selection store init");
     const r: any = await withTimeout(
       this.pool.query(
-        `SELECT conversation_id, tenant_id, connection_id, connection_label, tables, columns,
+        `SELECT conversation_id, tenant_id, connection_id, connection_label, tables, columns, dependencies,
                 (extract(epoch from updated_at) * 1000)::bigint AS updated_ms
            FROM public.text2ui_selections WHERE conversation_id = $1 AND tenant_id = $2`,
         [conversationId, tenantId],
@@ -185,6 +200,7 @@ export class PgSelectionStore implements SelectionBackend {
       connectionLabel: row.connection_label ?? undefined,
       tables: Array.isArray(row.tables) ? row.tables.map(String) : [],
       columns: row.columns && typeof row.columns === "object" ? row.columns : {},
+      dependencies: Array.isArray(row.dependencies) ? row.dependencies : [],
       updatedAt: Number(row.updated_ms ?? 0),
     };
   }
@@ -194,19 +210,21 @@ export class PgSelectionStore implements SelectionBackend {
     await withTimeout(
       this.pool.query(
         `INSERT INTO public.text2ui_selections
-           (conversation_id, tenant_id, connection_id, connection_label, tables, columns, updated_at)
-         VALUES ($1, $2, $3, $4, $5::jsonb, $6::jsonb, now())
+           (conversation_id, tenant_id, connection_id, connection_label, tables, columns, dependencies, updated_at)
+         VALUES ($1, $2, $3, $4, $5::jsonb, $6::jsonb, $7::jsonb, now())
          ON CONFLICT (conversation_id) DO UPDATE SET
            tenant_id = EXCLUDED.tenant_id,
            connection_id = EXCLUDED.connection_id,
            connection_label = EXCLUDED.connection_label,
            tables = EXCLUDED.tables,
            columns = EXCLUDED.columns,
+           dependencies = EXCLUDED.dependencies,
            updated_at = now()`,
         [
           state.conversationId, state.tenantId, state.connectionId || null,
           state.connectionLabel ?? null,
           JSON.stringify(state.tables), JSON.stringify(state.columns),
+          JSON.stringify(state.dependencies ?? []),
         ],
       ),
       PG_TIMEOUT_MS,
@@ -283,9 +301,53 @@ const undoStacks = new Map<string, { tables: string[]; columns: Record<string, s
 
 /** Current selection for a conversation (never null — an unknown conversation is
  *  simply an empty selection). */
-export async function getSelection(conversationId: string, tenantId: string): Promise<SelectionState> {
+export async function getSelection(
+  conversationId: string,
+  tenantId: string,
+  /** Positional index -> stable member id, for rows written before members had
+   *  stable ids. Callers that have the live group pass this; without it a legacy
+   *  row is still migrated, just marked rejected because the position can't be
+   *  resolved — which is visible feedback rather than a silent wrong join. */
+  idAt: (index: number) => string | null = () => null,
+): Promise<SelectionState> {
   const s = await viaBackend((b) => b.load(conversationId, tenantId));
-  return s ?? empty(conversationId, tenantId);
+  if (!s) return empty(conversationId, tenantId);
+
+  // MIGRATE ON READ, and write the migrated shape back. Dependencies stored
+  // before the switch to stable ids key on a POSITION, which silently starts
+  // describing a different database the first time a member is removed. The
+  // failure mode is a wrong join, not an error, so it must not be left to chance.
+  const raw = Array.isArray(s.dependencies) ? s.dependencies : [];
+  const migrated = migrateDependencyMembers(raw, idAt);
+  const changed = JSON.stringify(migrated) !== JSON.stringify(raw);
+  if (!changed) return { ...s, dependencies: migrated };
+
+  const next = { ...s, dependencies: migrated };
+  // Best-effort: a failed write-back just means we migrate again next read.
+  try { await viaBackend((b) => b.save(next)); }
+  catch (err: any) { console.warn(`[selection-store] dependency migration write-back failed: ${describeError(err)}`); }
+  console.log(`[selection-store] migrated ${migrated.length} dependency row(s) to stable member ids`);
+  return next;
+}
+
+/** Replace the dependency list wholesale. Separate from setSelection because
+ *  ticking a table and declaring a relationship are independent edits — neither
+ *  may clobber the other. */
+export async function setDependencies(
+  conversationId: string,
+  tenantId: string,
+  dependencies: Dependency[],
+): Promise<SelectionState> {
+  const prev = await viaBackend((b) => b.load(conversationId, tenantId));
+  const next: SelectionState = {
+    ...(prev ?? empty(conversationId, tenantId)),
+    conversationId,
+    tenantId,
+    dependencies,
+    updatedAt: Date.now(),
+  };
+  await viaBackend((b) => b.save(next));
+  return next;
 }
 
 /** Replace the selection, pushing the previous value onto the undo stack. */
@@ -318,6 +380,9 @@ export async function setSelection(
     connectionLabel: meta.connectionLabel ?? prev?.connectionLabel,
     tables: kept,
     columns,
+    // Dependencies survive every selection edit: ticking a table must not clear
+    // what the user told us about how the databases relate.
+    dependencies: prev?.dependencies ?? [],
     updatedAt: Date.now(),
   };
   await viaBackend((b) => b.save(next));
@@ -338,6 +403,7 @@ export async function undoSelection(conversationId: string, tenantId: string): P
     connectionLabel: cur?.connectionLabel,
     tables: prev.tables,
     columns: prev.columns,
+    dependencies: cur?.dependencies ?? [],
     updatedAt: Date.now(),
   };
   await viaBackend((b) => b.save(next));

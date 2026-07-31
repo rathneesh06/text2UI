@@ -53,10 +53,45 @@ export interface ConnRecord {
 }
 
 export interface GroupPart {
+  /** STABLE member id, generated once when this database is opened and never
+   *  reused. Everything persisted — dependency members, staged-dataset origins —
+   *  keys on this, NOT on the member's position.
+   *
+   *  `src{i}` is assigned positionally at attach time, so removing a member
+   *  renumbers every member after it. Keying durable state on a position means a
+   *  stored dependency silently starts describing a different database the first
+   *  time someone closes a tab. Positions are derived from ids at attach
+   *  (memberIndexById); nothing durable holds one. */
+  id: string;
   conn: DbConn;
   label: string;
   allTables: DbTableInfo[];
   datasets: Dataset[];
+}
+
+/** Fresh stable member id. Separate from ConnRecord ids so a member keeps its
+ *  identity even if the record it came from is gone. */
+export const newMemberId = (): string => "mem_" + randomUUID().replace(/-/g, "").slice(0, 12);
+
+/** id -> current positional index (`src{i}`), built at attach time. The ONLY
+ *  place positions are allowed to come from. */
+export function memberIndexById(parts: GroupPart[]): Map<string, number> {
+  return new Map(parts.map((p, i) => [p.id, i]));
+}
+
+/** The attach-time catalog name for a member id, or null if it isn't in this
+ *  group any more (a removed member — callers must handle that, not assume). */
+export function catalogForMember(parts: GroupPart[], id: string): string | null {
+  const i = memberIndexById(parts).get(id);
+  return i === undefined ? null : `src${i}`;
+}
+
+/** Inverse: which member id currently sits at `src{i}`. Used to translate an
+ *  attach-time catalog back to something durable at snapshot time. */
+export function memberIdForCatalog(parts: GroupPart[], catalog: string): string | null {
+  const m = /^src(\d+)$/.exec(catalog);
+  if (!m) return null;
+  return parts[Number(m[1])]?.id ?? null;
 }
 
 const TTL_MS = Number(process.env.WB_CONN_TTL_MS ?? 4 * 3_600_000); // 4h idle default
@@ -67,6 +102,10 @@ function sweep(now = Date.now()): void {
     if (now - r.lastUsed > TTL_MS) {
       try { r.handle?.close(); } catch { /* already gone */ }
       records.delete(id);
+      // The override outlives nothing: once the record is gone its surviving-member
+      // id is unreachable, and leaving it behind grows the map for the life of the
+      // process (one entry per group that ever degraded to a single member).
+      soloIdOverride.delete(id);
     }
   }
 }
@@ -218,6 +257,127 @@ export function openGroup(tenantId: string, parts: GroupPart[]): ConnRecord {
   return rec;
 }
 
+/**
+ * Remove one database from a group, keyed on its STABLE id.
+ *
+ * Every surviving member keeps its `id` byte-identical — that is the whole point
+ * of the ids. Only the attach-time positions shift (the member that was src1
+ * becomes src0), and nothing durable stores those. The record id is preserved
+ * too, so the client's connectionId stays valid.
+ *
+ * Degrades in two steps, deliberately matching what a lone connection already
+ * looks like so callers need no special case:
+ *   1 member left  -> a plain connection record (groupParts dropped)
+ *   0 members left -> the record is closed and removed entirely
+ *
+ * Returns the surviving record, or null when the connection is gone.
+ */
+export function removeGroupMember(rec: ConnRecord, memberId: string): {
+  rec: ConnRecord | null;
+  removed: GroupPart | null;
+  removedTables: string[];
+} {
+  const parts = rec.groupParts?.length
+    ? rec.groupParts
+    // A lone connection is conceptually a one-member group; removing "its" member
+    // must behave exactly like removing the last member of a real group.
+    : [{ id: soloMemberId(rec), conn: rec.conn, label: rec.label, allTables: rec.allTables, datasets: rec.datasets }];
+
+  const idx = parts.findIndex((p) => p.id === memberId);
+  if (idx === -1) return { rec, removed: null, removedTables: [] };
+
+  const removed = parts[idx];
+  // Merged display names, which is what a selection stores.
+  const removedTables = rec.groupParts?.length
+    ? rec.allTables.filter((t) => memberIdForCatalog(parts, t.ref.split(".")[0]) === memberId).map((t) => t.name)
+    : rec.allTables.map((t) => t.name);
+  const rest = parts.filter((_, i) => i !== idx);
+
+  // The names the SURVIVORS currently answer to. Re-merging from scratch would
+  // reassign them: `users_2` only carries a suffix because the removed member
+  // also had a `users`, so dropping that member renames the survivor's table
+  // back to `users` — silently invalidating every tick and column projection
+  // stored against the old name. Removing A must not rename B's tables.
+  // Read the names ACTUALLY in use, rather than re-deriving them by replaying the
+  // merge: after an earlier removal the live names no longer match what a fresh
+  // merge would produce (drop B from A/B/C and C stays `users_3`, though a replay
+  // would now call it `users_2`). Re-deriving reintroduces the rename one removal
+  // later — which is precisely what member-removal.test.ts caught.
+  const preferred = new Map<string, string>();
+  {
+    const solo = !rec.groupParts?.length;
+    for (const t of rec.allTables) {
+      const mid = solo ? parts[0].id : memberIdForCatalog(parts, t.ref.split(".")[0]);
+      if (mid) preferred.set(`${mid} ${t.schema}.${t.table}`, t.name);
+    }
+  }
+
+  if (!rest.length) {
+    closeConnectionHandle(rec);
+    records.delete(rec.id);
+    soloIdOverride.delete(rec.id); // nothing left to be addressable as
+    return { rec: null, removed, removedTables };
+  }
+
+  // The attach changes shape, so any open handle is stale.
+  closeConnectionHandle(rec);
+  rec.viewsVersion = (rec.viewsVersion ?? 0) + 1;
+
+  if (rest.length === 1) {
+    const only = rest[0];
+    // Plain connection again, so refs revert to `src.` — but the DISPLAY NAMES
+    // stay as they were, or the survivor's selection breaks.
+    const rename = new Map<string, string>();
+    rec.allTables = only.allTables.map((t) => {
+      const name = preferred.get(`${only.id} ${t.schema}.${t.table}`) ?? t.name;
+      rename.set(t.name, name);
+      return { ...t, name };
+    });
+    rec.datasets = only.datasets.map((d) => {
+      const name = rename.get(d.tableName) ?? d.tableName;
+      return name === d.tableName ? d : { ...d, tableName: name };
+    });
+    rec.conn = only.conn;
+    rec.label = only.label;
+    rec.groupParts = undefined; // now a plain connection — but `only.id` lives on
+    // Keep the surviving member addressable under the id it already had.
+    soloIdOverride.set(rec.id, only.id);
+    return { rec, removed, removedTables };
+  }
+
+  // Same rule for a still-multi group: positions shift (src1 becomes src0), names
+  // must not.
+  const taken = new Set<string>();
+  const allTables: DbTableInfo[] = [];
+  const datasets: Dataset[] = [];
+  rest.forEach((p, i) => {
+    const rename = new Map<string, string>();
+    for (const t of p.allTables) {
+      let name = preferred.get(`${p.id} ${t.schema}.${t.table}`) ?? t.name;
+      if (taken.has(name)) { const b = name; for (let n = 2; taken.has(name); n++) name = `${b}_${n}`; }
+      taken.add(name);
+      rename.set(t.name, name);
+      allTables.push({ ...t, name, ref: `src${i}."${t.schema}"."${t.table}"` });
+    }
+    for (const d of p.datasets) {
+      const name = rename.get(d.tableName) ?? d.tableName;
+      datasets.push(name === d.tableName ? d : { ...d, tableName: name });
+    }
+  });
+  rec.conn = rest[0].conn;
+  rec.label = rest.map((p) => p.label).join(" + ");
+  rec.allTables = allTables;
+  rec.datasets = datasets;
+  rec.groupParts = rest;
+  return { rec, removed, removedTables };
+}
+
+/** When a group degrades to one member, that member keeps the id it already had
+ *  rather than being handed a fresh solo id — otherwise removing a sibling would
+ *  silently change the survivor's identity, which is the exact bug the stable
+ *  ids prevent. */
+const soloIdOverride = new Map<string, string>();
+
 /** Tenant-scoped lookup. Returns null (never throws) for missing/foreign ids. */
 export function getConnection(tenantId: string, id: string): ConnRecord | null {
   sweep();
@@ -258,17 +418,40 @@ export function markExecution(rec: ConnRecord, ok: boolean): "active" | "degrade
   return rec.status;
 }
 
-/** The shape the client is allowed to see. No conn, no password, no handle. */
+/** A single (non-group) connection still gets ONE member, so the client has one
+ *  uniform shape instead of a special case. Derived from the record id, so it is
+ *  stable for the life of the connection. */
+export const soloMemberId = (rec: ConnRecord): string =>
+  soloIdOverride.get(rec.id) ?? `solo_${rec.id}`;
+
+/** The shape the client is allowed to see. No conn, no password, no handle.
+ *
+ *  `memberId` is stamped onto every table HERE, server-side, from the table's
+ *  `ref` (src{i}.…). The client must never parse `src{i}` itself: that index is
+ *  attach-scoped and shifts the moment a member is removed, which is exactly
+ *  what the stable ids exist to prevent. Position stays on this side of the wire. */
 export function publicView(rec: ConnRecord) {
+  const parts = rec.groupParts;
+  const members = parts?.length
+    ? parts.map((g) => ({ id: g.id, label: g.label }))
+    : [{ id: soloMemberId(rec), label: rec.label }];
+
+  const solo = !parts?.length;
+  const allTables = rec.allTables.map((t) => ({
+    ...t,
+    // A solo connection's refs carry no src{i} prefix — every table is its one member.
+    memberId: solo ? soloMemberId(rec) : (memberIdForCatalog(parts!, t.ref.split(".")[0]) ?? null),
+  }));
+
   return {
     connectionId: rec.id,
     status: rec.status,
     mode: rec.mode ?? null,
     label: rec.label,
-    allTables: rec.allTables,
+    allTables,
     datasets: rec.datasets,
     warnings: rec.warnings,
-    ...(rec.groupParts ? { members: rec.groupParts.map((g) => g.label) } : {}),
+    members,
   };
 }
 

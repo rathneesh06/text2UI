@@ -172,6 +172,77 @@
   max-width: 72ch; padding: 8px 11px; border-radius: 9px;
   font-size: 13px; line-height: 1.5; white-space: pre-wrap;
 }
+/* ---- captured dependencies: what the system believes about the joins ----
+   Shown, not hidden: a rejected entry is feedback the user can correct, and an
+   invisible list is one nobody corrects. */
+.sel-deps {
+  border-top: 1px solid var(--line, #1f2937);
+  max-height: 34%; overflow-y: auto; padding: 6px 8px;
+}
+.sel-deps__head {
+  font-size: 11px; color: #64748b; text-transform: uppercase;
+  letter-spacing: .04em; padding: 2px 2px 6px;
+}
+.sel-dep {
+  padding: 6px 8px; margin-bottom: 5px; border-radius: 7px;
+  background: #131c2b; border-left: 2px solid #334155;
+}
+.sel-dep--confirmed { border-left-color: #34d399; }
+.sel-dep--validated { border-left-color: #60a5fa; }
+.sel-dep--inferred  { border-left-color: #fbbf24; }
+.sel-dep--rejected  { border-left-color: #f87171; }
+.sel-dep__top { display: flex; align-items: center; gap: 6px; margin-bottom: 3px; }
+.sel-dep__badge {
+  font-size: 9px; text-transform: uppercase; letter-spacing: .04em;
+  padding: 1px 5px; border-radius: 3px; background: #1f2937; color: #94a3b8;
+}
+.sel-dep__badge--confirmed { color: #34d399; }
+.sel-dep__badge--validated { color: #60a5fa; }
+.sel-dep__badge--inferred  { color: #fbbf24; }
+.sel-dep__badge--rejected  { color: #f87171; }
+.sel-dep__kind, .sel-dep__overlap { font-size: 10px; color: #64748b; }
+.sel-dep__overlap { margin-left: auto; }
+.sel-dep__stmt { font-size: 12px; color: #e2e8f0; line-height: 1.4; }
+.sel-dep__note { font-size: 11px; color: #94a3b8; margin-top: 3px; line-height: 1.4; }
+
+/* ---- database tabs: one tab per member of the connection group ---- */
+.sel-tabs {
+  display: flex; flex-wrap: wrap; gap: 3px;
+  padding: 6px 8px 0; border-bottom: 1px solid var(--line, #1f2937);
+}
+.sel-tab {
+  display: inline-flex; align-items: center; gap: 6px;
+  max-width: 190px; padding: 5px 8px;
+  border: 1px solid var(--line, #1f2937); border-bottom: none;
+  border-radius: 7px 7px 0 0;
+  background: transparent; color: #94a3b8;
+  font-size: 12px; cursor: pointer; user-select: none;
+}
+.sel-tab--on { background: #131c2b; color: #e2e8f0; }
+.sel-tab__label { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+/* Selection is global, so a tab shows what is ticked inside it even when
+   another tab is in view. */
+.sel-tab__n {
+  flex: none; min-width: 16px; padding: 0 4px; border-radius: 8px;
+  background: var(--accent-purple-dark, #4c1d95); color: #fff;
+  font-size: 10px; line-height: 15px; text-align: center;
+}
+.sel-tab__x {
+  flex: none; border: none; background: none; cursor: pointer;
+  color: #64748b; font-size: 14px; line-height: 1; padding: 0 1px;
+}
+.sel-tab__x:hover { color: #f87171; }
+.sel-tab--add { color: #64748b; font-size: 15px; padding: 4px 10px; }
+.sel-addmember { display: flex; gap: 6px; padding: 8px; }
+.sel-addmember .sel-input { flex: 1; min-width: 0; }
+/* Which database a row came from — the merged catalog only suffixes collisions
+   (users, users_2), which is not enough to tell two tables apart. */
+.sel-row__db {
+  margin-left: auto; flex: none; max-width: 40%;
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+  font-size: 10px; color: #64748b;
+}
+
 /* Markdown bubbles emit real block elements — the base pre-wrap above would add
    a blank line after every paragraph and list item. */
 .sel-msg--md { white-space: normal; }

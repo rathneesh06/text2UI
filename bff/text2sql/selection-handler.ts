@@ -22,19 +22,24 @@
 import { randomUUID } from "node:crypto";
 import { getChatStore, InMemoryChatStore, type ChatStore } from "../chat-store";
 import { describeError } from "../sources/describe-error";
-import { getConnection } from "../sources/connection-registry";
+import { getConnection, getHandle, memberIdForCatalog, soloMemberId, type ConnRecord } from "../sources/connection-registry";
 import { nativeTableDetail, nativeQuery } from "../sources/native-catalog";
 import { guardSelect } from "./guard";
 import {
-  getSelection, setSelection, undoSelection, canUndo, dropSelection,
+  getSelection, setSelection, setDependencies, undoSelection, canUndo, dropSelection,
 } from "../sources/selection-store";
-import { finalizeStaged, projectStagedColumns } from "../sources/workbench-store";
+import { finalizeStaged, projectStagedColumns, stagingDbPath, releaseInstance } from "../sources/workbench-store";
+import { buildJoinGraph, viewDdl, describeCombinedSchema, type StagedTable } from "./combined-schema";
 import { stageSnapshot } from "./handler";
 import {
   answerFromRows, applyOps, correctionNote, describeRows, offlineFallback,
   planSelectionTurn, summarizeApply, type PlanSelectionRun, type SelOp,
 } from "./selection";
-import { runChatAnalyst, fallbackSummary } from "./interpret";
+import {
+  planDependencyTurn, applyTurn, validateAgainstCatalog, probeOverlap, captureVerbatim,
+  type DependencyCatalogTable,
+} from "./dependency-chat";
+import { mergeDependencies, type Dependency, type MemberId } from "../../shared/dependencies";
 import { callGemini, ORCHESTRATE_OPTS } from "../aiflow";
 import type { Dataset } from "../../shared/types";
 
@@ -209,14 +214,20 @@ const PROFILE_BATCH = Number(process.env.T2SQL_PROFILE_BATCH ?? 12);
 
 /** The catalog as the client renders it: display order, 1-based numbers, and a
  *  `profiled` flag so the UI knows whether clicking needs a round-trip. */
-function catalogView(rec: { allTables: { name: string; approxRows: number }[]; datasets: Dataset[] }) {
+function catalogView(rec: ConnRecord) {
   const profiled = new Set(rec.datasets.map((d) => d.tableName));
+  const parts = rec.groupParts;
+  const solo = !parts?.length;
   return rec.allTables.map((t, i) => ({
     index: i + 1,
     name: t.name,
     approxRows: t.approxRows,
     profiled: profiled.has(t.name),
     columnCount: rec.datasets.find((d) => d.tableName === t.name)?.profile.columns.length ?? null,
+    // Which database this table came from. Resolved SERVER-SIDE from the ref, so
+    // the UI never parses `src{i}` — that index is attach-scoped and shifts when
+    // a member is removed.
+    memberId: solo ? soloMemberId(rec) : (memberIdForCatalog(parts!, String(t.ref ?? "").split(".")[0]) ?? null),
   }));
 }
 
@@ -238,163 +249,101 @@ async function handleSelectionChatInner(body: unknown, tenantId: string, deps: S
   const prompt = b.prompt.trim();
   await store.appendMessage(conversationId, { role: "user", content: prompt });
 
-  const catalog = rec.allTables.map((t) => t.name);
-  const state = await getSelection(conversationId, tenantId);
-  const current = state.tables;
+  // ---- dependency capture --------------------------------------------------------
+  // This chat no longer selects tables (checkboxes and tabs do that) and no longer
+  // answers data questions (the build chat does that). Its one job is to record how
+  // the connected databases relate, because that is the only thing here that no
+  // other surface can recover: a planner looking at two staged tables cannot know
+  // which column joins them, or that one row explains forty.
+  const parts = rec.groupParts ?? [];
+  const idAt = (i: number): string | null => parts[i]?.id ?? null;
+  const state = await getSelection(conversationId, tenantId, idAt);
+  const memberOf = (name: string): MemberId =>
+    (parts.length
+      ? memberIdForCatalog(parts, String(rec.allTables.find((t) => t.name === name)?.ref ?? "").split(".")[0])
+      : soloMemberId(rec)) ?? soloMemberId(rec);
 
-  // The model plans EVERY turn. It sees the catalog (with columns where they've
-  // been profiled), the live selection, and the conversation so far, and it
-  // writes both the ops and the words the user reads.
-  const planned = await planSelectionTurn(
-    {
-      prompt,
-      catalog: rec.allTables.map((t) => ({
-        name: t.name,
-        approxRows: t.approxRows,
-        columns: rec.datasets.find((d) => d.tableName === t.name)?.profile.columns.map((c: any) => String(c.name)),
-      })),
-      selection: current,
-      history,
-      dialect: rec.conn.dialect,
-    },
-    deps.plan,
+  const depCatalog: DependencyCatalogTable[] = rec.allTables.map((t) => ({
+    member: memberOf(t.name),
+    memberLabel: parts.find((p) => p.id === memberOf(t.name))?.label ?? rec.label,
+    table: t.name,
+    columns: rec.datasets.find((d) => d.tableName === t.name)?.profile.columns.map((c: any) => String(c.name)) ?? [],
+  }));
+
+  const turn = await planDependencyTurn(
+    { prompt, catalog: depCatalog, captured: state.dependencies ?? [], history },
+    deps.plan as any,
   );
 
-  let ops: SelOp[] | null = planned?.ops ?? null;
-  let modelReply: string | undefined = planned?.reply;
-  let source: "model" | "offline" = "model";
+  let captured: Dependency[];
+  let reply: string;
+  if (!turn) {
+    // The model is unreachable. Keep the statement anyway — losing what the user
+    // said is the one outcome this feature must never produce.
+    captured = mergeDependencies(state.dependencies ?? [], [captureVerbatim(prompt)]);
+    reply = "I couldn't reach the assistant, so I've saved that exactly as you wrote it and will structure it when the model is back.";
+  } else {
+    const merged = applyTurn(state.dependencies ?? [], turn);
+    // Validation is CODE, not prompt: check the columns exist, then (best-effort)
+    // that the values actually overlap. A dependency that fails either is KEPT and
+    // marked, because a rejected dependency is feedback the user can correct.
+    const columnsOf = (member: MemberId, table: string): string[] | null => {
+      const hit = depCatalog.find((c) => c.member === member && c.table.toLowerCase() === table.toLowerCase())
+        ?? depCatalog.find((c) => c.table.toLowerCase() === table.toLowerCase());
+      if (!hit) return null;
+      return hit.columns.length ? hit.columns : null;
+    };
+    let validated = validateAgainstCatalog(merged, columnsOf);
 
-  // planSelectionTurn returns null only for an outage (unreachable, timed out,
-  // unparseable). Bare "1, 4, 9" still works in that state; anything with intent
-  // in it does not, and the user is told why rather than half-obeyed.
-  if (!planned) {
-    const offline = offlineFallback(prompt, catalog);
-    if (!offline) {
-      const answer = `I can't reach the model right now, so I can't work out what you meant. You can still tick tables in the list on the left — or send just the numbers (“1, 4, 9”) and I'll add those.`;
-      await store.appendMessage(conversationId, { role: "assistant", content: answer });
-      return { status: 200, body: { conversationId, reply: answer, selection: current, added: [], removed: [], canUndo: canUndo(conversationId), understood: false, source: "offline" } };
+    // Probe only what this turn touched, and never let a probe failure cost the turn.
+    const touched = new Set(turn.dependencies.map((d) => d.id));
+    if (touched.size) {
+      try {
+        const h = await getHandle(rec);
+        const refOf = (member: MemberId, table: string): string | null => {
+          const t = rec.allTables.find((x) => x.name.toLowerCase() === table.toLowerCase()
+            && (!parts.length || memberOf(x.name) === member));
+          return t?.ref ?? null;
+        };
+        const probed = await probeOverlap(
+          validated.filter((d) => touched.has(d.id)),
+          refOf,
+          async (sql) => ({ rows: await h.readAll(sql, "dependency overlap probe") }),
+        );
+        validated = mergeDependencies(validated, probed);
+      } catch (err: any) {
+        console.warn(`[dependency] probe unavailable: ${describeError(err)}`);
+      }
     }
-    ops = offline;
-    source = "offline";
+    captured = validated;
+    reply = turn.reply || "Noted.";
   }
 
-  // ---- analyst pass: the model asked to read the data ----
-  // Runs BEFORE selection ops are applied so a turn can do both ("add orders and
-  // tell me how many are open"). The query is guarded statically, then executed
-  // inside a READ ONLY transaction against the source database.
-  let dataAnswer: string | undefined;
-  let queryNote: string | undefined;
-  // planned.sql is a single string today, but the planner is being widened to
-  // return several — accept both shapes rather than depending on which the model
-  // happened to emit this turn.
-  const plannedSql: string[] = Array.isArray(planned?.sql)
-    ? (planned.sql as unknown[]).map(String).filter(Boolean)
-    : planned?.sql ? [String(planned.sql)] : [];
-  const analysisRowCap = Number(process.env.DB_ANALYSIS_ROW_CAP ?? 200);
-  // Pre-screen with the SAME guardSelect the loop uses, so a turn the guard will
-  // never run keeps its specific message ("I couldn't run that safely") instead of
-  // being handed to the composer to explain. One guard, applied twice.
-  const screened = plannedSql.map((raw) => ({ raw, g: guardSelect(raw, analysisRowCap) }));
-  const runnable = screened.filter((s) => s.g.ok).map((s) => s.raw);
-  const firstRejected = screened.find((s) => !s.g.ok);
-  if (plannedSql.length && !runnable.length && firstRejected) {
-    queryNote = `I couldn't run that safely (${(firstRejected.g as { ok: false; error: string }).error}).`;
-    console.warn(`[selection] query rejected: ${(firstRejected.g as { ok: false; error: string }).error} — ${firstRejected.raw.slice(0, 200)}`);
-  } else if (runnable.length) {
-    try {
-      // Caps are OMITTED on purpose: interpret.ts's T2SQL_SELECT_* defaults are
-      // this path's own limits, and this path is the tight one — it queries
-      // whatever production database the user pasted a string for.
-      const result = await runChatAnalyst(
-        { prompt, plannedSql: runnable, history },
-        {
-          runQuery: (sql) => (deps.runQuery ?? nativeQuery)(rec.conn, sql),
-          guard: guardSelect,
-          // deps.answer is the injected composer the offline tests supply; fall
-          // back to the real model only when nothing was injected.
-          model: (system, user) => (deps.answer ?? callGemini)(system, user, ORCHESTRATE_OPTS),
-          rowCap: analysisRowCap,
-          onQuery: deps.onQuery,
-        },
-      );
-      dataAnswer = result.answer ?? fallbackSummary(result.outcomes);
-      // A guard rejection or a failed query is information the user can act on
-      // (usually a wrong column or a permission gap), so surface it rather than
-      // letting it vanish into the prose.
-      // Surface a failure even when the composer still produced prose: the
-      // database's own message ("column \"widget\" does not exist") is usually
-      // the most actionable thing in the turn, and must not vanish into it.
-      const bad = result.outcomes.filter((o) => !o.ok);
-      if (bad.length) queryNote = `That query failed: ${bad[0].error}`;
-    } catch (err: any) {
-      queryNote = `That query failed: ${describeError(err)}`;
-      console.warn(`[selection] analyst failed:`, err?.stack ?? err);
-    }
-  }
+  await setDependencies(conversationId, tenantId, captured);
+  console.log(`[dependency] ${captured.length} captured (${captured.filter((d) => d.confidence === "rejected").length} rejected)`);
 
-  const result = applyOps(current, ops ?? [], catalog, state.columns);
-
-  // "undo" rewinds the store rather than computing a new set.
-  if (result.undo) {
-    const undone = await undoSelection(conversationId, tenantId);
-    const answer = modelReply?.trim() || (undone
-      ? `Undone — back to ${undone.tables.length} selected table${undone.tables.length === 1 ? "" : "s"}${undone.tables.length ? `: ${undone.tables.slice(0, 12).join(", ")}${undone.tables.length > 12 ? ", …" : ""}` : ""}.`
-      : "There's nothing to undo yet.");
-    await store.appendMessage(conversationId, {
-      role: "assistant", content: answer,
-      briefJson: JSON.stringify({ intent: "selection", op: "undo", selection: undone?.tables ?? current }),
-    });
-    return { status: 200, body: { conversationId, reply: answer, selection: undone?.tables ?? current, added: [], removed: [], canUndo: canUndo(conversationId), understood: true, source } };
-  }
-
-  // Persist only when the set actually moved, so the undo stack stays meaningful.
-  const colsChanged = JSON.stringify(result.columns) !== JSON.stringify(state.columns);
-  const changed = result.added.length > 0 || result.removed.length > 0 || colsChanged;
-  if (changed) {
-    await setSelection(conversationId, tenantId, result.selection, {
-      connectionId: rec.id, connectionLabel: rec.label, columns: result.columns,
-    });
-  }
-
-  // The model's words are the reply — this is a conversation, not a form. The
-  // server only appends what the model can actually be wrong about: names that
-  // don't exist and names that matched several tables.
-  // The data answer leads when there is one — it's what was asked. Selection
-  // changes and corrections follow, so nothing happens silently.
-  let reply = dataAnswer || modelReply?.trim() || summarizeApply(result, catalog.length);
-  if (dataAnswer && (result.added.length || result.removed.length)) {
-    reply = `${reply}\n\n${summarizeApply(result, catalog.length)}`;
-  }
-  if (queryNote) reply = `${queryNote}${reply === queryNote ? "" : `\n\n${reply}`}`;
-  if (!dataAnswer && modelReply?.trim()) {
-    const note = correctionNote(result);
-    if (note) reply = `${reply}\n\n${note}`;
-  }
-
-  await store.appendMessage(conversationId, {
-    role: "assistant",
-    content: reply,
-    briefJson: JSON.stringify({ intent: "selection", ops, selection: result.selection, source }),
-  });
-
+  await store.appendMessage(conversationId, { role: "assistant", content: reply });
   return {
     status: 200,
     body: {
       conversationId,
       reply,
-      selection: result.selection,
-      columns: result.columns,
-      added: result.added,
-      removed: result.removed,
-      unresolved: result.unresolved,
-      ambiguous: result.ambiguous,
-      ...(result.focus ? { focus: result.focus } : {}),
+      dependencies: captured,
+      // Selection is untouched by this chat now — returned so the page keeps one
+      // shape and the rail doesn't have to guess.
+      selection: state.tables,
+      columns: state.columns,
+      added: [], removed: [],
       canUndo: canUndo(conversationId),
-      understood: true,
-      source,
+      understood: !!turn,
+      source: turn ? "model" : "offline",
     },
   };
 }
+
+/** Retired with Stage 3: the chat used to plan selection ops and answer data
+ *  questions. Kept only so the old code path is obviously gone rather than
+ *  half-present. */
 
 // ---- GET /api/sql/selection/:conversationId — rehydrate after a reload -------------
 export async function handleSelectionGet(conversationId: string, tenantId: string, deps: SelectionDeps = {}): Promise<Out> {
@@ -423,6 +372,9 @@ async function handleSelectionGetInner(conversationId: string, tenantId: string,
       connectionLabel: state.connectionLabel ?? null,
       canUndo: canUndo(id),
       turns,
+      // Durable across reloads: the dependency list is the user's only view of
+      // what the system believes, so it must come back with the selection.
+      dependencies: state.dependencies ?? [],
     },
   };
 }
@@ -575,6 +527,11 @@ export function handleCatalog(connectionId: string, tenantId: string): Out {
       mode: rec.mode ?? null,
       status: rec.status,
       tables: catalogView(rec),
+      // One entry per database, in attach order. Always present — a single
+      // connection reports one synthetic member so the UI has no special case.
+      members: rec.groupParts?.length
+        ? rec.groupParts.map((p) => ({ id: p.id, label: p.label }))
+        : [{ id: soloMemberId(rec), label: rec.label }],
       warnings: rec.warnings,
     },
   };
@@ -663,6 +620,68 @@ async function handleSelectionCommitInner(body: unknown, tenantId: string, deps:
     // still hold tables the user has since deselected.
     const wanted = new Set(tables);
     staged.tables = staged.tables.filter((t) => wanted.has(t.tableName));
+
+    // ---- the combined schema layer -------------------------------------------------
+    // Tables stay staged AS-IS. This adds a SECOND layer beside them: views over
+    // the declared joins, plus a prose directive for the planner. Without it a
+    // planner sees `orders` and `customers` side by side with no way to know which
+    // column relates them, or that one row of one explains forty of the other.
+    //
+    // Entirely best-effort. A view that fails to build is a warning, never a
+    // failed commit — the raw tables are the valuable part and they are already
+    // extracted by this point.
+    let combinedSchema: string | undefined;
+    const viewWarnings: string[] = [];
+    try {
+      const captured = (await getSelection(conversationId, tenantId)).dependencies ?? [];
+      if (captured.length) {
+        // member comes from origin.memberId — the STABLE id stamped at snapshot
+        // time. Never origin.catalog: that is `src{i}`, positional, and shifts
+        // the moment a database is removed from the group.
+        const stagedTables: StagedTable[] = staged.tables
+          .map((t: any) => (t.origin?.memberId
+            ? { member: String(t.origin.memberId), sourceTable: String(t.origin.table), localName: t.tableName }
+            : null))
+          .filter(Boolean) as StagedTable[];
+
+        const graph = buildJoinGraph(captured, stagedTables);
+        viewWarnings.push(...graph.warnings);
+
+        const columnsOf = (localName: string): string[] =>
+          staged.tables.find((t) => t.tableName === localName)?.profile.columns.map((c: any) => String(c.name)) ?? [];
+        const ddl = viewDdl(graph, columnsOf);
+
+        if (ddl.length) {
+          onPhase(`building ${ddl.length} combined view(s)`);
+          const { DuckDBInstance } = await import("@duckdb/node-api");
+          await releaseInstance(stagingDbPath(conversationId));
+          const inst = await DuckDBInstance.create(stagingDbPath(conversationId));
+          const c = await inst.connect();
+          try {
+            for (const sql of ddl) {
+              try { await c.run(sql); }
+              catch (e: any) {
+                // One broken view must not cost the user tables that extracted fine.
+                const msg = `combined view skipped: ${(e?.message ?? e).toString().slice(0, 200)}`;
+                console.warn(`[combined-schema] ${msg}`);
+                viewWarnings.push(msg);
+              }
+            }
+          } finally {
+            c.disconnectSync();
+            inst.closeSync();
+          }
+        }
+        combinedSchema = describeCombinedSchema(graph, captured);
+        console.log(`[combined-schema] ${graph.components.length} component(s), ${ddl.length} view(s), ${graph.isolated.length} isolated`);
+      }
+    } catch (err: any) {
+      // Never fail a commit over the extra layer.
+      const msg = `combined schema unavailable: ${describeError(err)}`;
+      console.warn(`[combined-schema] ${msg}`);
+      viewWarnings.push(msg);
+    }
+
     const source = finalizeStaged(conversationId, label);
     await dropSelection(conversationId, tenantId); // published — the stage is now a source
     await store.appendMessage(conversationId, {
@@ -678,7 +697,11 @@ async function handleSelectionCommitInner(body: unknown, tenantId: string, deps:
         label: source.label,
         tables: source.tables,
         mode: "snapshot" as const,
-        warnings: [...warnings, ...skipped, ...colWarnings],
+        // Sibling to `evidence`, never a replacement: a build can legitimately
+        // have analyst findings AND join semantics, and they are spent
+        // differently (see ChatPage — evidence is first-build-only, this is not).
+        ...(combinedSchema ? { combinedSchema } : {}),
+        warnings: [...warnings, ...skipped, ...colWarnings, ...viewWarnings],
       },
     };
   } catch (err: any) {

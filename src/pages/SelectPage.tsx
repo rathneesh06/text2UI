@@ -16,8 +16,9 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { useNavigate } from "react-router-dom";
 import ChatMarkdown from "../components/ChatMarkdown";
+import type { Dependency } from "../../shared/dependencies";
 import {
-  wbConnect, wbCatalog, wbProfile, wbSelect, wbSelectStream, wbSetSelection, wbGetSelection,
+  wbConnect, wbCatalog, wbProfile, wbSelect, wbSelectStream, wbSetSelection, wbGetSelection, wbRemoveMember,
   wbCommitSelection, wbSchema,
   type WbCatalogTable, type WbTableDetail, type WbExtracted,
 } from "../workbench-api";
@@ -50,6 +51,13 @@ export default function SelectPage({ onUseWorkbenchSource }: SelectPageProps) {
   const [connError, setConnError] = useState<string | null>(null);
 
   const [catalog, setCatalog] = useState<WbCatalogTable[]>([]);
+  // One tab per database, in attach order. Always at least one — a single
+  // connection reports one synthetic member, so there is no non-tabbed mode.
+  const [members, setMembers] = useState<{ id: string; label: string }[]>([]);
+  // Which tab is in view, by STABLE id. Never an index: removing a member
+  // renumbers positions, and a position held here would jump to another database.
+  const [activeMember, setActiveMember] = useState<string | null>(null);
+  const [addingMember, setAddingMember] = useState(false);
   const [selection, setSelection] = useState<string[]>([]);
   // Per-table column narrowing. A table absent here stores EVERY column, which
   // is the default and the common case — only narrowed tables are tracked.
@@ -61,6 +69,9 @@ export default function SelectPage({ onUseWorkbenchSource }: SelectPageProps) {
 
   const [conversationId, setConversationId] = useState<string | null>(null);
   const [turns, setTurns] = useState<Turn[]>([]);
+  /** Cross-database relationships captured by the chat. Durable server-side for
+   *  the whole conversation; mirrored here so the list is visible and correctable. */
+  const [dependencies, setDependencies] = useState<Dependency[]>([]);
   const [prompt, setPrompt] = useState("");
   const [busy, setBusy] = useState(false);
   const [filter, setFilter] = useState("");
@@ -90,6 +101,8 @@ export default function SelectPage({ onUseWorkbenchSource }: SelectPageProps) {
           setConnLabel(c.label);
           const cat = await wbCatalog(c.connectionId);
           setCatalog(cat.tables);
+          setMembers(cat.members ?? []);
+          setActiveMember(cat.members?.[0]?.id ?? null);
         })
         .catch(() => { try { sessionStorage.removeItem(CONN_KEY); } catch { /* ignore */ } });
     }
@@ -98,6 +111,7 @@ export default function SelectPage({ onUseWorkbenchSource }: SelectPageProps) {
         .then((r) => {
           setConversationId(savedConv);
           setSelection(r.selection);
+          if (r.dependencies) setDependencies(r.dependencies);
           setColSel(r.columns ?? {});
           setTurns(
             r.turns
@@ -108,6 +122,79 @@ export default function SelectPage({ onUseWorkbenchSource }: SelectPageProps) {
         .catch(() => { /* stale conversation — a fresh one starts on the first turn */ });
     }
   }, []);
+
+  // ---- tabs: add / close a database ---------------------------------------------
+  /** The `+` tab. Reuses the SAME addTo path connect() already uses for pasted
+   *  multi-line strings — one connect flow, not two. */
+  const addMember = useCallback(async () => {
+    const raw = connStr.trim();
+    if (!raw || !connectionId || connecting) return;
+    setConnecting(true);
+    setConnError(null);
+    try {
+      const lines = raw.split(/[;\n]+/).map((l) => l.trim()).filter(Boolean);
+      let c = { connectionId } as { connectionId: string };
+      for (const line of lines) c = await wbConnect(line, c.connectionId, undefined, { fast: true });
+      setConnectionId(c.connectionId);
+      try { sessionStorage.setItem(CONN_KEY, c.connectionId); } catch { /* private mode */ }
+      const cat = await wbCatalog(c.connectionId);
+      setCatalog(cat.tables);
+      setMembers(cat.members ?? []);
+      setConnLabel(cat.label);
+      // Land on the database just added.
+      setActiveMember(cat.members?.[cat.members.length - 1]?.id ?? null);
+      setConnStr("");
+      setAddingMember(false);
+    } catch (e: any) {
+      setConnError(e?.message ?? "could not add that database");
+    } finally {
+      setConnecting(false);
+    }
+  }, [connStr, connectionId, connecting]);
+
+  /** Close a database tab. Confirms first, then reports exactly which ticks went
+   *  with it — silently un-ticking a table the user chose is the failure mode. */
+  const closeMember = useCallback(async (id: string, label: string) => {
+    if (!connectionId) return;
+    const picked = catalog.filter((t) => t.memberId === id && selection.includes(t.name)).length;
+    const warn = picked
+      ? `\n\n${picked} selected table${picked === 1 ? "" : "s"} from it will be un-ticked.`
+      : "";
+    if (!window.confirm(`Remove ${label}?${warn}`)) return;
+    try {
+      const r = await wbRemoveMember(connectionId, id, conversationId ?? undefined);
+      if (!r.connectionId) {
+        // Last database closed — back to the connect form.
+        setConnectionId(null); setConnLabel(""); setCatalog([]); setMembers([]);
+        setActiveMember(null); setSelection([]); setColSel({}); setActive(null); setDetails({});
+        try { sessionStorage.removeItem(CONN_KEY); } catch { /* ignore */ }
+        setNotice(`Removed ${r.removedLabel ?? label}. No databases left.`);
+        return;
+      }
+      const cat = await wbCatalog(r.connectionId);
+      setCatalog(cat.tables);
+      setMembers(cat.members ?? []);
+      setConnLabel(cat.label);
+      setActiveMember((prev) => (prev === id ? cat.members?.[0]?.id ?? null : prev));
+      if (r.prunedTables?.length) {
+        setSelection((prev) => prev.filter((t) => !r.prunedTables.includes(t)));
+        setColSel((prev) => {
+          const next = { ...prev };
+          for (const t of r.prunedTables) delete next[t];
+          return next;
+        });
+      }
+      setActive((prev) => (prev && r.prunedTables?.includes(prev) ? null : prev));
+      setNotice(
+        `Removed ${r.removedLabel ?? label}.` +
+        (r.prunedTables?.length
+          ? ` Un-ticked ${r.prunedTables.length} table${r.prunedTables.length === 1 ? "" : "s"} that came from it: ${r.prunedTables.slice(0, 8).join(", ")}${r.prunedTables.length > 8 ? ", …" : ""}.`
+          : " No selected tables were affected."),
+      );
+    } catch (e: any) {
+      setNotice(`Could not remove ${label}: ${e?.message ?? e}`);
+    }
+  }, [connectionId, conversationId, catalog, selection]);
 
   // ---- connect ----------------------------------------------------------------
   const connect = useCallback(async () => {
@@ -129,6 +216,8 @@ export default function SelectPage({ onUseWorkbenchSource }: SelectPageProps) {
       try { sessionStorage.setItem(CONN_KEY, c.connectionId); } catch { /* private mode */ }
       const cat = await wbCatalog(c.connectionId);
       setCatalog(cat.tables);
+      setMembers(cat.members ?? []);
+      setActiveMember(cat.members?.[0]?.id ?? null);
       setSelection([]);
       setColSel({});
       setActive(null);
@@ -229,6 +318,7 @@ export default function SelectPage({ onUseWorkbenchSource }: SelectPageProps) {
             // The rail must not wait for the prose to finish.
             if (Array.isArray(ev.selection)) setSelection(ev.selection);
             if (ev.columns) setColSel(ev.columns);
+            if (ev.dependencies) setDependencies(ev.dependencies);
             if (ev.focus) void openTable(ev.focus);
           }
         });
@@ -248,6 +338,7 @@ export default function SelectPage({ onUseWorkbenchSource }: SelectPageProps) {
         remember(r.conversationId);
         setSelection(r.selection);
         if (r.columns) setColSel(r.columns);
+        if (r.dependencies) setDependencies(r.dependencies);
         setTurns((prev) => [...prev, { role: "assistant", text: r.reply }]);
         if (r.focus) void openTable(r.focus);
       }
@@ -309,11 +400,36 @@ export default function SelectPage({ onUseWorkbenchSource }: SelectPageProps) {
     void pushSelection(selection, on || !all.length ? rest : { ...rest, [table]: [all[0]] });
   }, [colSel, details, selection, pushSelection]);
 
+  /** Tables belonging to the tab in view, matched on the stable memberId the
+   *  server stamped. A table with no memberId (older payload) stays visible
+   *  rather than vanishing from every tab. */
+  const inActiveTab = useMemo(() => {
+    if (!activeMember || members.length <= 1) return catalog;
+    return catalog.filter((t) => !t.memberId || t.memberId === activeMember);
+  }, [catalog, activeMember, members.length]);
+
   const shown = useMemo(() => {
     const q = filter.trim().toLowerCase();
-    if (!q) return catalog;
-    return catalog.filter((t) => t.name.toLowerCase().includes(q) || String(t.index) === q);
-  }, [catalog, filter]);
+    if (!q) return inActiveTab;
+    return inActiveTab.filter((t) => t.name.toLowerCase().includes(q) || String(t.index) === q);
+  }, [inActiveTab, filter]);
+
+  /** Selection is GLOBAL across tabs, so a user on tab 3 must be able to see the
+   *  ticks they left on tab 1 — otherwise those selections are invisible. */
+  const selectedPerMember = useMemo(() => {
+    const counts = new Map<string, number>();
+    const picked = new Set(selection);
+    for (const t of catalog) {
+      if (!t.memberId || !picked.has(t.name)) continue;
+      counts.set(t.memberId, (counts.get(t.memberId) ?? 0) + 1);
+    }
+    return counts;
+  }, [catalog, selection]);
+
+  const labelForMember = useMemo(
+    () => new Map(members.map((m) => [m.id, m.label])),
+    [members],
+  );
 
   const detail = active ? details[active] : undefined;
 
@@ -372,8 +488,59 @@ export default function SelectPage({ onUseWorkbenchSource }: SelectPageProps) {
         <aside className="sel-rail">
           <div className="sel-rail__head">
             <span>Tables</span>
-            <span className="sel-count">{catalog.length}</span>
+            <span className="sel-count">{members.length > 1 ? `${inActiveTab.length}/${catalog.length}` : catalog.length}</span>
           </div>
+          {/* ---- one tab per database ---- */}
+          {connectionId && (
+            <div className="sel-tabs" role="tablist">
+              {members.map((m) => {
+                const n = selectedPerMember.get(m.id) ?? 0;
+                return (
+                  <div
+                    key={m.id}
+                    role="tab"
+                    aria-selected={activeMember === m.id}
+                    className={`sel-tab${activeMember === m.id ? " sel-tab--on" : ""}`}
+                    onClick={() => setActiveMember(m.id)}
+                    title={m.label}
+                  >
+                    <span className="sel-tab__label">{m.label}</span>
+                    {n > 0 && <span className="sel-tab__n" title={`${n} selected in this database`}>{n}</span>}
+                    <button
+                      type="button"
+                      className="sel-tab__x"
+                      aria-label={`remove ${m.label}`}
+                      title={`Remove ${m.label}`}
+                      onClick={(e) => { e.stopPropagation(); void closeMember(m.id, m.label); }}
+                    >×</button>
+                  </div>
+                );
+              })}
+              <button
+                type="button"
+                className="sel-tab sel-tab--add"
+                title="Add another database"
+                onClick={() => setAddingMember((v) => !v)}
+              >+</button>
+            </div>
+          )}
+          {connectionId && addingMember && (
+            <div className="sel-addmember">
+              <input
+                className="sel-input sel-input--mono"
+                type="password"
+                autoComplete="off"
+                placeholder="postgres://…  (one per line adds several)"
+                value={connStr}
+                onChange={(e) => setConnStr(e.target.value)}
+                onKeyDown={(e) => e.key === "Enter" && addMember()}
+                disabled={connecting}
+              />
+              <button type="button" className="sel-btn" onClick={addMember} disabled={connecting || !connStr.trim()}>
+                {connecting ? "Adding…" : "Add"}
+              </button>
+            </div>
+          )}
           {connectionId ? (
             <>
               <input
@@ -398,6 +565,14 @@ export default function SelectPage({ onUseWorkbenchSource }: SelectPageProps) {
                     />
                     <span className="sel-row__n">{t.index}</span>
                     <span className="sel-row__name">{t.name}</span>
+                    {/* Which database, always — the merged catalog suffixes
+                        collisions (users, users_2), so without this two
+                        similarly-named tables are indistinguishable. */}
+                    {members.length > 1 && t.memberId && (
+                      <span className="sel-row__db" title={labelForMember.get(t.memberId) ?? ""}>
+                        {labelForMember.get(t.memberId) ?? "?"}
+                      </span>
+                    )}
                   </div>
                 ))}
                 {!shown.length && <div className="sel-empty">No table matches “{filter}”.</div>}
@@ -519,6 +694,32 @@ export default function SelectPage({ onUseWorkbenchSource }: SelectPageProps) {
           ))}
           {busy && <div className="sel-msg sel-msg--assistant sel-msg--busy">Working…</div>}
         </div>
+
+        {/* What the system believes about how these databases relate. Rendered
+            because an invisible dependency list is one nobody corrects — a
+            rejected entry is feedback, not an error to hide. */}
+        {dependencies.length > 0 && (
+          <div className="sel-deps">
+            <div className="sel-deps__head">
+              <span>Relationships ({dependencies.length})</span>
+            </div>
+            {dependencies.map((d) => (
+              <div key={d.id} className={`sel-dep sel-dep--${d.confidence}`}>
+                <div className="sel-dep__top">
+                  <span className={`sel-dep__badge sel-dep__badge--${d.confidence}`}>{d.confidence}</span>
+                  <span className="sel-dep__kind">{d.kind}</span>
+                  {d.kind === "join" && d.overlap && (
+                    <span className="sel-dep__overlap" title="sampled values that matched">
+                      {d.overlap.matched}/{d.overlap.sampled} matched
+                    </span>
+                  )}
+                </div>
+                <div className="sel-dep__stmt">{d.statement}</div>
+                {d.note && <div className="sel-dep__note">{d.note}</div>}
+              </div>
+            ))}
+          </div>
+        )}
 
         <div className="sel-composer">
           <input

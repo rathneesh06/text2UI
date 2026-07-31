@@ -2,6 +2,7 @@
 // Kept beside api.ts rather than inside it so the workbench feature lands as an
 // additive module; mirrors api.ts's request conventions (auth header, dbg log).
 import type { Dataset, DataProfile } from "../shared/types";
+import type { Dependency } from "../shared/dependencies";
 import { BFF_URL, dbg } from "./api";
 
 function authHeaders(): Record<string, string> {
@@ -34,11 +35,34 @@ export interface WbConnection {
   connectionId: string;
   status?: "active" | "degraded";
   label: string;
-  allTables: { name: string; approxRows: number; schema?: string; ref?: string }[];
+  /** `memberId` is stamped SERVER-SIDE from each table's ref. Never re-derive it
+   *  by parsing `src{i}.` here: that index is attach-scoped and shifts when a
+   *  member is removed, which is what the stable ids exist to prevent. */
+  allTables: { name: string; approxRows: number; schema?: string; ref?: string; memberId?: string | null }[];
   datasets: Dataset[];
   warnings: string[];
-  /** al3: present when this "connection" is a GROUP of databases. */
-  members?: string[];
+  /** One entry per database. Always present — a single connection reports one
+   *  synthetic member, so the client has no special case. */
+  members: { id: string; label: string }[];
+}
+
+/** Response to closing a database tab. `connectionId: null` means the last
+ *  member went and the connection is closed. */
+export interface WbMemberRemoved extends Omit<Partial<WbConnection>, "connectionId"> {
+  connectionId: string | null;
+  closed?: boolean;
+  removedLabel: string | null;
+  /** Selected tables that came from the removed database — surfaced to the user
+   *  rather than silently un-ticked. */
+  prunedTables: string[];
+}
+
+/** Close one database. Keyed on the stable member id, never a position. */
+export function wbRemoveMember(connectionId: string, memberId: string, conversationId?: string): Promise<WbMemberRemoved> {
+  return request<WbMemberRemoved>(
+    `/api/sql/${encodeURIComponent(connectionId)}/members/${encodeURIComponent(memberId)}/remove`,
+    { method: "POST", body: JSON.stringify({ ...(conversationId ? { conversationId } : {}) }) },
+  );
 }
 
 export interface WbExtracted {
@@ -48,6 +72,10 @@ export interface WbExtracted {
   /** al1: analyst-loop findings, present on build handoffs when T2SQL_ANALYST=1 —
    *  carried into the first dashboard build as its analytical directive. */
   evidence?: string;
+  /** Stage 4: how the selected tables relate across databases. Unlike `evidence`
+   *  this is NOT spent on the first build — a user editing three turns later
+   *  still needs to know the join semantics. */
+  combinedSchema?: string;
 }
 
 /** Connect + introspect. The connection string is sent once over the wire and the
@@ -103,6 +131,9 @@ export interface WbCatalogTable {
   approxRows: number;
   profiled: boolean;      // false -> clicking it needs a wbProfile round-trip
   columnCount: number | null;
+  /** Which database this table came from. Stamped server-side — do NOT derive it
+   *  by parsing a ref's `src{i}` prefix; that index shifts on member removal. */
+  memberId?: string | null;
 }
 export interface WbColumn {
   name: string;
@@ -131,10 +162,12 @@ export interface WbSelectionReply {
   canUndo: boolean;
   understood: boolean;
   source?: "model" | "offline";   // "offline" = the model was unreachable
+  /** Cross-database relationships captured so far in this conversation. */
+  dependencies?: Dependency[];
 }
 
 /** The rail's list: every table, numbered as the user sees it. */
-export function wbCatalog(connectionId: string): Promise<{ connectionId: string; label: string; tables: WbCatalogTable[]; warnings: string[] }> {
+export function wbCatalog(connectionId: string): Promise<{ connectionId: string; label: string; tables: WbCatalogTable[]; members: { id: string; label: string }[]; warnings: string[] }> {
   return request(`/api/sql/${encodeURIComponent(connectionId)}/catalog`);
 }
 
@@ -206,7 +239,7 @@ export function wbSetSelection(body: { connectionId: string; conversationId?: st
 }
 
 /** Rehydrate selection + transcript after a reload. */
-export function wbGetSelection(conversationId: string): Promise<{ conversationId: string; selection: string[]; columns: Record<string, string[]>; connectionId: string | null; connectionLabel: string | null; canUndo: boolean; turns: { role: string; content: string }[] }> {
+export function wbGetSelection(conversationId: string): Promise<{ conversationId: string; selection: string[]; columns: Record<string, string[]>; connectionId: string | null; connectionLabel: string | null; canUndo: boolean; turns: { role: string; content: string }[]; dependencies?: Dependency[] }> {
   return request(`/api/sql/selection/${encodeURIComponent(conversationId)}`);
 }
 

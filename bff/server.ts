@@ -21,7 +21,7 @@ import { buildExportZip, buildConnectedZip } from "./export";
 import { generateReport } from "./report";
 import { COLO_PROJECT_ID, COLO_LABEL, coloAvailable, coloProfiles, coloQuery } from "./sources/colo";
 import { isWorkbenchProject, listWorkbenchSources, wbQuery, removeWorkbenchSource } from "./sources/workbench-store";
-import { handleSqlConnect, handleSqlSchema, handleSqlStageDiscard, handleSourceChat, handleCombineSources, liveQuery, LIVE_PREFIX } from "./text2sql/handler";
+import { handleSqlConnect, handleSqlSchema, handleSqlStageDiscard, handleSourceChat, handleCombineSources, handleRemoveMember, liveQuery, LIVE_PREFIX } from "./text2sql/handler";
 import { handleSelectionChat, handleSelectionGet, handleSelectionSet, handleSelectionCommit, handleTableProfile, handleCatalog, describeError, chatStoreDegraded } from "./text2sql/selection-handler";
 import { selectionStoreDegraded } from "./sources/selection-store";
 import { streamingComposer } from "./text2sql/stream-compose";
@@ -1193,6 +1193,16 @@ export function createServer() {
       send({ type: "error", error: describeError(err) || "the source chat stream failed" });
     }
     res.end();
+  });
+
+  // Close a database tab. Literal-ish segments ("members", "remove") make this
+  // more specific than /api/sql/:connectionId/profile, but it is registered ahead
+  // of every parameterised /api/sql/:connectionId/... route regardless.
+  app.post("/api/sql/:connectionId/members/:memberId/remove", async (req, res) => {
+    const { status, body } = await handleRemoveMember(
+      String(req.params.connectionId), String(req.params.memberId), req.body, req.tenantId ?? DEV_TENANT,
+    );
+    res.status(status).json(body);
   });
 
   app.get("/api/sql/:connectionId/schema", (req, res) => {

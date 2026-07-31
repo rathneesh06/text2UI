@@ -162,57 +162,19 @@ const store = new InMemoryChatStore();
 const CONV = "conv_seltest";
 const plan = (obj: unknown) => async () => ({ text: JSON.stringify(obj), finishReason: "STOP" } as any);
 
-// The model's ops are applied and the selection is persisted server-side.
-{
-  const r = await handleSelectionChat(
-    { connectionId: rec.id, conversationId: CONV, prompt: "select tables 1, 2 and 4" },
-    TENANT,
-    { chatStore: store, plan: plan({ reply: "Added orders, order_items and payments.", ops: [{ op: "add", refs: ["1", "2", "4"] }] }) },
-  );
-  assert.equal(r.status, 200, JSON.stringify(r.body));
-  assert.deepEqual(r.body.selection, ["orders", "order_items", "payments"]);
-  assert.equal(r.body.reply, "Added orders, order_items and payments.", "the model's words are the reply");
-  assert.equal(r.body.source, "model");
-  assert.deepEqual((await getSelection(CONV, TENANT)).tables, ["orders", "order_items", "payments"], "persisted server-side");
-}
 
-// The model is given the live selection and the history to reason over.
-{
-  let sawSelection = "";
-  let sawHistory = false;
-  const spy = async (_s: string, user: string) => {
-    sawSelection = (user.match(/Currently selected \(\d+\): (.*)/) ?? [])[1] ?? "";
-    sawHistory = user.includes("Conversation so far:");
-    return { text: JSON.stringify({ reply: "Added customers.", ops: [{ op: "add", refs: ["customers"] }] }), finishReason: "STOP" } as any;
-  };
-  const r = await handleSelectionChat(
-    { connectionId: rec.id, conversationId: CONV, prompt: "also the customer one" },
-    TENANT,
-    { chatStore: store, plan: spy },
-  );
-  assert.equal(sawSelection, "orders, order_items, payments", "the model sees what's already selected");
-  assert.ok(sawHistory, "the model sees the conversation so far");
-  assert.deepEqual(r.body.selection, ["orders", "order_items", "customers", "payments"], "catalog order preserved");
-  assert.deepEqual(r.body.added, ["customers"]);
-}
 
-// A table the model invented is reported, not selected — and the correction is
-// appended to its reply rather than replacing it.
-{
-  const r = await handleSelectionChat(
-    { connectionId: rec.id, conversationId: CONV, prompt: "add whatever covers money movement" },
-    TENANT,
-    { chatStore: store, plan: plan({ reply: "Pulled in the payment tables.", ops: [{ op: "add", refs: ["payments", "payment_ledger"] }] }) },
-  );
-  assert.ok(!r.body.selection.includes("payment_ledger"), "hallucinated names never enter the selection");
-  assert.deepEqual(r.body.unresolved, ["payment_ledger"]);
-  assert.ok(r.body.reply.startsWith("Pulled in the payment tables."), "the model still speaks first");
-  assert.ok(/couldn't find payment_ledger/i.test(r.body.reply), "…but the user is told what didn't exist");
-}
 
 // Clicking a checkbox edits the same selection AND lands in the transcript, so
 // the next typed turn can refer to it.
+// Seeded explicitly: selection used to arrive via a chat turn, but as of Stage 3
+// the chat captures dependencies and never touches the selection.
 {
+  await handleSelectionSet(
+    { connectionId: rec.id, conversationId: CONV, tables: ["orders", "order_items", "payments"] },
+    TENANT,
+    { chatStore: store },
+  );
   const r = await handleSelectionSet(
     { connectionId: rec.id, conversationId: CONV, tables: ["orders", "customers", "shipments"] },
     TENANT,
@@ -224,70 +186,18 @@ const plan = (obj: unknown) => async () => ({ text: JSON.stringify(obj), finishR
   assert.ok(history.some((m) => m.content.includes("clicked in the table list")), "click recorded as memory");
 }
 
-// Undo rewinds one step, and the model's phrasing is kept when it sent any.
-{
-  const r = await handleSelectionChat(
-    { connectionId: rec.id, conversationId: CONV, prompt: "no wait, go back" },
-    TENANT,
-    { chatStore: store, plan: plan({ reply: "Reverted.", ops: [{ op: "undo" }] }) },
-  );
-  assert.deepEqual(r.body.selection, ["orders", "order_items", "customers", "payments"], "back to the pre-click set");
-  assert.equal(r.body.reply, "Reverted.");
-}
 
-// A question changes nothing and still gets answered.
-{
-  const before = (await getSelection(CONV, TENANT)).tables;
-  const r = await handleSelectionChat(
-    { connectionId: rec.id, conversationId: CONV, prompt: "which of these has a region column?" },
-    TENANT,
-    { chatStore: store, plan: plan({ reply: "orders has region.", ops: [] }) },
-  );
-  assert.equal(r.body.reply, "orders has region.");
-  assert.deepEqual(r.body.selection, before, "a question is not a mutation");
-}
 
-// "focus" opens a table's columns without touching the selection.
-{
-  const before = (await getSelection(CONV, TENANT)).tables;
-  const r = await handleSelectionChat(
-    { connectionId: rec.id, conversationId: CONV, prompt: "what's in shipments?" },
-    TENANT,
-    { chatStore: store, plan: plan({ reply: "Opening shipments.", ops: [{ op: "focus", refs: ["shipments"] }] }) },
-  );
-  assert.equal(r.body.focus, "shipments");
-  assert.deepEqual(r.body.selection, before);
-}
 
-// Model outage: bare numbers still land, anything else degrades honestly.
-{
-  const before = (await getSelection(CONV, TENANT)).tables;
-  const dead = async () => { throw new Error("model down"); };
-
-  const r = await handleSelectionChat(
-    { connectionId: rec.id, conversationId: CONV, prompt: "drop everything except orders" },
-    TENANT,
-    { chatStore: store, plan: dead },
-  );
-  assert.equal(r.body.understood, false);
-  assert.ok(/can't reach the model/i.test(r.body.reply), r.body.reply);
-  assert.deepEqual(r.body.selection, before, "an outage never mutates the selection");
-
-  const r2 = await handleSelectionChat(
-    { connectionId: rec.id, conversationId: CONV, prompt: "10" },
-    TENANT,
-    { chatStore: store, plan: dead },
-  );
-  assert.equal(r2.body.source, "offline");
-  assert.ok(r2.body.selection.includes("shipments"), "a bare number still works offline");
-}
 
 // Rehydration after a reload returns the selection AND the transcript.
 {
   const r = await handleSelectionGet(CONV, TENANT, { chatStore: store });
   assert.equal(r.status, 200);
   assert.deepEqual(r.body.selection, (await getSelection(CONV, TENANT)).tables);
-  assert.ok(r.body.turns.length > 6, "conversation memory survives");
+  // Was >6 when the chat drove selection and every turn added two messages. As of
+  // Stage 3 the transcript here is the two checkbox edits above.
+  assert.ok(r.body.turns.length >= 2, "conversation memory survives");
   assert.equal(r.body.connectionLabel, rec.label);
 }
 
@@ -305,25 +215,6 @@ const plan = (obj: unknown) => async () => ({ text: JSON.stringify(obj), finishR
   assert.ok(/nothing selected/i.test(empty.body.error), empty.body.error);
 }
 
-// The model can narrow columns, and the narrowing is persisted server-side.
-{
-  const r = await handleSelectionChat(
-    { connectionId: rec.id, conversationId: CONV, prompt: "from shipments keep only the id and status" },
-    TENANT,
-    { chatStore: store, plan: plan({ reply: "Narrowed shipments to id and status.", ops: [{ op: "columns", table: "shipments", refs: ["id", "status"] }] }) },
-  );
-  assert.deepEqual(r.body.columns.shipments, ["id", "status"]);
-  assert.ok(r.body.selection.includes("shipments"));
-  assert.deepEqual((await getSelection(CONV, TENANT)).columns.shipments, ["id", "status"], "persisted");
-
-  // A checkbox change to the same table goes through the same state.
-  const set = await handleSelectionSet(
-    { connectionId: rec.id, conversationId: CONV, tables: r.body.selection, columns: { shipments: ["id"] } },
-    TENANT,
-    { chatStore: store },
-  );
-  assert.deepEqual(set.body.columns.shipments, ["id"], "clicking and chatting edit one projection");
-}
 
 // An extract that throws an Error with NO message must still tell the user
 // something. This is the "Extraction failed:" bug: `??` let "" through.
@@ -450,82 +341,6 @@ const plan = (obj: unknown) => async () => ({ text: JSON.stringify(obj), finishR
   assert.deepEqual(step5.body.columns.orders, narrowed, "a table tick leaves column choices alone");
 }
 
-// ---- the analyst pass: answering questions about the DATA ----------------------------
-{
-  const ask = (sql: string) => async () => ({ text: JSON.stringify({ reply: "Let me check.", ops: [], sql }), finishReason: "STOP" } as any);
-  const compose = async () => ({ text: "There are 8,423 system IPs across 190 customers.", finishReason: "STOP" } as any);
-
-  // Happy path: SQL is guarded, executed, and the rows become a sentence.
-  let ranSql = "";
-  const exec: any = async (_conn: unknown, sql: string) => {
-    ranSql = sql;
-    return { columns: ["n"], rows: [{ n: 8423 }], truncated: false, elapsedMs: 12 };
-  };
-  const r = await handleSelectionChat(
-    { connectionId: rec.id, conversationId: "conv_analyst", prompt: "how many system IPs are there?" },
-    TENANT,
-    { chatStore: store, plan: ask("SELECT count(*) AS n FROM orders"), runQuery: exec, answer: compose },
-  );
-  assert.equal(r.status, 200, JSON.stringify(r.body));
-  assert.ok(/8,423/.test(r.body.reply), `answer not surfaced: "${r.body.reply}"`);
-  assert.ok(/LIMIT/i.test(ranSql), "the guard's row cap is applied before execution");
-
-  // A write attempt must never reach the database.
-  let touched = false;
-  const blocked = await handleSelectionChat(
-    { connectionId: rec.id, conversationId: "conv_analyst", prompt: "delete the old rows" },
-    TENANT,
-    {
-      chatStore: store,
-      plan: ask("DELETE FROM orders WHERE id > 0"),
-      runQuery: (async () => { touched = true; throw new Error("should never run"); }) as any,
-      answer: compose,
-    },
-  );
-  assert.equal(touched, false, "a non-SELECT must be rejected before execution");
-  assert.ok(/couldn't run that safely/i.test(blocked.body.reply), blocked.body.reply);
-
-  // A failed query explains itself instead of vanishing.
-  const failed = await handleSelectionChat(
-    { connectionId: rec.id, conversationId: "conv_analyst", prompt: "count the widgets" },
-    TENANT,
-    {
-      chatStore: store,
-      plan: ask("SELECT count(*) FROM orders"),
-      runQuery: (async () => { throw Object.assign(new Error('column "widget" does not exist'), { code: "42703" }); }) as any,
-      answer: compose,
-    },
-  );
-  assert.ok(/query failed/i.test(failed.body.reply), failed.body.reply);
-  assert.ok(/does not exist/.test(failed.body.reply), "the database's own explanation reaches the user");
-
-  // Analysis and selection in one turn: both must land.
-  const both = await handleSelectionChat(
-    { connectionId: rec.id, conversationId: "conv_analyst_2", prompt: "add customers and tell me the count" },
-    TENANT,
-    {
-      chatStore: store,
-      plan: async () => ({ text: JSON.stringify({ reply: "ok", ops: [{ op: "add", refs: ["customers"] }], sql: "SELECT count(*) AS n FROM customers" }), finishReason: "STOP" } as any),
-      runQuery: exec,
-      answer: compose,
-    },
-  );
-  assert.ok(both.body.selection.includes("customers"), "the selection op still applies");
-  assert.ok(/8,423/.test(both.body.reply) && /Added/.test(both.body.reply), `both halves missing: "${both.body.reply}"`);
-
-  // If the composer is down, the rows are still shown rather than swallowed.
-  const rawRows = await handleSelectionChat(
-    { connectionId: rec.id, conversationId: "conv_analyst_3", prompt: "top customers" },
-    TENANT,
-    {
-      chatStore: store,
-      plan: ask("SELECT region, count(*) AS n FROM orders GROUP BY region"),
-      runQuery: (async () => ({ columns: ["region", "n"], rows: [{ region: "APAC", n: 5 }], truncated: false, elapsedMs: 3 })) as any,
-      answer: (async () => { throw new Error("model down"); }) as any,
-    },
-  );
-  assert.ok(/APAC/.test(rawRows.body.reply), `fallback lost the rows: "${rawRows.body.reply}"`);
-}
 
 // ---- the pluggable selection backend ---------------------------------------------
 // Selections now go to Postgres when STORAGE=postgres (so two BFF instances see
@@ -582,6 +397,130 @@ const plan = (obj: unknown) => async () => ({ text: JSON.stringify(obj), finishR
   assert.deepEqual((await getSelection("conv_file", TENANT)).tables, ["payments"], "file backend round-trips");
 
   _resetSelectionsForTest();
+}
+
+// ---- STAGE 3: the chat captures DEPENDENCIES, it no longer selects tables --------
+// The contract under test is the one that matters most for this feature: whatever
+// the user says, something is captured. A statement that cannot be structured into
+// a join must survive as `semantic` rather than being silently dropped.
+{
+  const dep = (obj: unknown) => async () => ({ text: JSON.stringify(obj), finishReason: "STOP" } as any);
+  const CONV_D = "conv_deps";
+  const MEM = "solo_conn_seltest"; // single connection -> one synthetic member
+
+  // A join both ends of which exist in the profiled catalog (orders.id / orders.region).
+  const joined = await handleSelectionChat(
+    { connectionId: rec.id, conversationId: CONV_D, prompt: "orders.id points at customers.id" },
+    TENANT,
+    {
+      chatStore: store,
+      plan: dep({
+        reply: "Captured: orders.id -> customers.id.",
+        dependencies: [{
+          kind: "join",
+          from: { member: MEM, table: "orders", column: "id" },
+          to: { member: MEM, table: "orders", column: "region" },
+          cardinality: "N:1",
+          statement: "orders.id points at customers.id",
+        }],
+      }),
+    },
+  );
+  assert.equal(joined.status, 200, JSON.stringify(joined.body));
+  assert.equal(joined.body.dependencies.length, 1, "the join was captured");
+  assert.equal(joined.body.dependencies[0].kind, "join");
+  assert.equal(joined.body.dependencies[0].confidence, "validated", "columns exist -> validated");
+  assert.deepEqual(joined.body.selection, [], "the chat no longer changes the selection");
+
+  // Unstructurable input MUST be kept verbatim as semantic, never discarded.
+  const semantic = await handleSelectionChat(
+    { connectionId: rec.id, conversationId: CONV_D, prompt: "all amounts are in GBP" },
+    TENANT,
+    {
+      chatStore: store,
+      plan: dep({
+        reply: "Noted.",
+        dependencies: [{ kind: "semantic", scope: [], statement: "all amounts are in GBP" }],
+      }),
+    },
+  );
+  const sem = semantic.body.dependencies.find((d: any) => d.kind === "semantic");
+  assert.ok(sem, "a statement with no join form is still captured");
+  assert.equal(sem.statement, "all amounts are in GBP", "kept VERBATIM");
+  assert.equal(semantic.body.dependencies.length, 2, "and it did not replace the join");
+
+  // A column that does not exist is REJECTED but KEPT — feedback, not garbage —
+  // and the turn still succeeds.
+  const wrong = await handleSelectionChat(
+    { connectionId: rec.id, conversationId: CONV_D, prompt: "orders.nonexistent links to customers.id" },
+    TENANT,
+    {
+      chatStore: store,
+      plan: dep({
+        reply: "I could not find that column.",
+        dependencies: [{
+          kind: "join",
+          from: { member: MEM, table: "orders", column: "nonexistent" },
+          to: { member: MEM, table: "orders", column: "region" },
+          cardinality: "N:1",
+          statement: "orders.nonexistent links to customers.id",
+        }],
+      }),
+    },
+  );
+  assert.equal(wrong.status, 200, "a bad dependency must NOT fail the turn");
+  const bad = wrong.body.dependencies.find((d: any) => d.confidence === "rejected");
+  assert.ok(bad, "kept and marked rejected rather than dropped");
+  assert.match(bad.note ?? "", /nonexistent/i, "the note names what was not found");
+
+  // Restating the same pair UPDATES rather than duplicating (ids are content-derived).
+  const before = wrong.body.dependencies.length;
+  const restated = await handleSelectionChat(
+    { connectionId: rec.id, conversationId: CONV_D, prompt: "actually orders.id to orders.region is one-to-one" },
+    TENANT,
+    {
+      chatStore: store,
+      plan: dep({
+        reply: "Updated.",
+        dependencies: [{
+          kind: "join",
+          from: { member: MEM, table: "orders", column: "id" },
+          to: { member: MEM, table: "orders", column: "region" },
+          cardinality: "1:1",
+          statement: "actually orders.id to orders.region is one-to-one",
+        }],
+      }),
+    },
+  );
+  assert.equal(restated.body.dependencies.length, before, "restating updates in place");
+  const j = restated.body.dependencies.find((d: any) => d.kind === "join" && d.confidence !== "rejected");
+  assert.equal(j.cardinality, "1:1", "the correction won");
+
+  // Deletion by id.
+  const removed = await handleSelectionChat(
+    { connectionId: rec.id, conversationId: CONV_D, prompt: "forget that link" },
+    TENANT,
+    { chatStore: store, plan: dep({ reply: "Removed.", dependencies: [], removeIds: [j.id] }) },
+  );
+  assert.ok(!removed.body.dependencies.some((d: any) => d.id === j.id), "deleted");
+
+  // Durable across turns: the semantic one is still there at the end.
+  assert.ok(
+    removed.body.dependencies.some((d: any) => d.statement === "all amounts are in GBP"),
+    "dependencies persist for the whole conversation",
+  );
+
+  // A dead model must not lose what the user said.
+  const offline = await handleSelectionChat(
+    { connectionId: rec.id, conversationId: CONV_D, prompt: "shipments belong to orders somehow" },
+    TENANT,
+    { chatStore: store, plan: (async () => { throw new Error("model down"); }) as any },
+  );
+  assert.equal(offline.status, 200, "an outage must not fail the turn");
+  assert.ok(
+    offline.body.dependencies.some((d: any) => d.statement === "shipments belong to orders somehow"),
+    "the statement is saved verbatim even with no model",
+  );
 }
 
 console.log("selection.test.ts: all assertions passed ✅");

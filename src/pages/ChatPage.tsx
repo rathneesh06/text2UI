@@ -38,6 +38,9 @@ interface Props {
   initialPrompt: string | null;
   /** al1: analyst-loop evidence riding a workbench handoff (first build only). */
   initialDirective?: string | null;
+  /** Join semantics for the current source. Conversation-scoped and included on
+   *  EVERY turn — unlike initialDirective, which is spent on the first build. */
+  combinedSchema?: string | null;
   onConsumeInitialPrompt: () => void;
   onFiles: (files: FileList | File[]) => void;
   onRemoveSource: (id: string) => void;
@@ -75,7 +78,7 @@ function detectArtifactSwitch(prompt: string): "ppt" | "pdf" | "dashboard" | nul
 }
 
 export default function ChatPage({
-  projectId, tables, initialPrompt, initialDirective = null, onConsumeInitialPrompt,
+  projectId, tables, initialPrompt, initialDirective = null, combinedSchema = null, onConsumeInitialPrompt,
   onFiles, onRemoveSource, fileError, onNewProject, onBuildMeta,
 }: Props) {
   const [turns, setTurns] = useState<Turn[]>([]);
@@ -147,6 +150,24 @@ export default function ChatPage({
   // al1: evidence captured before the initial prompt is consumed; spent on the
   // FIRST successful dashboard build, then cleared (edits use currentSpec).
   const pendingDirective = useRef<string | null>(null);
+  /**
+   * Two directives, spent DIFFERENTLY on purpose.
+   *
+   * pendingDirective (analyst findings) is a one-off observation about the data
+   * as it looked at build time — right to spend on the first build and then drop.
+   *
+   * combinedSchema (how the tables relate) is structural. A user editing the
+   * dashboard three turns later still needs to know that orders joins customers
+   * on customer_ref, so it rides EVERY build and edit turn and is never cleared.
+   */
+  const combinedRef = useRef<string | null>(null);
+  useEffect(() => { combinedRef.current = combinedSchema ?? null; }, [combinedSchema]);
+  const directiveFor = (isFirstBuild: boolean): string | null => {
+    const parts: string[] = [];
+    if (isFirstBuild && pendingDirective.current) parts.push(pendingDirective.current);
+    if (combinedRef.current) parts.push(combinedRef.current);
+    return parts.length ? parts.join("\n\n") : null;
+  };
   const builds = useRef(0);
   const startedRef = useRef(false);
   const threadRef = useRef<HTMLDivElement>(null);
@@ -423,7 +444,7 @@ export default function ChatPage({
           const { app, spec: nextSpec, warnings, summary, noChange } = await buildDashboard({
             datasets, userPrompt: prompt, ...(spec ? { currentSpec: spec } : {}),
             ...(lastBrief.current && !spec ? { brief: lastBrief.current } : {}),
-            ...(pendingDirective.current && !spec ? { analystDirective: pendingDirective.current } : {}),
+            ...((d) => (d ? { analystDirective: d } : {}))(directiveFor(!spec)),
             ...((convIdRef.current ?? conversationId) ? { conversationId: (convIdRef.current ?? conversationId)! } : {}),
             ...(selectedWidget && spec ? { selectedWidget: { id: selectedWidget.id, title: selectedWidget.title } } : {}),
           });
