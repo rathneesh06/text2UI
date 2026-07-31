@@ -243,8 +243,9 @@ export const SELECTION_PLAN_SCHEMA = {
       description: "What you say to the user. Always present. Natural, brief, specific — this IS the conversation.",
     },
     sql: {
-      type: "string",
-      description: "A single read-only SELECT answering a data question the user asked. Only set this when they asked about the DATA, not the schema. Leave unset otherwise.",
+      type: "array",
+      items: { type: "string" },
+      description: "Read-only SELECT queries answering a data question the user asked — usually one, several only when the question genuinely needs them (a total AND its breakdown, two periods to compare). Each must stand alone; they run independently, not in sequence. Only set this when they asked about the DATA, not the schema. Leave unset otherwise.",
     },
     ops: {
       type: "array",
@@ -290,7 +291,7 @@ BE SMART ABOUT WHAT THEY MEAN
 - Follow-on questions ("which of these has an email column?", "how big is orders?") deserve a real answer from the catalog, with ops empty.
 
 ANSWERING QUESTIONS ABOUT THE DATA
-You can read the data, not just the schema. When the user asks something only the rows can answer — "how many tickets per priority?", "which customers have the most hosts?", "is ci_status ever false?", "what date range does this cover?" — put a single read-only SELECT in "sql" and leave ops empty (unless the question also implies a selection change).
+You can read the data, not just the schema. When the user asks something only the rows can answer — "how many tickets per priority?", "which customers have the most hosts?", "is ci_status ever false?", "what date range does this cover?" — put one or more read-only SELECTs in "sql" (at most {{MAX}}) and leave ops empty (unless the question also implies a selection change). Ask for several only when the question genuinely needs them — a total AND its breakdown, or two periods to compare — never to explore. Each query must stand alone; they run independently, not in sequence.
 
 Rules for that SQL:
 - ONE statement, SELECT only. No semicolons, no CTE writes, no DDL/DML — it runs inside a READ ONLY transaction and will be rejected outright.
@@ -378,11 +379,14 @@ export async function planSelectionTurn(
   input: SelectionPlanInput,
   run: PlanSelectionRun = callGemini,
   timeoutMs = PLAN_TIMEOUT_MS,
-): Promise<{ ops: SelOp[]; reply?: string; sql?: string } | null> {
+): Promise<{ ops: SelOp[]; reply?: string; sql?: string | string[] } | null> {
   const timeout = new Promise<null>((resolve) => setTimeout(() => resolve(null), timeoutMs));
-  const call = (async (): Promise<{ ops: SelOp[]; reply?: string; sql?: string } | null> => {
+  const call = (async (): Promise<{ ops: SelOp[]; reply?: string; sql?: string | string[] } | null> => {
     try {
-      const { text } = await run(SYSTEM, buildUserPrompt(input), { ...ORCHESTRATE_OPTS, responseSchema: SELECTION_PLAN_SCHEMA });
+      // {{MAX}} is substituted here rather than baked in, so the cap the model is
+      // told about is the same T2SQL_SELECT_MAX_QUERIES the loop actually enforces.
+      const maxQueries = Math.max(1, Number(process.env.T2SQL_SELECT_MAX_QUERIES ?? 3));
+      const { text } = await run(SYSTEM.replace(/\{\{MAX\}\}/g, String(maxQueries)), buildUserPrompt(input), { ...ORCHESTRATE_OPTS, responseSchema: SELECTION_PLAN_SCHEMA });
       const parsed = JSON.parse(stripFences(text)) as { ops?: unknown; reply?: unknown; sql?: unknown };
       if (!parsed || typeof parsed !== "object") return null;
       const ops: SelOp[] = [];
@@ -397,10 +401,15 @@ export async function planSelectionTurn(
         ops.push({ op: raw.op, ...(refs ? { refs } : {}), ...(raw.table ? { table: String(raw.table) } : {}) });
       }
       const reply = typeof parsed.reply === "string" && parsed.reply.trim() ? parsed.reply.trim() : undefined;
-      const sql = typeof parsed.sql === "string" && parsed.sql.trim() ? parsed.sql.trim() : undefined;
+      // The schema asks for an array, but a model will still hand back a bare
+      // string sometimes — accept both rather than dropping the question.
+      const sqlList = Array.isArray(parsed.sql)
+        ? (parsed.sql as unknown[]).map((s) => String(s).trim()).filter(Boolean)
+        : typeof parsed.sql === "string" && parsed.sql.trim() ? [parsed.sql.trim()] : [];
+      const sql = sqlList.length ? sqlList : undefined;
       // A response with no ops, no words and no query is indistinguishable from a failure.
       if (!ops.length && !reply && !sql) return null;
-      console.log(`[selection] plan: ${ops.map((o) => `${o.op}(${o.refs?.join("|") ?? ""})`).join(" ") || (sql ? "query" : "reply only")}`);
+      console.log(`[selection] plan: ${ops.map((o) => `${o.op}(${o.refs?.join("|") ?? ""})`).join(" ") || (sql ? `query x${sqlList.length}` : "reply only")}`);
       return { ops, reply, sql };
     } catch (err: any) {
       console.warn(`[selection] planner failed: ${err?.message ?? err}`);

@@ -35,7 +35,7 @@ import { guardSelect } from "./guard";
 import { runAnalystLoop, formatEvidenceDirective, compactEvidence, type AnalystRun } from "./analyst";
 import { planSqlTurn, type PlanSqlRun, type SqlTurnPlan } from "./planner";
 import { composeAnswer, composeFallback, type ComposeRun } from "./composer";
-import { runAnalyst, fallbackSummary } from "./interpret";
+import { runChatAnalyst, fallbackSummary } from "./interpret";
 import { callGemini, PLAN_OPTS } from "../aiflow";
 
 // The main chat's analyst caps. Separate env vars from the /select analyst's
@@ -67,6 +67,9 @@ export interface SqlHandlerDeps {
   compose?: ComposeRun;     // Gemini runner for the composer
   analyst?: AnalystRun;     // the analyst loop (tests inject a fake)
   chatStore?: ChatStore;
+  /** Streaming seam: each guarded query as it is about to run, so the SSE route
+   *  can emit a `query` event. Additive — omit it and nothing changes. */
+  onQuery?: (sql: string) => void;
 }
 
 type Out = { status: number; body: any };
@@ -235,13 +238,13 @@ export async function handleSourceChat(body: unknown, tenantId: string, deps: Sq
   }
 
   // Pre-validate so an unsafe plan still gets the specific, actionable message
-  // rather than being explained by the composer. runAnalyst guards again through
+  // rather than being explained by the composer. runChatAnalyst guards again through
   // this same guardSelect — one guard, applied twice, never a second one.
   const guarded = guardSelect(plan.sql ?? "", 500);
   if (!guarded.ok) return say({ answer: `I couldn't form a safe query for that (${guarded.error}). Try rephrasing.` });
 
   const t0 = Date.now();
-  const analyst = await runAnalyst(
+  const analyst = await runChatAnalyst(
     { prompt, plannedSql: [plan.sql ?? ""], history },
     {
       runQuery: async (sql) => {
@@ -255,12 +258,22 @@ export async function handleSourceChat(body: unknown, tenantId: string, deps: Sq
       guard: (sql, rowCap) => guardSelect(sql, rowCap ?? 500),
       model: (system, user) => (deps.compose ?? callGemini)(system, user, PLAN_OPTS),
       rowCap: 500,
+      onQuery: deps.onQuery,
       // Deliberately looser than the /select analyst's T2SQL_ANALYST_* caps: this
       // runs against a local DuckDB snapshot, where an extra query costs
       // milliseconds and cannot put anyone's production database under load.
       maxQueries: SOURCE_MAX_QUERIES(),
       maxRounds: SOURCE_MAX_ROUNDS(),
       budgetMs: SOURCE_BUDGET_MS(),
+      // The deterministic shortcut, restored: one query returning one cell (or
+      // nothing) has no shape to interpret, so skip the composer and save the
+      // round trip. Matches the sibling call site in handleSqlChat.
+      shouldCompose: (outcomes) => {
+        if (outcomes.length !== 1) return true; // several results => worth interpreting
+        const o = outcomes[0];
+        if (!o.ok) return true;                 // a failure needs explaining
+        return !(o.rows.length === 0 || (o.rows.length === 1 && Object.keys(o.rows[0]).length === 1));
+      },
     },
   );
 
@@ -275,9 +288,14 @@ export async function handleSourceChat(body: unknown, tenantId: string, deps: Sq
     durationMs: Date.now() - t0, rowsReturned: rows.length, sourceType: "snapshot" as const,
     queriesRun: analyst.outcomes.length, stoppedBy: analyst.stoppedBy,
   };
-  // fallbackSummary (not composeFallback) because a turn here may hold several
-  // result sets, and it already explains WHY it is terse.
-  const answer = analyst.answer ?? fallbackSummary(analyst.outcomes);
+  // Three sources, in order: the interpretive answer; the deterministic one-liner
+  // when we skipped the composer on purpose (modelDown=false — nothing to
+  // apologise for); and fallbackSummary when the model was asked and didn't
+  // answer, which says so.
+  const answer = analyst.answer
+    ?? (analyst.stoppedBy === "compose_skipped"
+      ? composeFallback({ question: prompt, sql: primary.sql, rows, truncated: primary.truncated }, false)
+      : fallbackSummary(analyst.outcomes));
   return say({ answer, sql: primary.sql, rows: rows.slice(0, 50), columns: primary.columns, executionMeta });
 }
 

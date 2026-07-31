@@ -203,8 +203,80 @@ export type StreamEvent =
   | { type: "chunk"; text: string }
   | { type: "progress"; chars: number }
   | { type: "plan"; text: string }
+  // Added for the chat streams (see chatStream below). Additive on purpose:
+  // ChatPage switches on these, so the existing members must not be restructured.
+  | { type: "token"; text: string }
+  | { type: "query"; sql: string }
   | { type: "done"; app: GeneratedApp }
   | { type: "error"; error: string };
+
+/** What a chat stream finishes with. `generateStream` completes with a
+ *  GeneratedApp; the chat streams complete with prose. */
+export interface ChatStreamResult { reply: string; conversationId: string }
+
+/**
+ * Shared SSE reader for the three chat streams, modelled on generateStream's
+ * getReader() + TextDecoder loop. Kept separate from generateStream because the
+ * two have different `done` payloads and collapsing them would mean restructuring
+ * the union that ChatPage already switches on.
+ *
+ * Throws on transport failure or an `error` event, so every caller can fall back
+ * to its non-streaming twin — a dead stream must never cost the user their turn.
+ */
+async function chatStream(path: string, body: unknown, onEvent: (ev: StreamEvent) => void): Promise<ChatStreamResult> {
+  const url = `${BFF}${path}`;
+  dbg(`→ STREAM ${url}`);
+  const res = await fetch(url, {
+    method: "POST",
+    headers: { "Content-Type": "application/json", ...authHeaders() },
+    body: JSON.stringify(body),
+  });
+  dbg(`← STREAM ${res.status} ${res.headers.get("content-type") ?? ""}`);
+  if (!res.ok) {
+    const json: any = await res.json().catch(() => ({}));
+    throw new Error(json?.error ?? `Stream request failed (HTTP ${res.status})`);
+  }
+  if (!res.body) throw new Error("Stream unavailable");
+
+  const reader = res.body.getReader();
+  const decoder = new TextDecoder();
+  let buffer = "";
+  let out: ChatStreamResult | null = null;
+
+  while (true) {
+    const { done, value } = await reader.read();
+    if (value) buffer += decoder.decode(value, { stream: true });
+
+    let splitIndex: number;
+    while ((splitIndex = buffer.indexOf("\n\n")) !== -1) {
+      const chunk = buffer.slice(0, splitIndex);
+      buffer = buffer.slice(splitIndex + 2);
+      const line = chunk.trim();
+      if (!line || !line.startsWith("data:")) continue;
+      const payload = JSON.parse(line.slice(5).trim()) as any;
+      if (payload.type === "error") throw new Error(payload.error);
+      if (payload.type === "done") {
+        out = { reply: String(payload.reply ?? ""), conversationId: String(payload.conversationId ?? "") };
+        break;
+      }
+      onEvent(payload as StreamEvent);
+    }
+    if (done) break;
+    if (out) break;
+  }
+  if (!out) throw new Error("Stream ended without completion");
+  return out;
+}
+
+/** Streaming twin of the /api/gate call — the conversational (non-build) reply. */
+export function gateTurnStream(body: unknown, onEvent: (ev: StreamEvent) => void): Promise<ChatStreamResult> {
+  return chatStream("/api/gate/stream", body, onEvent);
+}
+
+/** Streaming twin of sourceChat() — data answers in the main build chat. */
+export function sourceChatStream(body: unknown, onEvent: (ev: StreamEvent) => void): Promise<ChatStreamResult> {
+  return chatStream("/api/source/chat/stream", body, onEvent);
+}
 
 export async function generateStream(body: GenerateRequest, onEvent: (ev: StreamEvent) => void): Promise<GeneratedApp> {
   const url = `${BFF}/api/generate/stream`;

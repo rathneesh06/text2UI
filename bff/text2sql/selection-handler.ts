@@ -19,6 +19,7 @@
 // Every typed turn is planned by the MODEL (see selection.ts). The only thing
 // the server decides for itself is whether the names the model emitted exist —
 // resolution and the correction note, never the intent.
+import { randomUUID } from "node:crypto";
 import { getChatStore, InMemoryChatStore, type ChatStore } from "../chat-store";
 import { describeError } from "../sources/describe-error";
 import { getConnection } from "../sources/connection-registry";
@@ -33,6 +34,8 @@ import {
   answerFromRows, applyOps, correctionNote, describeRows, offlineFallback,
   planSelectionTurn, summarizeApply, type PlanSelectionRun, type SelOp,
 } from "./selection";
+import { runChatAnalyst, fallbackSummary } from "./interpret";
+import { callGemini, ORCHESTRATE_OPTS } from "../aiflow";
 import type { Dataset } from "../../shared/types";
 
 type Out = { status: number; body: any };
@@ -96,9 +99,81 @@ export function resilientStore(real: ChatStore): ChatStore {
   }) as ChatStore;
 }
 
-/** The store a handler should use: the caller's (tests inject one), else the
- *  real one wrapped so an outage degrades instead of 500ing. */
-const storeFor = (deps: SelectionDeps): ChatStore => deps.chatStore ?? resilientStore(getChatStore());
+// ---- ephemeral vs durable chat storage -------------------------------------------
+//
+// PRIVACY: a /select answer is composed out of live row values read from whatever
+// production database the user pasted a connection string for. Persisting those
+// turns copied that data into text2ui_messages on the shared flowops box, in
+// plaintext, permanently. Selection turns therefore live in memory only.
+//
+// But the /select conversation is not only a chat: handleSelectionCommit creates
+// the conversation id that BECOMES the main text2UI conversation, and its final
+// "Extracted … Opening the builder…" breadcrumb is the main chat's first message.
+// So "stop persisting" cannot mean "write nothing" — exactly one write survives,
+// and it is authored by us, not by the database.
+const CHAT_TTL_MS = () => Math.max(60_000, Number(process.env.T2SQL_SELECT_CHAT_TTL_MS ?? 3_600_000));
+
+/** In-memory transcripts, one InMemoryChatStore per conversation so an idle one
+ *  can actually be dropped (ChatStore has no delete). Swept on access, the same
+ *  shape as sweep() in ../sources/connection-registry. */
+class EphemeralChatStore implements ChatStore {
+  private convs = new Map<string, { s: InMemoryChatStore; last: number }>();
+  /** Project state is not row data; keep one shared store for it. */
+  private projects = new InMemoryChatStore();
+
+  private sweep(now = Date.now()): void {
+    const ttl = CHAT_TTL_MS();
+    for (const [id, e] of this.convs) if (now - e.last > ttl) this.convs.delete(id);
+  }
+  private For(id: string): InMemoryChatStore {
+    this.sweep();
+    let e = this.convs.get(id);
+    if (!e) { e = { s: new InMemoryChatStore(), last: Date.now() }; this.convs.set(id, e); }
+    else e.last = Date.now();
+    return e.s;
+  }
+
+  async createConversation(title?: string, id?: string): Promise<string> {
+    // Mint the id ourselves when the caller has none, so the per-conversation
+    // store can be keyed before InMemoryChatStore would have generated one.
+    const cid = id || randomUUID();
+    return this.For(cid).createConversation(title, cid);
+  }
+  async appendMessage(conversationId: string, msg: Parameters<ChatStore["appendMessage"]>[1]): Promise<void> {
+    return this.For(conversationId).appendMessage(conversationId, msg);
+  }
+  async getHistory(conversationId: string, limit?: number): ReturnType<ChatStore["getHistory"]> {
+    return this.For(conversationId).getHistory(conversationId, limit);
+  }
+  async listConversations(limit?: number): ReturnType<ChatStore["listConversations"]> {
+    this.sweep();
+    const all = (await Promise.all([...this.convs.values()].map((e) => e.s.listConversations(limit)))).flat();
+    all.sort((a: any, b: any) => Number(b?.updatedAt ?? 0) - Number(a?.updatedAt ?? 0));
+    return (limit ? all.slice(0, limit) : all) as any;
+  }
+  async saveProjectState(projectId: string, state: Parameters<ChatStore["saveProjectState"]>[1]): Promise<void> {
+    return this.projects.saveProjectState(projectId, state);
+  }
+  async getProjectState(projectId: string): ReturnType<ChatStore["getProjectState"]> {
+    return this.projects.getProjectState(projectId);
+  }
+  /** Test seam. */
+  _clear(): void { this.convs.clear(); }
+}
+
+const ephemeral = new EphemeralChatStore();
+
+/** Selection turns: in memory, never written to Postgres. Used by
+ *  handleSelectionChat / Get / Set. */
+const ephemeralStore = (deps: SelectionDeps): ChatStore => deps.chatStore ?? ephemeral;
+
+/** The commit breadcrumb only: this one conversation and its single closing
+ *  message become the main chat, so they must survive. Still wrapped so a
+ *  storage outage degrades instead of 500ing. */
+const durableStore = (deps: SelectionDeps): ChatStore => deps.chatStore ?? resilientStore(getChatStore());
+
+/** Test seam: forget every in-memory selection transcript. */
+export function _resetEphemeralChatForTest(): void { ephemeral._clear(); }
 
 async function guarded(route: string, fn: () => Promise<Out> | Out): Promise<Out> {
   try {
@@ -124,6 +199,9 @@ export interface SelectionDeps {
   /** Test seam for the analyst pass: run SQL / compose the answer. */
   runQuery?: typeof nativeQuery;
   answer?: PlanSelectionRun;
+  /** Streaming seam: called with each guarded query as it is about to run, so the
+   *  SSE route can emit a `query` event. Additive — omit it and nothing changes. */
+  onQuery?: (sql: string) => void;
 }
 
 /** Max tables a single /profile call will introspect (each one is a query). */
@@ -154,7 +232,7 @@ async function handleSelectionChatInner(body: unknown, tenantId: string, deps: S
   const rec = getConnection(tenantId, String(b.connectionId ?? ""));
   if (!rec) return { status: 404, body: { error: "unknown or expired connection — reconnect" } };
 
-  const store = storeFor(deps);
+  const store = ephemeralStore(deps);
   const conversationId = await store.createConversation(`Select tables: ${rec.conn.database}`, b.conversationId || undefined);
   const history = await store.getHistory(conversationId, 24);
   const prompt = b.prompt.trim();
@@ -206,29 +284,51 @@ async function handleSelectionChatInner(body: unknown, tenantId: string, deps: S
   // inside a READ ONLY transaction against the source database.
   let dataAnswer: string | undefined;
   let queryNote: string | undefined;
-  if (planned?.sql) {
-    const guard = guardSelect(planned.sql, Number(process.env.DB_ANALYSIS_ROW_CAP ?? 200));
-    if (!guard.ok) {
-      // The model wrote something the guard won't run. Say so rather than
-      // silently dropping the question — and never echo the rejected SQL as if
-      // it were an answer.
-      queryNote = `I couldn't run that safely (${guard.error}).`;
-      console.warn(`[selection] query rejected: ${guard.error} — ${planned.sql.slice(0, 200)}`);
-    } else {
-      try {
-        console.log(`[selection] query: ${guard.sql.replace(/\s+/g, " ").slice(0, 300)}`);
-        const rows = await (deps.runQuery ?? nativeQuery)(rec.conn, guard.sql);
-        console.log(`[selection] query returned ${rows.rows.length} row(s) in ${rows.elapsedMs}ms`);
-        dataAnswer = (await answerFromRows(
-          { prompt, sql: guard.sql, columns: rows.columns, rows: rows.rows, truncated: rows.truncated, history },
-          deps.answer,
-        )) ?? describeRows(rows);
-      } catch (err: any) {
-        // A failed query is information: usually a wrong column or a permission
-        // gap, both of which the user can act on.
-        queryNote = `That query failed: ${describeError(err)}`;
-        console.warn(`[selection] query failed:`, err?.stack ?? err);
-      }
+  // planned.sql is a single string today, but the planner is being widened to
+  // return several — accept both shapes rather than depending on which the model
+  // happened to emit this turn.
+  const plannedSql: string[] = Array.isArray(planned?.sql)
+    ? (planned.sql as unknown[]).map(String).filter(Boolean)
+    : planned?.sql ? [String(planned.sql)] : [];
+  const analysisRowCap = Number(process.env.DB_ANALYSIS_ROW_CAP ?? 200);
+  // Pre-screen with the SAME guardSelect the loop uses, so a turn the guard will
+  // never run keeps its specific message ("I couldn't run that safely") instead of
+  // being handed to the composer to explain. One guard, applied twice.
+  const screened = plannedSql.map((raw) => ({ raw, g: guardSelect(raw, analysisRowCap) }));
+  const runnable = screened.filter((s) => s.g.ok).map((s) => s.raw);
+  const firstRejected = screened.find((s) => !s.g.ok);
+  if (plannedSql.length && !runnable.length && firstRejected) {
+    queryNote = `I couldn't run that safely (${(firstRejected.g as { ok: false; error: string }).error}).`;
+    console.warn(`[selection] query rejected: ${(firstRejected.g as { ok: false; error: string }).error} — ${firstRejected.raw.slice(0, 200)}`);
+  } else if (runnable.length) {
+    try {
+      // Caps are OMITTED on purpose: interpret.ts's T2SQL_SELECT_* defaults are
+      // this path's own limits, and this path is the tight one — it queries
+      // whatever production database the user pasted a string for.
+      const result = await runChatAnalyst(
+        { prompt, plannedSql: runnable, history },
+        {
+          runQuery: (sql) => (deps.runQuery ?? nativeQuery)(rec.conn, sql),
+          guard: guardSelect,
+          // deps.answer is the injected composer the offline tests supply; fall
+          // back to the real model only when nothing was injected.
+          model: (system, user) => (deps.answer ?? callGemini)(system, user, ORCHESTRATE_OPTS),
+          rowCap: analysisRowCap,
+          onQuery: deps.onQuery,
+        },
+      );
+      dataAnswer = result.answer ?? fallbackSummary(result.outcomes);
+      // A guard rejection or a failed query is information the user can act on
+      // (usually a wrong column or a permission gap), so surface it rather than
+      // letting it vanish into the prose.
+      // Surface a failure even when the composer still produced prose: the
+      // database's own message ("column \"widget\" does not exist") is usually
+      // the most actionable thing in the turn, and must not vanish into it.
+      const bad = result.outcomes.filter((o) => !o.ok);
+      if (bad.length) queryNote = `That query failed: ${bad[0].error}`;
+    } catch (err: any) {
+      queryNote = `That query failed: ${describeError(err)}`;
+      console.warn(`[selection] analyst failed:`, err?.stack ?? err);
     }
   }
 
@@ -307,7 +407,10 @@ async function handleSelectionGetInner(conversationId: string, tenantId: string,
   const state = await getSelection(id, tenantId);
   let turns: { role: string; content: string }[] = [];
   try {
-    const store = storeFor(deps);
+    // Ephemeral: after a BFF restart this is legitimately empty. The SELECTION
+    // still loads from Postgres below — an empty transcript is correct here,
+    // not a failure, so this must not throw.
+    const store = ephemeralStore(deps);
     turns = await store.getHistory(id, 40);
   } catch { /* memory is best-effort; the selection itself is the payload */ }
   return {
@@ -339,7 +442,7 @@ async function handleSelectionSetInner(body: unknown, tenantId: string, deps: Se
   const rec = getConnection(tenantId, String(b.connectionId ?? ""));
   if (!rec) return { status: 404, body: { error: "unknown or expired connection — reconnect" } };
 
-  const store = storeFor(deps);
+  const store = ephemeralStore(deps);
   const conversationId = await store.createConversation(`Select tables: ${rec.conn.database}`, b.conversationId || undefined);
 
   const catalog = new Set(rec.allTables.map((t) => t.name));
@@ -490,7 +593,9 @@ async function handleSelectionCommitInner(body: unknown, tenantId: string, deps:
   if (!b || typeof b !== "object") return bad("body must be a JSON object");
   const rec = getConnection(tenantId, String(b.connectionId ?? ""));
   if (!rec) return { status: 404, body: { error: "unknown or expired connection — reconnect" } };
-  const store = storeFor(deps);
+  // DURABLE — the only persisted path. This conversation id becomes the main
+  // text2UI conversation and its closing breadcrumb is that chat's first message.
+  const store = durableStore(deps);
   const conversationId = await store.createConversation(`Select tables: ${rec.conn.database}`, b.conversationId || undefined);
 
   // The client may pass the tables explicitly (belt and braces); the stored

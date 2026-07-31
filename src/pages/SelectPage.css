@@ -172,6 +172,9 @@
   max-width: 72ch; padding: 8px 11px; border-radius: 9px;
   font-size: 13px; line-height: 1.5; white-space: pre-wrap;
 }
+/* Markdown bubbles emit real block elements — the base pre-wrap above would add
+   a blank line after every paragraph and list item. */
+.sel-msg--md { white-space: normal; }
 .sel-msg--user { align-self: flex-end; background: var(--accent-purple-dark); color: #fff; }
 .sel-msg--assistant { align-self: flex-start; background: var(--bg-card); color: var(--text-secondary); border: 1px solid var(--border-color, #1f2937); }
 .sel-msg--busy { color: var(--text-muted); font-style: italic; }

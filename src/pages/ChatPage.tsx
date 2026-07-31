@@ -17,12 +17,14 @@ import {
 } from "react-icons/hi";
 import PromptInput from "../components/PromptInput";
 import Sandbox from "../components/Sandbox";
+import ChatMarkdown from "../components/ChatMarkdown";
 import {
   orchestratePlan, generate, generateStream, generateReport, generatePpt, downloadBase64,
   exportProject, buildDashboard, buildDeck, gateTurn, uploadDatasets, COLO_PROJECT_ID, REMOTE_DATA, BFF_URL,
   type StreamEvent, type ReportResult, type PptResult,
 } from "../api";
 import { sourceChat } from "../workbench-api";
+import { sourceChatStream } from "../api";
 import DeckPreview from "../components/DeckPreview";
 import type { Table } from "../lib/datasets";
 import type { DashboardSpec } from "../../shared/dashboard-spec";
@@ -45,7 +47,7 @@ interface Props {
 }
 
 type Phase = "planning" | "building" | "done" | "clarify" | "error";
-type Turn = { id: number; prompt: string; phase: Phase; stages: string[]; tail?: string | null; brief?: OrchestratorBrief; assistantText?: string; hydrated?: boolean };
+type Turn = { id: number; prompt: string; phase: Phase; stages: string[]; tail?: string | null; brief?: OrchestratorBrief; assistantText?: string; hydrated?: boolean; streaming?: boolean };
 type Result =
   | { kind: "dashboard"; app: GeneratedApp; brief?: OrchestratorBrief }
   | { kind: "deck"; compiled: CompiledDeck; pptxBase64: string; filename: string }
@@ -304,12 +306,34 @@ export default function ChatPage({
       const answerInstead = async (reply: string, dataQuestion?: boolean) => {
         if (dataQuestion && serverSource) {
           append("Looking that up in the data…");
+          const req = { projectId, prompt, ...(conversationId ? { conversationId } : {}) };
           try {
-            const r = await sourceChat({ projectId, prompt, ...(conversationId ? { conversationId } : {}) });
+            // Stream first: patch on every token so the answer appears as it is
+            // written, with the caret showing until `done`.
+            let acc = "";
+            const r = await sourceChatStream(req, (ev) => {
+              if (ev.type === "token") {
+                acc += ev.text;
+                patch({ phase: "done", tail: null, assistantText: acc, streaming: true });
+              } else if (ev.type === "query") {
+                append(`Running: ${ev.sql.replace(/\s+/g, " ").slice(0, 120)}`);
+              }
+            });
             if (r.conversationId) adoptConvId(r.conversationId);
-            patch({ phase: "done", tail: null, assistantText: r.answer });
+            // `done` carries the authoritative reply — the accumulated tokens can
+            // be short if a round was withheld as need_more plumbing.
+            patch({ phase: "done", tail: null, assistantText: r.reply || acc, streaming: false });
             return;
-          } catch { /* fall back to the model's grounded reply */ }
+          } catch {
+            // Everything degrades rather than throws: a dead stream falls back to
+            // the one-shot call before it falls back to the grounded reply.
+            try {
+              const r = await sourceChat(req);
+              if (r.conversationId) adoptConvId(r.conversationId);
+              patch({ phase: "done", tail: null, assistantText: r.answer, streaming: false });
+              return;
+            } catch { /* fall back to the model's grounded reply */ }
+          }
         }
         patch({ phase: "done", tail: null, assistantText: reply });
       };
@@ -623,8 +647,17 @@ export default function ChatPage({
                         {t.tail && <pre className="cp-tail">{t.tail}</pre>}
                       </div>
                     )}
-                    {t.phase === "clarify" && <div className="cp-clarify">{t.assistantText}</div>}
-                    {t.phase === "done" && <div>{t.assistantText}</div>}
+                    {/* Assistant prose is markdown now. The `cp-md` modifier resets the
+                        inherited `white-space: pre-wrap` from .cp-msg-body — without it
+                        every rendered block double-spaces. The error branch stays plain
+                        text (and keeps pre-wrap), because a stack trace needs its newlines. */}
+                    {t.phase === "clarify" && <div className="cp-clarify cp-md"><ChatMarkdown text={t.assistantText ?? ""} /></div>}
+                    {t.phase === "done" && (
+                      <div className="cp-md">
+                        <ChatMarkdown text={t.assistantText ?? ""} />
+                        {t.streaming && <span className="md-caret" />}
+                      </div>
+                    )}
                     {t.phase === "error" && <div className="cp-err">{t.assistantText}</div>}
                   </div>
                 </div>

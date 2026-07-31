@@ -15,8 +15,9 @@
 //   header  "Continue to text2UI →", visible at ALL times
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { useNavigate } from "react-router-dom";
+import ChatMarkdown from "../components/ChatMarkdown";
 import {
-  wbConnect, wbCatalog, wbProfile, wbSelect, wbSetSelection, wbGetSelection,
+  wbConnect, wbCatalog, wbProfile, wbSelect, wbSelectStream, wbSetSelection, wbGetSelection,
   wbCommitSelection, wbSchema,
   type WbCatalogTable, type WbTableDetail, type WbExtracted,
 } from "../workbench-api";
@@ -208,12 +209,48 @@ export default function SelectPage({ onUseWorkbenchSource }: SelectPageProps) {
     setTurns((prev) => [...prev, { role: "user", text: p }]);
     setBusy(true);
     try {
-      const r = await wbSelect({ connectionId, prompt: p, ...(conversationId ? { conversationId } : {}) });
-      remember(r.conversationId);
-      setSelection(r.selection);
-      if (r.columns) setColSel(r.columns);
-      setTurns((prev) => [...prev, { role: "assistant", text: r.reply }]);
-      if (r.focus) void openTable(r.focus);
+      const req = { connectionId, prompt: p, ...(conversationId ? { conversationId } : {}) };
+      try {
+        // Stream first. Tokens append to a single assistant turn, which renders
+        // through ChatMarkdown as it grows — partial markdown is expected and
+        // handled by the renderer.
+        let acc = "";
+        let opened = false;
+        const r = await wbSelectStream(req, (ev: any) => {
+          if (ev.type === "token") {
+            acc += ev.text;
+            setTurns((prev) => {
+              if (!opened) { opened = true; return [...prev, { role: "assistant", text: acc }]; }
+              const copy = prev.slice();
+              copy[copy.length - 1] = { role: "assistant", text: acc };
+              return copy;
+            });
+          } else if (ev.type === "selection") {
+            // The rail must not wait for the prose to finish.
+            if (Array.isArray(ev.selection)) setSelection(ev.selection);
+            if (ev.columns) setColSel(ev.columns);
+            if (ev.focus) void openTable(ev.focus);
+          }
+        });
+        remember(r.conversationId);
+        // `done` is authoritative: a withheld need_more round means `acc` can be
+        // shorter than the real reply.
+        const finalText = r.reply || acc;
+        setTurns((prev) => {
+          if (!opened) return [...prev, { role: "assistant", text: finalText }];
+          const copy = prev.slice();
+          copy[copy.length - 1] = { role: "assistant", text: finalText };
+          return copy;
+        });
+      } catch {
+        // A dead stream must not cost the user their turn — replay as one shot.
+        const r = await wbSelect(req);
+        remember(r.conversationId);
+        setSelection(r.selection);
+        if (r.columns) setColSel(r.columns);
+        setTurns((prev) => [...prev, { role: "assistant", text: r.reply }]);
+        if (r.focus) void openTable(r.focus);
+      }
     } catch (e: any) {
       setTurns((prev) => [...prev, { role: "assistant", text: `Something went wrong: ${e?.message ?? e}` }]);
     } finally {
@@ -469,7 +506,16 @@ export default function SelectPage({ onUseWorkbenchSource }: SelectPageProps) {
             </div>
           )}
           {turns.map((t, i) => (
-            <div key={i} className={`sel-msg sel-msg--${t.role}`}>{t.text}</div>
+            // Assistant replies are interpretive markdown; user prompts stay plain
+            // text. sel-msg--md resets the base .sel-msg `white-space: pre-wrap`,
+            // which would otherwise double-space every rendered block.
+            t.role === "assistant"
+              ? (
+                <div key={i} className="sel-msg sel-msg--assistant sel-msg--md">
+                  <ChatMarkdown text={t.text ?? ""} />
+                </div>
+              )
+              : <div key={i} className={`sel-msg sel-msg--${t.role}`}>{t.text}</div>
           ))}
           {busy && <div className="sel-msg sel-msg--assistant sel-msg--busy">Working…</div>}
         </div>

@@ -61,6 +61,9 @@
   color: #64748b; white-space: pre-wrap; word-break: break-all;
 }
 .cp-clarify { color: #fcd34d; }
+/* Markdown bubbles render real block elements, so the pre-wrap inherited from
+   .cp-msg-body would add a blank line after every paragraph and list item. */
+.cp-md { white-space: normal; }
 .cp-err { color: #f87171; }
 
 .cp-composer { padding: 10px 14px 14px; border-top: 1px solid #1f2937; }

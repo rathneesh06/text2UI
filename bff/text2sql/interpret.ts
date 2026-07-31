@@ -16,9 +16,9 @@
 // pasted a string for. An uncapped agentic loop is a way to put a service under
 // load from a chat box. Three limits, all enforced here rather than trusted to
 // the prompt:
-//   T2SQL_ANALYST_MAX_QUERIES  total queries per turn        (default 3)
-//   T2SQL_ANALYST_MAX_ROUNDS   planning rounds per turn      (default 2)
-//   T2SQL_ANALYST_BUDGET_MS    wall clock for the whole turn (default 45000)
+//   T2SQL_SELECT_MAX_QUERIES  total queries per turn        (default 3)
+//   T2SQL_SELECT_MAX_ROUNDS   planning rounds per turn      (default 2)
+//   T2SQL_SELECT_BUDGET_MS    wall clock for the whole turn (default 45000)
 // Whichever binds first wins, and the composer answers with what it has. A turn
 // that runs out of budget still replies — it just says the picture is partial.
 //
@@ -30,7 +30,7 @@ export interface QueryRunner {
   (sql: string): Promise<{ columns: string[]; rows: Record<string, unknown>[]; truncated: boolean; elapsedMs: number }>;
 }
 export interface Guard { (sql: string, rowCap?: number): { ok: true; sql: string } | { ok: false; error: string } }
-export interface ModelRun { (system: string, user: string): Promise<{ text: string }> }
+export interface ChatModelRun { (system: string, user: string): Promise<{ text: string }> }
 
 export interface QueryOutcome {
   sql: string;
@@ -46,12 +46,15 @@ export interface AnalystResult {
   answer: string | null;
   outcomes: QueryOutcome[];
   rounds: number;
-  stoppedBy: "answered" | "max_queries" | "max_rounds" | "budget" | "model_unavailable";
+  // "compose_skipped": the caller's shouldCompose() said this result has nothing
+  // worth interpreting (a single cell, an empty set), so the model was never
+  // called. answer is null and the caller supplies its own deterministic text.
+  stoppedBy: "answered" | "max_queries" | "max_rounds" | "budget" | "model_unavailable" | "compose_skipped";
 }
 
-const MAX_QUERIES = () => Math.max(1, Number(process.env.T2SQL_ANALYST_MAX_QUERIES ?? 3));
-const MAX_ROUNDS = () => Math.max(1, Number(process.env.T2SQL_ANALYST_MAX_ROUNDS ?? 2));
-const BUDGET_MS = () => Math.max(5_000, Number(process.env.T2SQL_ANALYST_BUDGET_MS ?? 45_000));
+const MAX_QUERIES = () => Math.max(1, Number(process.env.T2SQL_SELECT_MAX_QUERIES ?? 3));
+const MAX_ROUNDS = () => Math.max(1, Number(process.env.T2SQL_SELECT_MAX_ROUNDS ?? 2));
+const BUDGET_MS = () => Math.max(5_000, Number(process.env.T2SQL_SELECT_BUDGET_MS ?? 45_000));
 
 // ---- prompts ---------------------------------------------------------------------
 
@@ -124,10 +127,10 @@ function renderOutcomes(outcomes: QueryOutcome[], perQuery = 40): string {
  * whole loop is testable with no network — the same posture as the route
  * handlers and `snapshotFromHandle`.
  */
-export async function runAnalyst(
+export async function runChatAnalyst(
   input: { prompt: string; plannedSql: string[]; history?: ChatMessage[] },
   deps: {
-    runQuery: QueryRunner; guard: Guard; model: ModelRun; rowCap?: number; onQuery?: (sql: string) => void;
+    runQuery: QueryRunner; guard: Guard; model: ChatModelRun; rowCap?: number; onQuery?: (sql: string) => void;
     // Caps may be supplied per caller. The /select analyst hits a live production
     // database and keeps the tight T2SQL_ANALYST_* defaults; the main chat runs
     // against a local DuckDB snapshot where an extra query costs milliseconds and
@@ -135,6 +138,11 @@ export async function runAnalyst(
     // values. Omit them and the defaults below still apply — additive, not a
     // behaviour change for existing callers.
     maxQueries?: number; maxRounds?: number; budgetMs?: number;
+    /** Latency escape hatch: return false to skip the composition pass entirely.
+     *  A single-cell or empty result has nothing to interpret, and a model call
+     *  to say "the count is 42" is pure latency. Queries have already run when
+     *  this is consulted, so the caller decides from real outcomes. */
+    shouldCompose?: (outcomes: QueryOutcome[]) => boolean;
   },
 ): Promise<AnalystResult> {
   const started = Date.now();
@@ -153,27 +161,30 @@ export async function runAnalyst(
       const g = deps.guard(raw, deps.rowCap);
       if (!g.ok) {
         outcomes.push({ sql: raw, ok: false, columns: [], rows: [], truncated: false, elapsedMs: 0, error: g.error });
-        console.warn(`[analyst] query rejected: ${g.error} — ${raw.slice(0, 200)}`);
+        console.warn(`[chat-analyst] query rejected: ${g.error} — ${raw.slice(0, 200)}`);
         continue;
       }
       deps.onQuery?.(g.sql);
-      console.log(`[analyst] query: ${g.sql.replace(/\s+/g, " ").slice(0, 300)}`);
+      console.log(`[chat-analyst] query: ${g.sql.replace(/\s+/g, " ").slice(0, 300)}`);
       try {
         const r = await deps.runQuery(g.sql);
         outcomes.push({ sql: g.sql, ok: true, columns: r.columns, rows: r.rows, truncated: r.truncated, elapsedMs: r.elapsedMs });
-        console.log(`[analyst] query returned ${r.rows.length} row(s) in ${r.elapsedMs}ms`);
+        console.log(`[chat-analyst] query returned ${r.rows.length} row(s) in ${r.elapsedMs}ms`);
       } catch (err: any) {
         // A failed query is information — usually a wrong column or a permission
         // gap. Hand it to the composer rather than swallowing it.
         const msg = (err?.message || String(err)).trim() || "no error message reported";
         outcomes.push({ sql: g.sql, ok: false, columns: [], rows: [], truncated: false, elapsedMs: 0, error: msg });
-        console.warn(`[analyst] query failed: ${msg}`);
+        console.warn(`[chat-analyst] query failed: ${msg}`);
       }
     }
   };
 
   await runBatch(input.plannedSql.slice(0, maxQueries));
   if (!outcomes.length) return { answer: null, outcomes, rounds: 0, stoppedBy };
+  if (deps.shouldCompose && !deps.shouldCompose(outcomes)) {
+    return { answer: null, outcomes, rounds: 0, stoppedBy: "compose_skipped" };
+  }
 
   for (let round = 1; round <= maxRounds; round++) {
     if (budgetLeft() <= 0) {
@@ -195,7 +206,7 @@ export async function runAnalyst(
     try {
       text = String((await deps.model(INTERPRET_SYSTEM, body)).text ?? "").trim();
     } catch (err: any) {
-      console.warn(`[analyst] composition failed: ${err?.message ?? err}`);
+      console.warn(`[chat-analyst] composition failed: ${err?.message ?? err}`);
       return { answer: null, outcomes, rounds: round, stoppedBy: "model_unavailable" };
     }
     if (!text) return { answer: null, outcomes, rounds: round, stoppedBy: "model_unavailable" };
@@ -205,7 +216,7 @@ export async function runAnalyst(
 
     if (round >= maxRounds) { stoppedBy = "max_rounds"; break; }
     if (outcomes.length >= maxQueries) { stoppedBy = "max_queries"; break; }
-    console.log(`[analyst] follow-up round ${round + 1}: ${more.length} query(ies)`);
+    console.log(`[chat-analyst] follow-up round ${round + 1}: ${more.length} query(ies)`);
     await runBatch(more);
   }
 

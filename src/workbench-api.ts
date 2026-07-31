@@ -148,6 +148,58 @@ export function wbSelect(body: { connectionId: string; conversationId?: string; 
   return request("/api/sql/select", { method: "POST", body: JSON.stringify(body) });
 }
 
+/**
+ * Streaming twin of wbSelect(). Emits stage/query/token/selection events as the
+ * turn runs and resolves with the finished reply. Throws on any transport or
+ * stream error so the caller can fall back to wbSelect() — a dead stream must not
+ * cost the user their turn.
+ */
+export async function wbSelectStream(
+  body: { connectionId: string; conversationId?: string; prompt: string },
+  onEvent: (ev: any) => void,
+): Promise<{ reply: string; conversationId: string }> {
+  const url = `${BFF_URL}/api/sql/select/stream`;
+  dbg(`→ STREAM ${url}`);
+  const res = await fetch(url, {
+    method: "POST",
+    headers: { "Content-Type": "application/json", ...authHeaders() },
+    body: JSON.stringify(body),
+  });
+  if (!res.ok) {
+    const json: any = await res.json().catch(() => ({}));
+    throw new Error(json?.error ?? `Stream request failed (HTTP ${res.status})`);
+  }
+  if (!res.body) throw new Error("Stream unavailable");
+
+  const reader = res.body.getReader();
+  const decoder = new TextDecoder();
+  let buffer = "";
+  let out: { reply: string; conversationId: string } | null = null;
+
+  while (true) {
+    const { done, value } = await reader.read();
+    if (value) buffer += decoder.decode(value, { stream: true });
+    let splitIndex: number;
+    while ((splitIndex = buffer.indexOf("\n\n")) !== -1) {
+      const chunk = buffer.slice(0, splitIndex);
+      buffer = buffer.slice(splitIndex + 2);
+      const line = chunk.trim();
+      if (!line || !line.startsWith("data:")) continue;
+      const payload = JSON.parse(line.slice(5).trim()) as any;
+      if (payload.type === "error") throw new Error(payload.error);
+      if (payload.type === "done") {
+        out = { reply: String(payload.reply ?? ""), conversationId: String(payload.conversationId ?? "") };
+        break;
+      }
+      onEvent(payload);
+    }
+    if (done) break;
+    if (out) break;
+  }
+  if (!out) throw new Error("Stream ended without completion");
+  return out;
+}
+
 /** Push the checkbox state — clicking and typing edit the SAME selection. */
 export function wbSetSelection(body: { connectionId: string; conversationId?: string; tables: string[]; columns?: Record<string, string[]>; note?: boolean }): Promise<{ conversationId: string; selection: string[]; columns: Record<string, string[]>; added: string[]; removed: string[]; canUndo: boolean }> {
   return request("/api/sql/selection", { method: "POST", body: JSON.stringify(body) });
