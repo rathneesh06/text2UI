@@ -523,4 +523,90 @@ const plan = (obj: unknown) => async () => ({ text: JSON.stringify(obj), finishR
   );
 }
 
+// ---- TASK 2: context builds up ACROSS turns, and several per SINGLE turn ---------
+// Two different things get called "multi": a user stating one relationship per
+// message over five messages, and a user stating three in one message. Both must
+// work, and they exercise different code (the merge into the stored set vs. the
+// per-turn array).
+{
+  const dep = (obj: unknown) => async () => ({ text: JSON.stringify(obj), finishReason: "STOP" } as any);
+  const MEM = "solo_conn_seltest";
+  const j = (col: string, statement: string) => ({
+    kind: "join",
+    from: { member: MEM, table: "orders", column: col },
+    to: { member: MEM, table: "orders", column: "region" },
+    cardinality: "N:1",
+    statement,
+  });
+
+  // (a) FIVE separate messages, one dependency each, accumulate to five.
+  const CONV_M = "conv_multiturn";
+  const cols = ["id", "region"];
+  let last: any;
+  for (let i = 0; i < cols.length; i++) {
+    last = await handleSelectionChat(
+      { connectionId: rec.id, conversationId: CONV_M, prompt: `turn ${i}` },
+      TENANT,
+      { chatStore: store, plan: dep({ reply: "ok", dependencies: [j(cols[i], `statement ${i}`)] }) },
+    );
+  }
+  // Two distinct joins from two messages, both still present.
+  assert.equal(last.body.dependencies.length, 2, "each turn MERGES into the stored set rather than replacing it");
+  assert.ok(last.body.dependencies.every((d: any) => d.kind === "join"));
+
+  // A semantic statement in a later message joins them rather than evicting them.
+  const after = await handleSelectionChat(
+    { connectionId: rec.id, conversationId: CONV_M, prompt: "and everything is UTC" },
+    TENANT,
+    { chatStore: store, plan: dep({ reply: "ok", dependencies: [{ kind: "semantic", scope: [], statement: "everything is UTC" }] }) },
+  );
+  assert.equal(after.body.dependencies.length, 3, "context accumulates across turns");
+
+  // And it is DURABLE, not just echoed back in the response.
+  const stored = await getSelection(CONV_M, TENANT);
+  assert.equal(stored.dependencies.length, 3, "persisted, so a reload keeps the accumulated context");
+
+  // The model is given what has been captured so far, or it cannot correct itself.
+  let sawCaptured = false;
+  await handleSelectionChat(
+    { connectionId: rec.id, conversationId: CONV_M, prompt: "what have you got?" },
+    TENANT,
+    {
+      chatStore: store,
+      plan: (async (_s: string, user: string) => {
+        sawCaptured = user.includes("Captured so far:") && user.includes("everything is UTC");
+        return { text: JSON.stringify({ reply: "Three so far.", dependencies: [] }), finishReason: "STOP" } as any;
+      }) as any,
+    },
+  );
+  assert.ok(sawCaptured, "the prompt carries the captured list, so state questions and corrections work");
+
+  // (b) ONE message containing THREE dependencies -> three entries, validated
+  // independently: a good join, a bad join, and a semantic statement.
+  const CONV_S = "conv_multisingle";
+  const three = await handleSelectionChat(
+    { connectionId: rec.id, conversationId: CONV_S, prompt: "orders.id joins region, orders.nope joins region, and all amounts are GBP" },
+    TENANT,
+    {
+      chatStore: store,
+      plan: dep({
+        reply: "Captured three.",
+        dependencies: [
+          j("id", "orders.id joins region"),
+          j("nope", "orders.nope joins region"),
+          { kind: "semantic", scope: [], statement: "all amounts are GBP" },
+        ],
+      }),
+    },
+  );
+  assert.equal(three.body.dependencies.length, 3, "three in one message yields three entries");
+  const byStatement = (s: string) => three.body.dependencies.find((d: any) => d.statement === s);
+  assert.equal(byStatement("orders.id joins region").confidence, "validated", "the good join validates");
+  assert.equal(byStatement("orders.nope joins region").confidence, "rejected", "the bad one is rejected INDEPENDENTLY");
+  assert.match(byStatement("orders.nope joins region").note ?? "", /nope/i, "and says which column was missing");
+  assert.equal(byStatement("all amounts are GBP").kind, "semantic", "the unstructurable one is kept as semantic");
+  // The bad one must not have poisoned the others.
+  assert.equal(three.body.dependencies.filter((d: any) => d.confidence === "rejected").length, 1, "one bad entry does not reject the rest");
+}
+
 console.log("selection.test.ts: all assertions passed ✅");

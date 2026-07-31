@@ -2,6 +2,7 @@
 // pair for the model. Lives in bff/ so the system prompt never reaches the browser.
 import type { DataProfile, ColumnProfile, Dataset, AssembleInput } from "../shared/types";
 import { buildEnrichment } from "./domain";
+import { designTokenBlock, DESIGN_FAMILY } from "./design-tokens";
 import { exemplarBlock } from "./exemplars";
 import { CRAFT_FLOOR, LAYOUT_FLOOR, designBlock } from "./design";
 import { diagnose } from "./heal";
@@ -308,7 +309,14 @@ Scope — THIS IS AN EDIT, NOT A REDESIGN:
     // use them in place of the static text exemplar (the ref images travel to the
     // model call separately). Empty/absent -> fall back to exemplarBlock() unchanged.
     const refBlock = input.referenceBlock?.trim();
-    const exemplar = refBlock ? refBlock : exemplarBlock(detected);
+    // Images carry LAYOUT — proportion, density, where the eye goes. They cannot
+    // carry an exact hex, a type scale or a radius, and a model reading a
+    // screenshot will approximate all three. The token block states those values
+    // outright, so it rides ALONGSIDE the references rather than instead of them:
+    // drop either and the output drifts.
+    const exemplar = refBlock
+      ? `${refBlock}\n${designTokenBlock(DESIGN_FAMILY)}`
+      : exemplarBlock(detected);
     user_prompt = [
       "Build this app on top of the data described above:",
       userPrompt,

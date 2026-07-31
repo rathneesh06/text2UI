@@ -18,7 +18,7 @@ import { useNavigate } from "react-router-dom";
 import ChatMarkdown from "../components/ChatMarkdown";
 import type { Dependency } from "../../shared/dependencies";
 import {
-  wbConnect, wbCatalog, wbProfile, wbSelect, wbSelectStream, wbSetSelection, wbGetSelection, wbRemoveMember,
+  wbConnect, wbCatalog, wbProfile, wbSelect, wbSetSelection, wbGetSelection, wbRemoveMember,
   wbCommitSelection, wbSchema,
   type WbCatalogTable, type WbTableDetail, type WbExtracted,
 } from "../workbench-api";
@@ -299,49 +299,15 @@ export default function SelectPage({ onUseWorkbenchSource }: SelectPageProps) {
     setBusy(true);
     try {
       const req = { connectionId, prompt: p, ...(conversationId ? { conversationId } : {}) };
-      try {
-        // Stream first. Tokens append to a single assistant turn, which renders
-        // through ChatMarkdown as it grows — partial markdown is expected and
-        // handled by the renderer.
-        let acc = "";
-        let opened = false;
-        const r = await wbSelectStream(req, (ev: any) => {
-          if (ev.type === "token") {
-            acc += ev.text;
-            setTurns((prev) => {
-              if (!opened) { opened = true; return [...prev, { role: "assistant", text: acc }]; }
-              const copy = prev.slice();
-              copy[copy.length - 1] = { role: "assistant", text: acc };
-              return copy;
-            });
-          } else if (ev.type === "selection") {
-            // The rail must not wait for the prose to finish.
-            if (Array.isArray(ev.selection)) setSelection(ev.selection);
-            if (ev.columns) setColSel(ev.columns);
-            if (ev.dependencies) setDependencies(ev.dependencies);
-            if (ev.focus) void openTable(ev.focus);
-          }
-        });
-        remember(r.conversationId);
-        // `done` is authoritative: a withheld need_more round means `acc` can be
-        // shorter than the real reply.
-        const finalText = r.reply || acc;
-        setTurns((prev) => {
-          if (!opened) return [...prev, { role: "assistant", text: finalText }];
-          const copy = prev.slice();
-          copy[copy.length - 1] = { role: "assistant", text: finalText };
-          return copy;
-        });
-      } catch {
-        // A dead stream must not cost the user their turn — replay as one shot.
-        const r = await wbSelect(req);
-        remember(r.conversationId);
-        setSelection(r.selection);
-        if (r.columns) setColSel(r.columns);
-        if (r.dependencies) setDependencies(r.dependencies);
-        setTurns((prev) => [...prev, { role: "assistant", text: r.reply }]);
-        if (r.focus) void openTable(r.focus);
-      }
+      // One-shot. Token streaming existed here but was never exercised — see the
+      // matching note in ChatPage. The reply still renders through ChatMarkdown.
+      const r = await wbSelect(req);
+      remember(r.conversationId);
+      setSelection(r.selection);
+      if (r.columns) setColSel(r.columns);
+      if (r.dependencies) setDependencies(r.dependencies);
+      setTurns((prev) => [...prev, { role: "assistant", text: r.reply }]);
+      if (r.focus) void openTable(r.focus);
     } catch (e: any) {
       setTurns((prev) => [...prev, { role: "assistant", text: `Something went wrong: ${e?.message ?? e}` }]);
     } finally {

@@ -24,7 +24,6 @@ import { isWorkbenchProject, listWorkbenchSources, wbQuery, removeWorkbenchSourc
 import { handleSqlConnect, handleSqlSchema, handleSqlStageDiscard, handleSourceChat, handleCombineSources, handleRemoveMember, liveQuery, LIVE_PREFIX } from "./text2sql/handler";
 import { handleSelectionChat, handleSelectionGet, handleSelectionSet, handleSelectionCommit, handleTableProfile, handleCatalog, describeError, chatStoreDegraded } from "./text2sql/selection-handler";
 import { selectionStoreDegraded } from "./sources/selection-store";
-import { streamingComposer } from "./text2sql/stream-compose";
 import { handleDashboardBuild } from "./dashboard/handler";
 import { buildWidgetSql } from "./dashboard/filters";
 import { handleDeckBuild, handleDeckEdit } from "./deck/handler";
@@ -1092,107 +1091,6 @@ export function createServer() {
   app.post("/api/sql/connect", async (req, res) => {
     const { status, body } = await handleSqlConnect(req.body, req.tenantId ?? DEV_TENANT);
     res.status(status).json(body);
-  });
-  // ---- streaming chat (SSE) ------------------------------------------------------
-  // Registered BEFORE every /api/sql/:connectionId/... route: ":connectionId" would
-  // otherwise happily capture "select" and shadow these.
-  //
-  // Same event contract for all three so the client parser is shared:
-  //   stage | query | token | selection | done | error
-  // Only the COMPOSITION pass streams; planning and query execution announce
-  // themselves with stage/query events. Each route delegates to the same handler
-  // the non-streaming endpoint uses — the streaming-ness is injected, not forked —
-  // so /api/sql/select, /api/gate and /api/source/chat keep working untouched and
-  // remain the client's fallback when a stream dies.
-  const sse = (res: express.Response) => {
-    res.setHeader("Content-Type", "text/event-stream");
-    res.setHeader("Cache-Control", "no-cache");
-    res.setHeader("Connection", "keep-alive");
-    res.setHeader("X-Accel-Buffering", "no");
-    res.flushHeaders?.();
-    return (ev: unknown) => { res.write(`data: ${JSON.stringify(ev)}\n\n`); };
-  };
-
-  app.post("/api/sql/select/stream", async (req, res) => {
-    const send = sse(res);
-    try {
-      send({ type: "stage", stage: "planning" });
-      const { body } = await handleSelectionChat(req.body, req.tenantId ?? DEV_TENANT, {
-        onQuery: (sql) => send({ type: "query", sql }),
-        answer: streamingComposer(send) as any,
-      });
-      if (body?.error) send({ type: "error", error: String(body.error) });
-      else {
-        if (Array.isArray(body?.selection)) {
-          // columns/focus are additive to the documented selection event: without
-          // them the streaming path would silently drop the column projection and
-          // the "open this table" hint that the one-shot reply carries.
-          send({
-            type: "selection", selection: body.selection,
-            added: body.added ?? [], removed: body.removed ?? [],
-            ...(body.columns ? { columns: body.columns } : {}),
-            ...(body.focus ? { focus: body.focus } : {}),
-          });
-        }
-        send({ type: "done", reply: String(body?.reply ?? ""), conversationId: String(body?.conversationId ?? "") });
-      }
-    } catch (err: any) {
-      console.error("[stream] /api/sql/select/stream FAILED:", err?.stack ?? err);
-      send({ type: "error", error: describeError(err) || "the selection stream failed" });
-    }
-    res.end();
-  });
-
-  app.post("/api/gate/stream", async (req, res) => {
-    const send = sse(res);
-    try {
-      const b = req.body ?? {};
-      if (typeof b.userPrompt !== "string" || !b.userPrompt.trim()) {
-        send({ type: "error", error: "userPrompt is required" });
-        return res.end();
-      }
-      send({ type: "stage", stage: "planning" });
-      const store = getChatStore();
-      let conversationId: string = typeof b.conversationId === "string" ? b.conversationId : "";
-      let history: any[] = [];
-      try {
-        if (conversationId) history = await store.getHistory(conversationId, 20);
-        else conversationId = await store.createConversation(b.userPrompt.slice(0, 80));
-        await store.appendMessage(conversationId, { role: "user", content: b.userPrompt });
-      } catch { /* memory best-effort, same as /api/gate */ }
-      send({ type: "stage", stage: "composing" });
-      const gate = (await gateTurn({
-        userPrompt: b.userPrompt, history,
-        artifactKind: String(b.artifactKind ?? "dashboard"),
-        artifactSummary: typeof b.artifactSummary === "string" ? b.artifactSummary : undefined,
-        datasets: Array.isArray(b.datasets) ? b.datasets : undefined,
-      }, streamingComposer(send) as any)) ?? { action: "edit" as const, reply: "" };
-      if (gate.action !== "edit" && gate.reply) {
-        try { await store.appendMessage(conversationId, { role: "assistant", content: gate.reply }); } catch { /* best-effort */ }
-      }
-      send({ type: "done", reply: String((gate as any).reply ?? ""), conversationId });
-    } catch (err: any) {
-      console.error("[stream] /api/gate/stream FAILED:", err?.stack ?? err);
-      send({ type: "error", error: describeError(err) || "the gate stream failed" });
-    }
-    res.end();
-  });
-
-  app.post("/api/source/chat/stream", async (req, res) => {
-    const send = sse(res);
-    try {
-      send({ type: "stage", stage: "planning" });
-      const { body } = await handleSourceChat(req.body, req.tenantId ?? DEV_TENANT, {
-        onQuery: (sql) => send({ type: "query", sql }),
-        compose: streamingComposer(send) as any,
-      });
-      if (body?.error) send({ type: "error", error: String(body.error) });
-      else send({ type: "done", reply: String(body?.answer ?? ""), conversationId: String(body?.conversationId ?? "") });
-    } catch (err: any) {
-      console.error("[stream] /api/source/chat/stream FAILED:", err?.stack ?? err);
-      send({ type: "error", error: describeError(err) || "the source chat stream failed" });
-    }
-    res.end();
   });
 
   // Close a database tab. Literal-ish segments ("members", "remove") make this

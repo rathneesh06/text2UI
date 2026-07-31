@@ -24,7 +24,6 @@ import {
   type StreamEvent, type ReportResult, type PptResult,
 } from "../api";
 import { sourceChat } from "../workbench-api";
-import { sourceChatStream } from "../api";
 import DeckPreview from "../components/DeckPreview";
 import type { Table } from "../lib/datasets";
 import type { DashboardSpec } from "../../shared/dashboard-spec";
@@ -50,7 +49,7 @@ interface Props {
 }
 
 type Phase = "planning" | "building" | "done" | "clarify" | "error";
-type Turn = { id: number; prompt: string; phase: Phase; stages: string[]; tail?: string | null; brief?: OrchestratorBrief; assistantText?: string; hydrated?: boolean; streaming?: boolean };
+type Turn = { id: number; prompt: string; phase: Phase; stages: string[]; tail?: string | null; brief?: OrchestratorBrief; assistantText?: string; hydrated?: boolean };
 type Result =
   | { kind: "dashboard"; app: GeneratedApp; brief?: OrchestratorBrief }
   | { kind: "deck"; compiled: CompiledDeck; pptxBase64: string; filename: string }
@@ -328,33 +327,17 @@ export default function ChatPage({
         if (dataQuestion && serverSource) {
           append("Looking that up in the data…");
           const req = { projectId, prompt, ...(conversationId ? { conversationId } : {}) };
+          // One-shot. Token streaming was built for this path but never actually
+          // exercised — no token ever streamed, so the sniff buffer, need_more
+          // suppression and caret were all unverified code sitting in the request
+          // path. Removed rather than shipped untested. The reply still renders as
+          // markdown; that was never part of streaming.
           try {
-            // Stream first: patch on every token so the answer appears as it is
-            // written, with the caret showing until `done`.
-            let acc = "";
-            const r = await sourceChatStream(req, (ev) => {
-              if (ev.type === "token") {
-                acc += ev.text;
-                patch({ phase: "done", tail: null, assistantText: acc, streaming: true });
-              } else if (ev.type === "query") {
-                append(`Running: ${ev.sql.replace(/\s+/g, " ").slice(0, 120)}`);
-              }
-            });
+            const r = await sourceChat(req);
             if (r.conversationId) adoptConvId(r.conversationId);
-            // `done` carries the authoritative reply — the accumulated tokens can
-            // be short if a round was withheld as need_more plumbing.
-            patch({ phase: "done", tail: null, assistantText: r.reply || acc, streaming: false });
+            patch({ phase: "done", tail: null, assistantText: r.answer });
             return;
-          } catch {
-            // Everything degrades rather than throws: a dead stream falls back to
-            // the one-shot call before it falls back to the grounded reply.
-            try {
-              const r = await sourceChat(req);
-              if (r.conversationId) adoptConvId(r.conversationId);
-              patch({ phase: "done", tail: null, assistantText: r.answer, streaming: false });
-              return;
-            } catch { /* fall back to the model's grounded reply */ }
-          }
+          } catch { /* fall back to the model's grounded reply */ }
         }
         patch({ phase: "done", tail: null, assistantText: reply });
       };
@@ -676,7 +659,6 @@ export default function ChatPage({
                     {t.phase === "done" && (
                       <div className="cp-md">
                         <ChatMarkdown text={t.assistantText ?? ""} />
-                        {t.streaming && <span className="md-caret" />}
                       </div>
                     )}
                     {t.phase === "error" && <div className="cp-err">{t.assistantText}</div>}
