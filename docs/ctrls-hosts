@@ -1,0 +1,55 @@
+# ctrls-hosts — internal hostname → IP mappings for the CtrlS estate.
+#
+# Append to your machine's hosts file:
+#   Windows  C:\Windows\System32\drivers\etc\hosts   (edit as Administrator)
+#   Linux    /etc/hosts
+#   macOS    /etc/hosts
+#
+#   # Windows (elevated PowerShell), from the repo root:
+#   Get-Content docs\ctrls-hosts | Add-Content -Path $env:WINDIR\System32\drivers\etc\hosts
+#
+#   # Linux / macOS:
+#   sudo sh -c 'cat docs/ctrls-hosts >> /etc/hosts'
+#
+# These names resolve only from inside the network (or over the VPN). A host that
+# pings from the office and times out from home is a routing problem, not a
+# mistake in this file.
+#
+# Lines starting with # are INACTIVE — see the notes at the bottom.
+
+#10.221.0.71        aiflow.ctrls.in dataflow.ctrls.in flowops.ctrls.in mcp.ctrls.in projectdesk.ctrls.in dataedge.ctrls.in minio.ctrls.in ci.ctrls.in
+10.221.0.61     gitlab.ctrls.in
+10.220.248.76    flowopsuat.ctrls.in minio-uat.ctrls.in mcpuat.ctrls.in ciuat.ctrls.in dataflowuat.ctrls.in vault-ai.ctrls.in
+10.220.248.63 myservice-api-uat.ctrls.in
+10.221.0.93 uatsso.ctrls.in
+10.220.248.69 sso-v1.ctrls.in
+10.220.248.85  myservice-api.ctrls.in myservice.ctrls.in
+10.220.248.84 flowops.ctrls.in
+10.220.248.83 mcp-prod.ctrls.in
+10.220.248.80 ci.ctrls.in
+10.220.248.28  git.ctrls.in
+10.220.248.29   build.ctrls.in
+202.65.137.25 emonitorh.ctrls.in
+#198.19.78.147 k8s-dashboard.ctrls.in
+
+# ---- notes ------------------------------------------------------------------
+#
+# COMMENTED-OUT LINES. The leading `#` on the 10.221.0.71 line comments out the
+# WHOLE line, all eight names on it — not just the first. So these seven names
+# have no active entry anywhere in this file and will not resolve:
+#
+#   aiflow.ctrls.in  dataflow.ctrls.in  mcp.ctrls.in  projectdesk.ctrls.in
+#   dataedge.ctrls.in  minio.ctrls.in  k8s-dashboard.ctrls.in
+#
+# If any of those are meant to work, uncomment the line — but read the next note
+# first, because two of its names are now served from elsewhere.
+#
+# DUPLICATES, currently harmless. `flowops.ctrls.in` and `ci.ctrls.in` appear
+# both on the commented 10.221.0.71 line and on active lines further down
+# (10.220.248.84 and 10.220.248.80). While that first line stays commented there
+# is no conflict. Uncomment it and each name is defined twice — most resolvers
+# take the FIRST match, so both would silently flip to 10.221.0.71.
+#
+# NOT ALL PRIVATE. 202.65.137.25 (emonitorh) is a public address; everything else
+# is RFC1918 except 198.19.78.147 (commented), which is in the RFC2544 benchmark
+# range rather than a normal private one.

@@ -36,7 +36,19 @@ const PAD = COMPACT ? " p-2.5" : " p-3";
 const GAP = COMPACT ? "grid grid-cols-12 gap-2" : "grid grid-cols-12 gap-2.5";
 const SECTION_MT = COMPACT ? "mt-2.5" : "mt-4";
 const KPI_TXT = COMPACT ? " text-xl" : " text-2xl";
+// DESIGN TOKENS from the plan (chosen once, from the curated references). Each
+// is optional: absent means keep the Tailwind default that shipped before, so a
+// plan that says nothing renders exactly as it always did.
+const BG = PLAN.meta && HEX.test(String(PLAN.meta.background || "")) ? PLAN.meta.background : "";
+const SURFACE = PLAN.meta && HEX.test(String(PLAN.meta.surface || "")) ? PLAN.meta.surface : "";
+const RADIUS = PLAN.meta && typeof PLAN.meta.radius === "number" ? PLAN.meta.radius : null;
+const HEAD_FONT = PLAN.meta && /^[A-Za-z0-9 _-]{2,40}$/.test(String(PLAN.meta.headingFont || "")) ? PLAN.meta.headingFont : "";
 const CARD_CLS = (DARK ? " bg-slate-900 rounded-xl border border-slate-800 shadow-sm" : " bg-white rounded-xl border border-slate-200 shadow-sm") + PAD;
+// Inline style wins over the utility classes above without having to rewrite them.
+const CARD_STYLE = {};
+if (SURFACE) CARD_STYLE.background = SURFACE;
+if (RADIUS !== null) CARD_STYLE.borderRadius = RADIUS + "px";
+const HEAD_STYLE = HEAD_FONT ? { fontFamily: '"' + HEAD_FONT + '", ui-sans-serif, system-ui, sans-serif' } : {};
 const TICK = DARK ? "#94a3b8" : "#64748b";
 const GRID = DARK ? "#334155" : "#e2e8f0";
 // GLOBAL FILTERS (A1): the compiled plan carries the filter bar (columns,
@@ -122,7 +134,7 @@ function Empty(props) {
 }
 function Card(props) {
   return (
-    <div className={widthClass(props.width) + CARD_CLS}>
+    <div className={widthClass(props.width) + CARD_CLS} style={CARD_STYLE}>
       {props.title ? <div className={"text-sm font-medium " + (DARK ? "text-slate-200" : "text-slate-700")}>{props.title}</div> : null}
       {props.subtitle ? <div className="text-xs text-slate-400 mb-1.5">{props.subtitle}</div> : <div className="mb-1" />}
       {props.children}
@@ -193,7 +205,7 @@ function Kpi(props) {
   const chip = COLORS[(props.idx || 0) % COLORS.length];
   const isSel = useSelected(w.id);
   return (
-    <div className={widthClass(w.width || "quarter") + CARD_CLS + " cursor-pointer" + (isSel ? SEL_RING : "")}
+    <div className={widthClass(w.width || "quarter") + CARD_CLS + " cursor-pointer" + (isSel ? SEL_RING : "")} style={CARD_STYLE}
          title={isSel ? "Selected — your next edit targets this. Click again or press Escape to clear." : "Click to target this widget in chat"}
          onClick={function () { toggleSelect(w, "kpi", "kpi", props.sql); }}>
       <div className="flex items-start justify-between gap-2">
@@ -407,9 +419,9 @@ export default function App() {
   function setFilter(id, v) { setFv(function (prev) { const n = Object.assign({}, prev); n[id] = v; return n; }); }
   function resetFilters() { setFv({}); }
   return (
-    <div className={"min-h-screen font-sans " + (DARK ? "bg-slate-950 text-slate-100" : "bg-slate-50 text-slate-900")}>
+    <div className={"min-h-screen font-sans " + (DARK ? "bg-slate-950 text-slate-100" : "bg-slate-50 text-slate-900")} style={BG ? { background: BG } : {}}>
       <div className="mx-auto p-3 md:p-4" style={{ maxWidth: "1600px" }}>
-        <h1 className="text-2xl font-bold tracking-tight">{PLAN.meta.title}</h1>
+        <h1 className="text-2xl font-bold tracking-tight" style={HEAD_STYLE}>{PLAN.meta.title}</h1>
         {PLAN.meta.subtitle ? <p className={"text-sm mt-1 " + (DARK ? "text-slate-400" : "text-slate-500")}>{PLAN.meta.subtitle}</p> : null}
         {PLAN.meta.insight ? (
           <div className="mt-3 rounded-xl px-4 py-3 text-sm font-medium text-white flex items-center gap-3"

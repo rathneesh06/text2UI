@@ -92,8 +92,14 @@ export function isIdLike(name: string, uniqueCount: number, rowCount: number): b
   return rowCount > 0 && uniqueCount >= rowCount * 0.9;
 }
 
-/** Measures minus id-masquerades — what the metric tier should aggregate. */
-function realMeasures(datasets: Dataset[], measures: RoledColumn[]): RoledColumn[] {
+/** Measures minus id-masquerades — what the metric tier should aggregate.
+ *
+ *  Exported because the dashboard agents' deterministic fallbacks need exactly
+ *  this filter: without it they summed primary keys and shipped KPIs reading
+ *  "TOTAL ITILTICKETID 3.3B". One definition, used everywhere — a second ID
+ *  heuristic would drift from this one and reintroduce the bug on whichever
+ *  path was not updated. */
+export function realMeasures(datasets: Dataset[], measures: RoledColumn[]): RoledColumn[] {
   const rowsOf = new Map(datasets.map((d) => [d.tableName, d.profile.rowCount]));
   return measures.filter((m) => !isIdLike(m.col.name, m.col.uniqueCount, rowsOf.get(m.table) ?? 0));
 }

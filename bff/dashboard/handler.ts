@@ -30,6 +30,8 @@ import { planSpec, HEX_RE, type PlanSpecInput } from "./planner";
 import { enhanceQuery, briefToStyleHints, briefToAnalyticalDirective, type Enhancement } from "./enhance";
 import { runChartAgents, type AgentRun, type AgentHarvest } from "./agents";
 import { decomposeQuery, type PlanDesign } from "./decompose";
+import { staticReferences } from "../design-rag/static-refs";
+import { designTokenBlock, DESIGN_FAMILY } from "../design-tokens";
 import { buildSemanticModel, semanticDigest } from "../datasources/semantic";
 import { audit, newTurnId } from "../datasources/audit";
 import { mergeHarvest, seededPalette } from "./merge";
@@ -149,7 +151,16 @@ export async function handleDashboardBuild(
     // QUERY BREAKDOWN LAYER: decompose the request into grounded analytical
     // tasks, routed to the agent families below. Trivial prompts skip the model
     // call; failures fall back to deterministic schema-derived tasks.
-    const { tasks, source: taskSource, design, reasoning } = await decomposeQuery(datasets, b.userPrompt, enhancement.combined, deps.agentRun);
+    // DESIGN REFERENCES reach the spec pipeline HERE and nowhere else. Until now
+    // retrieveForBuild was called only on the assembler (React-codegen) path, so
+    // every dashboard built through these agents was reference-blind — the
+    // visible reason curated references never showed up in the output.
+    // staticReferences() never throws; no refs means the previous behaviour.
+    const curated = await staticReferences();
+    const { tasks, source: taskSource, design, reasoning } = await decomposeQuery(
+      datasets, b.userPrompt, enhancement.combined, deps.agentRun,
+      { images: curated.images, tokenBlock: designTokenBlock(DESIGN_FAMILY) },
+    );
     planDesign = design;
     audit({ turnId, conversationId, stage: "decompose", detail: { source: taskSource, tasks: tasks.map((t) => ({ kind: t.kind, q: t.question.slice(0, 80) })), ...(design ? { design } : {}), ...(reasoning ? { reasoning: reasoning.slice(0, 300) } : {}) } });
     const harvest = await runChartAgents(
@@ -259,6 +270,15 @@ export async function handleDashboardBuild(
   // then the SEEDED palette (per-domain distinct), never a fixed constant.
   if (!spec.meta.chartPalette?.length) spec.meta.chartPalette = planDesign?.palette ?? seededPalette(paletteSeed(datasets));
   if (!spec.meta.accent || !HEX_RE.test(spec.meta.accent)) spec.meta.accent = planDesign?.accent ?? spec.meta.chartPalette[0];
+  // The concrete tokens the plan chose from the references. Only filled when the
+  // spec doesn't already carry them, so a user's explicit edit ("make it dark")
+  // still wins over the plan's opinion.
+  const m = spec.meta as unknown as Record<string, unknown>;
+  if (planDesign?.background && !m.background) m.background = planDesign.background;
+  if (planDesign?.surface && !m.surface) m.surface = planDesign.surface;
+  if (planDesign?.theme && !spec.meta.theme) spec.meta.theme = planDesign.theme;
+  if (planDesign?.headingFont && !m.headingFont) m.headingFont = planDesign.headingFont;
+  if (planDesign?.radius !== undefined && m.radius === undefined) m.radius = planDesign.radius;
 
   // ---- Stage 2.9: measure-on-demand join verification --------------------------
   // The verified-edge law stands; this turns "rejected because unmeasured" into

@@ -19,7 +19,7 @@
 import { getChatStore, type ChatStore } from "../chat-store";
 import {
   openConnection, openConnectionWith, getConnection, getHandle, closeConnectionHandle, publicView, profileTables,
-  markExecution, openGroup, newMemberId, memberIdForCatalog, removeGroupMember, soloMemberId,
+  markExecution, openGroup, newMemberId, memberIdForCatalog, parseRef, removeGroupMember, soloMemberId,
   type ConnRecord, type GroupPart,
 } from "../sources/connection-registry";
 import { getSelection, setSelection } from "../sources/selection-store";
@@ -240,11 +240,12 @@ export async function stageSnapshot(
     // so translate to the fully-qualified db:schema.table form the resolver
     // matches first. Names we can't map are passed through unchanged and fail
     // the normal way, with a "table not found" the user can read.
-    const REF = /^([A-Za-z0-9_]+)\."([^"]+)"\."([^"]+)"$/;
+    // parseRef is the ONE parser for `src{i}."schema"."table"` — shared with
+    // routeTablesToMembers, because a second copy is how this bug came back.
     const byName = new Map(rec.allTables.map((t) => [t.name, t]));
     const qualified = cleaned.map((want) => {
-      const m = byName.get(want)?.ref?.match(REF);
-      return m ? `${m[1]}:${m[2]}.${m[3]}` : want;
+      const r = parseRef(byName.get(want)?.ref ?? "");
+      return r ? `${r.catalog}:${r.schema}.${r.table}` : want;
     });
     mkdirSync(dirname(dbPath), { recursive: true });
     const h = await attachGroup(members.map((p) => p.conn), { dbPath, onPhase });

@@ -199,12 +199,37 @@ function rateLimitMessage(bodyText: string): string {
 export async function checkModelHealth(): Promise<{ ok: boolean; detail: string }> {
   if (!API_KEY) return { ok: false, detail: "GEMINI_API_KEY is not set" };
   try {
-    const res = await fetch(API_URL(), {
+    // THINKING PROBE, folded into the startup ping so it costs no extra request.
+    // Gemini 3.x rejects the 2.x thinkingConfig shape with a bare 400
+    // INVALID_ARGUMENT. Discovering that lazily meant the FIRST REAL BUILD paid
+    // for it — a 400 plus a retry, which was enough to push the parallel
+    // dashboard agents past their timeout and drop the whole board to
+    // deterministic fallbacks. Probing here means the flag is already correct by
+    // the time a user asks for anything.
+    const probeThinking = THINKING_FIELD_OK;
+    const ping = (withThinking: boolean) => fetch(API_URL(), {
       method: "POST",
       headers: { "Content-Type": "application/json", "x-goog-api-key": API_KEY },
-      body: JSON.stringify({ contents: [{ role: "user", parts: [{ text: "ping" }] }], generationConfig: { maxOutputTokens: 1 } }),
+      body: JSON.stringify({
+        contents: [{ role: "user", parts: [{ text: "ping" }] }],
+        generationConfig: {
+          maxOutputTokens: 1,
+          ...(withThinking ? { thinkingConfig: { thinkingBudget: 0 } } : {}),
+        },
+      }),
     });
-    if (res.ok) return { ok: true, detail: `model reachable (${MODEL})` };
+    let res = await ping(probeThinking);
+    if (!res.ok && res.status === 400 && probeThinking) {
+      const t = await res.clone().text().catch(() => "");
+      if (/INVALID_ARGUMENT/.test(t)) {
+        THINKING_FIELD_OK = false;
+        console.warn(`[gemini] startup probe: thinkingConfig rejected by ${MODEL} — dropping the field for this process`);
+        res = await ping(false); // re-verify reachability without it
+      }
+    }
+    if (res.ok) {
+      return { ok: true, detail: `model reachable (${MODEL})${THINKING_FIELD_OK ? "" : ", thinkingConfig unsupported"}` };
+    }
     const text = (await res.text().catch(() => "")).replace(/\s+/g, " ").slice(0, 300);
     // MODEL AUTO-RESOLUTION: a retired/re-pointed model name is a Google-side
     // change, not a user error — ask ListModels what this key can use, pick

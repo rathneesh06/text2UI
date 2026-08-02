@@ -94,6 +94,82 @@ export function memberIdForCatalog(parts: GroupPart[], catalog: string): string 
   return parts[Number(m[1])]?.id ?? null;
 }
 
+/** A merged table's ref: `src{i}."schema"."table"`. The ONE parser for this —
+ *  stageSnapshot and the per-member routing below both go through it, because
+ *  writing a second one is how the merged-name bug came back. */
+const REF_RE = /^([A-Za-z0-9_]+)\."([^"]+)"\."([^"]+)"$/;
+export function parseRef(ref: string): { catalog: string; schema: string; table: string } | null {
+  const m = REF_RE.exec(String(ref ?? ""));
+  return m ? { catalog: m[1], schema: m[2], table: m[3] } : null;
+}
+
+export interface MemberRoute {
+  part: GroupPart;
+  /** Names to ask THAT member for, in its own catalog's terms. */
+  sourceNames: string[];
+  /** source name -> merged display name, to map results back on the way out. */
+  displayOf: Map<string, string>;
+}
+
+/**
+ * Split a list of MERGED display names into per-member work.
+ *
+ * Two translations happen here, and both have bitten this codebase:
+ *
+ *   1. rec.conn is only parts[0] ("placeholder for shape"), so anything that
+ *      reads metadata through it silently only ever sees the first database.
+ *   2. mergeGroupParts invents `users_2` for a collision. That name exists in no
+ *      real catalog, so asking any member for it returns nothing — which is how
+ *      the Stage 1 proof skipped two of three tables.
+ *
+ * The member-local name is used as the source identifier rather than a rebuilt
+ * `schema.table`, because it is already in the exact form each engine's own
+ * introspection expects (bare for the default schema, qualified otherwise) — so
+ * no dialect branching is needed here.
+ *
+ * A SOLO connection yields exactly one route with identity mapping, so callers
+ * need no special case and behaviour is unchanged for them.
+ */
+export function routeTablesToMembers(
+  rec: ConnRecord,
+  names: string[],
+): { routes: MemberRoute[]; unresolved: string[] } {
+  const parts = rec.groupParts ?? [];
+  if (!parts.length) {
+    const solo: GroupPart = {
+      id: soloMemberId(rec), conn: rec.conn, label: rec.label,
+      allTables: rec.allTables, datasets: rec.datasets,
+    };
+    return {
+      routes: [{ part: solo, sourceNames: [...names], displayOf: new Map(names.map((n) => [n, n])) }],
+      unresolved: [],
+    };
+  }
+
+  const byDisplay = new Map(rec.allTables.map((t) => [t.name, t]));
+  const byIndex = new Map<number, MemberRoute>();
+  const unresolved: string[] = [];
+
+  for (const want of names) {
+    const merged = byDisplay.get(want);
+    const ref = merged ? parseRef(merged.ref) : null;
+    const m = ref ? /^src(\d+)$/.exec(ref.catalog) : null;
+    const i = m ? Number(m[1]) : -1;
+    const part = parts[i];
+    if (!merged || !ref || !part) { unresolved.push(want); continue; }
+
+    // The name this member's OWN catalog knows the table by.
+    const local = part.allTables.find((x) => x.schema === ref.schema && x.table === ref.table);
+    const sourceName = local?.name ?? ref.table;
+
+    let route = byIndex.get(i);
+    if (!route) { route = { part, sourceNames: [], displayOf: new Map() }; byIndex.set(i, route); }
+    route.sourceNames.push(sourceName);
+    route.displayOf.set(sourceName, want);
+  }
+  return { routes: [...byIndex.values()], unresolved };
+}
+
 const TTL_MS = Number(process.env.WB_CONN_TTL_MS ?? 4 * 3_600_000); // 4h idle default
 const records = new Map<string, ConnRecord>();
 
@@ -469,9 +545,6 @@ export async function profileTables(
   const need0 = tables.filter((t) => !rec.datasets.some((d) => d.tableName === t));
   if (need0.length) {
     const introspect = opts.deps?.introspect ?? introspectDb;
-    const fp = connFingerprint(rec.conn);
-    let need = need0;
-    let sigs: Map<string, string> | null = null;
 
     const sigsFor = async (names: string[]): Promise<Map<string, string>> => {
       const infos = rec.allTables.filter((t) => names.includes(t.name));
@@ -480,27 +553,58 @@ export async function profileTables(
       return catalogSignatures(readAll, infos);
     };
 
-    if (cacheEnabled() && !opts.refresh) {
-      try {
-        sigs = await sigsFor(need0);
-        const { hits, misses, note } = cacheLookup(fp, need0, sigs);
-        if (hits.length) {
-          rec.datasets = [...rec.datasets, ...hits];
-          if (note) { rec.warnings.push(note); console.log(`[schema-cache] ${rec.id}: ${note}`); }
-        }
-        need = misses;
-      } catch { need = need0; }
-    }
+    // PER MEMBER, for two reasons. Introspecting through rec.conn only ever saw
+    // parts[0], so the planner never learned member 2+'s columns. And the cache
+    // key was connFingerprint(rec.conn) for every member, so two members owning a
+    // same-named table collided — serving member 0's columns for member 1's
+    // table, a silent wrong answer rather than a visible gap.
+    const { routes, unresolved } = routeTablesToMembers(rec, need0);
+    for (const u of unresolved) rec.warnings.push(`${u}: could not tell which database it belongs to`);
 
-    if (need.length) {
-      const r = await introspect(rec.conn, { tables: need, sampleRows: 5 });
-      rec.datasets = [...rec.datasets, ...r.datasets];
-      rec.warnings.push(...r.warnings);
-      if (cacheEnabled()) {
+    for (const route of routes) {
+      const fp = connFingerprint(route.part.conn);
+      // Signatures are keyed by MERGED name (that is what rec.allTables holds),
+      // while the cache is keyed per member — so translate on the way in.
+      const displays = route.sourceNames.map((s) => route.displayOf.get(s) ?? s);
+      let need = displays;
+      let sigs: Map<string, string> | null = null;
+
+      if (cacheEnabled() && !opts.refresh) {
         try {
-          if (!sigs) sigs = await sigsFor(need);
-          cacheStore(fp, rec.label, r.datasets, sigs);
-        } catch { /* best-effort write-through */ }
+          sigs = await sigsFor(displays);
+          const { hits, misses, note } = cacheLookup(fp, displays, sigs);
+          if (hits.length) {
+            rec.datasets = [...rec.datasets, ...hits];
+            if (note) { rec.warnings.push(note); console.log(`[schema-cache] ${rec.id}: ${note}`); }
+          }
+          need = misses;
+        } catch { need = displays; }
+      }
+
+      if (need.length) {
+        // Ask the owning member for its OWN names, then map the answers back to
+        // the merged display names everything downstream keys on.
+        const toSource = new Map([...route.displayOf].map(([s, d]) => [d, s]));
+        const sourceNeed = need.map((d) => toSource.get(d) ?? d);
+        try {
+          const r = await introspect(route.part.conn, { tables: sourceNeed, sampleRows: 5 });
+          const mapped = r.datasets.map((d) => {
+            const display = route.displayOf.get(d.tableName);
+            return display && display !== d.tableName ? { ...d, tableName: display } : d;
+          });
+          rec.datasets = [...rec.datasets, ...mapped];
+          rec.warnings.push(...r.warnings);
+          if (cacheEnabled()) {
+            try {
+              if (!sigs) sigs = await sigsFor(need);
+              cacheStore(fp, route.part.label, mapped, sigs);
+            } catch { /* best-effort write-through */ }
+          }
+        } catch (err: any) {
+          // One member failing must not cost the others their profiles.
+          rec.warnings.push(`${route.part.label}: ${(err?.message ?? err)}`);
+          console.warn(`[registry] introspect failed for member ${route.part.id}: ${err?.message ?? err}`);
+        }
       }
     }
   }

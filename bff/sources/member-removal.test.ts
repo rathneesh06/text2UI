@@ -16,7 +16,7 @@
 // opt-in suite: group-extract.live.test.ts.)
 import assert from "node:assert";
 import {
-  openGroup, removeGroupMember, publicView, getConnection, soloMemberId,
+  openGroup, removeGroupMember, publicView, getConnection, soloMemberId, routeTablesToMembers,
   type GroupPart,
 } from "./connection-registry";
 
@@ -131,6 +131,57 @@ const nameOf = (rec: any, memberId: string) =>
   assert.equal(removed, null);
   assert.deepEqual(removedTables, []);
   assert.equal(rec!.groupParts?.length, 3, "nothing was disturbed");
+}
+
+// ---- routing merged names back to the member that OWNS them ---------------------
+// Four consumers read metadata through rec.conn, which for a group is only
+// parts[0] — so clicking a table in the second tab returned no columns at all.
+// The fix routes per member, and has to undo the merge's collision suffixes on
+// the way: `users_2` exists in no real catalog, so asking any member for it
+// returns nothing. That is the exact failure that made the Stage 1 proof skip two
+// of three tables, so it is pinned here rather than left to a live click.
+{
+  const g = openGroup(T, mk());   // A: users, orders | B: users | C: users
+
+  // The merged catalog is what the UI and the selection state speak.
+  const merged = publicView(g).allTables.map((t: any) => t.name).sort();
+  assert.deepEqual(merged, ["orders", "users", "users_2", "users_3"]);
+
+  // A collision-suffixed name must route to ITS OWN member, asking for the
+  // SOURCE name. This is the case that has broken twice.
+  const r1 = routeTablesToMembers(g, ["users_3"]);
+  assert.equal(r1.routes.length, 1, "one member is involved");
+  assert.equal(r1.routes[0].part.id, "mem_c", "users_3 belongs to C, not to A");
+  assert.deepEqual(r1.routes[0].sourceNames, ["users"], "asked for the SOURCE name, not the merged one");
+  assert.equal(r1.routes[0].displayOf.get("users"), "users_3", "and maps back to the merged name");
+  assert.deepEqual(r1.unresolved, []);
+
+  // Several tables spanning several members fan out, one call per member.
+  const r2 = routeTablesToMembers(g, ["orders", "users", "users_2", "users_3"]);
+  assert.equal(r2.routes.length, 3, "three members, three calls");
+  const byMember = Object.fromEntries(r2.routes.map((r) => [r.part.id, r.sourceNames.slice().sort()]));
+  assert.deepEqual(byMember["mem_a"], ["orders", "users"]);
+  assert.deepEqual(byMember["mem_b"], ["users"]);
+  assert.deepEqual(byMember["mem_c"], ["users"]);
+
+  // Every member asks for a table literally called `users`, and each answer maps
+  // back to a DIFFERENT merged name — the property that stops member 0's columns
+  // being served for member 1's table.
+  const backs = r2.routes.map((r) => r.displayOf.get("users")).sort();
+  assert.deepEqual(backs, ["users", "users_2", "users_3"]);
+
+  // An unknown name is reported, not silently routed to member 0.
+  const r3 = routeTablesToMembers(g, ["ghost"]);
+  assert.deepEqual(r3.routes, []);
+  assert.deepEqual(r3.unresolved, ["ghost"]);
+
+  // A SOLO connection yields one identity route, so callers need no special case.
+  removeGroupMember(g, "mem_b");
+  removeGroupMember(g, "mem_c");            // now a plain connection holding A
+  const r4 = routeTablesToMembers(g, ["orders"]);
+  assert.equal(r4.routes.length, 1);
+  assert.equal(r4.routes[0].part.conn, g.conn, "solo routes over the record's own conn");
+  assert.deepEqual(r4.routes[0].sourceNames, ["orders"], "identity mapping — unchanged behaviour");
 }
 
 console.log("member-removal.test.ts: all assertions passed ✅");

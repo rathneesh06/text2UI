@@ -52,6 +52,7 @@
     "import:gallery": "tsx bff/design-rag/gallery-import.ts",
     "test:ratelimit": "tsx bff/ratelimit.test.ts",
     "db:introspect": "tsx bff/sources/mysql-cli.ts",
+    "hosts:apply": "powershell -NoProfile -ExecutionPolicy Bypass -File scripts/apply-hosts.ps1",
     "test:sources": "tsx bff/sources/mysql.test.ts",
     "test:member-removal": "tsx bff/sources/member-removal.test.ts",
     "test:combined-schema": "tsx bff/text2sql/combined-schema.test.ts",

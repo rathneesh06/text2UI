@@ -18,10 +18,15 @@ import type { Dataset } from "../../shared/types";
 import type { Compare, KpiWidget, ChartWidget, TableWidget, Widget, Filter } from "../../shared/dashboard-spec";
 import { callGemini, ORCHESTRATE_OPTS, type GenResult, type GenOptions } from "../aiflow";
 import { classifySchema, type SchemaRoles } from "./enhance";
+import { realMeasures } from "../datasources/semantic";
 import { tasksForAgent, taskDirective, type AnalysisTask } from "./decompose";
 
 export type AgentRun = (system: string, user: string, opts?: GenOptions) => Promise<GenResult>;
-const AGENT_TIMEOUT_MS = Number(process.env.DASHBOARD_AGENT_TIMEOUT_MS ?? 15000);
+// Agents run in PARALLEL, so this is wall-clock per agent, not a cumulative
+// budget. 15s was too tight: a first call that hits the thinkingConfig 400 and
+// retries can burn most of it, and every agent then times out together — which
+// looked like "model failed" with no error line anywhere.
+const AGENT_TIMEOUT_MS = Number(process.env.DASHBOARD_AGENT_TIMEOUT_MS ?? 30000);
 
 // ---------------------------------------------------------------------------
 // Shared schema fragments (compact OpenAPI subset — Gemini-friendly)
@@ -185,16 +190,30 @@ function tableOf(datasets: Dataset[], name: string): Dataset | undefined {
 export function fallbackKpis(datasets: Dataset[], roles: SchemaRoles): KpiWidget[] {
   const out: KpiWidget[] = [];
   const main = datasets[0];
-  if (main) out.push({ id: wid("kpi"), kind: "kpi", title: `Total ${main.tableName}`, table: main.tableName, metric: { col: main.profile.columns[0]?.name ?? "*", agg: "count", format: "compact" }, width: "quarter" });
-  for (const m of roles.measures.slice(0, 3)) {
+  // `count` counts ROWS, so "Total <table>" reads as a sum of something. Say what
+  // it is: a count of records.
+  if (main) out.push({ id: wid("kpi"), kind: "kpi", title: `${main.tableName} records`, table: main.tableName, metric: { col: main.profile.columns[0]?.name ?? "*", agg: "count", format: "compact" }, width: "quarter" });
+  // NEVER sum an id. roles.measures is "numeric", which includes primary keys —
+  // summing one produced "TOTAL ITILTICKETID 3.3B". realMeasures is the semantic
+  // layer's existing filter; reuse it rather than writing a second heuristic.
+  const measures = realMeasures(datasets, roles.measures);
+  for (const m of measures.slice(0, 3)) {
     out.push({ id: wid("kpi"), kind: "kpi", title: `Total ${m.col.name}`, table: m.table, metric: { col: m.col.name, agg: "sum", format: "compact" }, width: "quarter" });
     if (out.length >= 3) break;
   }
   const idc = roles.identifiers[0];
   if (idc && out.length < 5) out.push({ id: wid("kpi"), kind: "kpi", title: `Distinct ${idc.col.name}`, table: idc.table, metric: { col: idc.col.name, agg: "count_distinct", format: "compact" }, width: "quarter" });
-  if (out.length < 3 && roles.measures[0]) {
-    const m = roles.measures[0];
+  if (out.length < 3 && measures[0]) {
+    const m = measures[0];
     out.push({ id: wid("kpi"), kind: "kpi", title: `Average ${m.col.name}`, table: m.table, metric: { col: m.col.name, agg: "avg", format: "number" }, width: "quarter" });
+  }
+  // No real measure anywhere: a DISTINCT count of an id is honest and useful,
+  // where a sum of it is neither.
+  if (out.length < 2 && !measures.length) {
+    for (const i of roles.identifiers.slice(0, 2)) {
+      if (out.some((k) => k.table === i.table && k.metric.col === i.col.name)) continue;
+      out.push({ id: wid("kpi"), kind: "kpi", title: `Distinct ${i.col.name}`, table: i.table, metric: { col: i.col.name, agg: "count_distinct", format: "compact" }, width: "quarter" });
+    }
   }
   // A2: one HONEST derived-ratio KPI when the data supports it — so the ratio
   // machinery is exercised even without a model (degraded mode / offline tests).
@@ -233,7 +252,7 @@ export function fallbackRatioKpi(datasets: Dataset[], roles: SchemaRoles): KpiWi
 export function fallbackBars(datasets: Dataset[], roles: SchemaRoles): ChartWidget[] {
   const dim = roles.dimensions.find((d) => d.col.uniqueCount >= 2);
   if (!dim) return [];
-  const measure = roles.measures.find((m) => m.table === dim.table);
+  const measure = realMeasures(datasets, roles.measures).find((m) => m.table === dim.table);
   const series = measure ? [{ col: measure.col.name, agg: "sum" as const, format: "compact" as const }] : [{ col: dim.col.name, agg: "count" as const }];
   const what = measure ? measure.col.name : "count";
   return [{ id: wid("bar"), kind: "bar", title: `${what} by ${dim.col.name}`, table: dim.table, x: { col: dim.col.name }, series, limit: 15, width: "half" }];
@@ -242,7 +261,7 @@ export function fallbackBars(datasets: Dataset[], roles: SchemaRoles): ChartWidg
 export function fallbackLines(datasets: Dataset[], roles: SchemaRoles): ChartWidget[] {
   const t = roles.temporals[0];
   if (!t) return [];
-  const measure = roles.measures.find((m) => m.table === t.table);
+  const measure = realMeasures(datasets, roles.measures).find((m) => m.table === t.table);
   const series = measure ? [{ col: measure.col.name, agg: "sum" as const, format: "compact" as const }] : [{ col: t.col.name, agg: "count" as const }];
   const what = measure ? measure.col.name : "records";
   return [{ id: wid("line"), kind: "line", title: `${what} over time`, table: t.table, x: { col: t.col.name, timeGrain: t.suggestedGrain ?? "month" }, series, width: "half" }];
@@ -251,7 +270,7 @@ export function fallbackLines(datasets: Dataset[], roles: SchemaRoles): ChartWid
 export function fallbackPies(datasets: Dataset[], roles: SchemaRoles): ChartWidget[] {
   const dim = roles.dimensions.find((d) => d.col.uniqueCount >= 2 && d.col.uniqueCount <= 8);
   if (!dim) return [];
-  const measure = roles.measures.find((m) => m.table === dim.table);
+  const measure = realMeasures(datasets, roles.measures).find((m) => m.table === dim.table);
   const series = measure ? [{ col: measure.col.name, agg: "sum" as const }] : [{ col: dim.col.name, agg: "count" as const }];
   return [{ id: wid("pie"), kind: "donut", title: `Share by ${dim.col.name}`, table: dim.table, x: { col: dim.col.name }, series, width: "half" }];
 }
@@ -261,7 +280,7 @@ export function fallbackTables(datasets: Dataset[], roles: SchemaRoles): TableWi
   if (!dim) return [];
   const ds = tableOf(datasets, dim.table);
   if (!ds) return [];
-  const measure = roles.measures.find((m) => m.table === dim.table);
+  const measure = realMeasures(datasets, roles.measures).find((m) => m.table === dim.table);
   const columns = [
     { col: dim.col.name },
     { col: measure ? measure.col.name : (ds.profile.columns[0]?.name ?? dim.col.name), agg: (measure ? "sum" : "count") as "sum" | "count" },
@@ -331,7 +350,15 @@ const TABLE_AGENT: AgentDef<TableWidget> = {
   fallback: fallbackTables,
 };
 
-export interface AgentReport { name: string; source: "model" | "fallback" | "skipped"; count: number; modelFailed?: boolean }
+export interface AgentReport {
+  name: string;
+  source: "model" | "fallback" | "skipped";
+  count: number;
+  modelFailed?: boolean;
+  /** WHY the fallback ran. "timeout" and "error" both read as [model failed]
+   *  before, which hid that the agents were simply running out of clock. */
+  reason?: "timeout" | "error" | "unusable";
+}
 export interface AgentHarvest {
   kpis: KpiWidget[];
   trends: ChartWidget[];       // line/area
@@ -350,23 +377,34 @@ async function runAgent<T extends Widget>(
   const timeout = new Promise<null>((resolve) => setTimeout(() => resolve(null), timeoutMs));
   let modelFailed = false; // E1: distinguish "model errored/timed out" (surface
                            // to the user) from "model answered but unusably"
+  // A timeout and a thrown error both printed "[model failed]" and were
+  // indistinguishable in the report — but they have opposite remedies (raise the
+  // budget vs. fix the call), so they are separated here.
+  let reason: "timeout" | "error" | "unusable" | undefined;
   const call = (async (): Promise<T[] | null> => {
     try {
       const { text } = await run(def.system, userPromptFor(input, def.ask, def.name), { ...ORCHESTRATE_OPTS, responseSchema: def.schema });
       const widgets = def.coerce(JSON.parse(stripFences(text)));
-      return widgets.length ? widgets : null;
+      if (widgets.length) return widgets;
+      reason = "unusable"; // answered, but nothing usable came back
+      return null;
     } catch (err) {
       console.warn(`[agent:${def.name}] failed: ${(err as Error).message}`);
       modelFailed = true;
+      reason = "error";
       return null;
     }
   })();
   const raced = await Promise.race([call.then((v) => ({ v, timedOut: false })), timeout.then(() => ({ v: null as T[] | null, timedOut: true }))]);
-  if (raced.timedOut) modelFailed = true;
+  if (raced.timedOut) { modelFailed = true; reason = "timeout"; }
   if (raced.v) return { widgets: raced.v, report: { name: def.name, source: "model", count: raced.v.length } };
   const fb = def.fallback(input.datasets, roles);
-  console.log(`[agent:${def.name}] using deterministic fallback (${fb.length} widget(s))${modelFailed ? " [model failed]" : ""}`);
-  return { widgets: fb, report: { name: def.name, source: "fallback", count: fb.length, modelFailed } };
+  const why = reason === "timeout" ? ` [timeout after ${timeoutMs}ms]`
+    : reason === "error" ? " [model error — see the failure above]"
+    : reason === "unusable" ? " [model answered but produced no usable widget]"
+    : "";
+  console.log(`[agent:${def.name}] using deterministic fallback (${fb.length} widget(s))${why}`);
+  return { widgets: fb, report: { name: def.name, source: "fallback", count: fb.length, modelFailed, ...(reason ? { reason } : {}) } };
 }
 
 /** Fan out all specialist agents IN PARALLEL. Total: every agent either returns
@@ -382,6 +420,8 @@ export async function runChartAgents(input: AgentInput, run: AgentRun = callGemi
     runAgent(TABLE_AGENT, input, roles, run, timeoutMs),
   ]);
   const reports = [kpi.report, bar.report, line.report, pie.report, table.report];
-  console.log(`[agents] ${reports.map((r) => `${r.name}:${r.source}(${r.count})`).join(" ")}`);
+  // Carry the reason into the summary: "kpi:fallback(5)" alone never said whether
+  // to raise the timeout or go and fix the call.
+  console.log(`[agents] ${reports.map((r) => `${r.name}:${r.source}${r.reason ? `/${r.reason}` : ""}(${r.count})`).join(" ")}`);
   return { kpis: kpi.widgets, bars: bar.widgets, trends: line.widgets, compositions: pie.widgets, tables: table.widgets, reports };
 }

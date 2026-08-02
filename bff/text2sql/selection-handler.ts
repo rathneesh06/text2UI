@@ -22,7 +22,7 @@
 import { randomUUID } from "node:crypto";
 import { getChatStore, InMemoryChatStore, type ChatStore } from "../chat-store";
 import { describeError } from "../sources/describe-error";
-import { getConnection, getHandle, memberIdForCatalog, soloMemberId, type ConnRecord } from "../sources/connection-registry";
+import { getConnection, getHandle, memberIdForCatalog, routeTablesToMembers, soloMemberId, type ConnRecord } from "../sources/connection-registry";
 import { nativeTableDetail, nativeQuery } from "../sources/native-catalog";
 import { guardSelect } from "./guard";
 import {
@@ -475,15 +475,41 @@ async function handleTableProfileInner(connectionId: string, body: unknown, tena
     .slice(0, PROFILE_BATCH);
   if (!wanted.length) return bad("tables[] must name at least one table from this connection");
   try {
-    const details = await nativeTableDetail(rec.conn, wanted);
+    // Route each table to the member that OWNS it. rec.conn is only parts[0], so
+    // asking it for a table from the second database returned no columns at all —
+    // the "click a table in tab 2 and nothing appears" bug. Each member is asked
+    // over its OWN connection (not the group ATTACH handle): the native path
+    // exists precisely to avoid materialising a 10,570-table remote catalog.
+    const { routes, unresolved } = routeTablesToMembers(rec, wanted);
+    const details: Awaited<ReturnType<typeof nativeTableDetail>> = [];
+    const profileWarnings: string[] = [];
+    for (const w of unresolved) profileWarnings.push(`${w}: could not tell which database it belongs to`);
+
+    for (const route of routes) {
+      try {
+        const got = await nativeTableDetail(route.part.conn, route.sourceNames);
+        for (const d of got) {
+          // Back to the MERGED display name before this reaches the UI or the
+          // selection state — both key on that, not on the source name.
+          details.push({ ...d, tableName: route.displayOf.get(d.tableName) ?? d.tableName });
+        }
+      } catch (err: any) {
+        // One unreachable member must not cost the others their columns.
+        profileWarnings.push(`${route.part.label}: ${describeError(err)}`);
+        console.warn(`[selection] profile failed for member ${route.part.id}: ${describeError(err)}`);
+      }
+    }
+
     // Cache what we learned on the record so the selection planner can see real
     // column names when it reasons about "the ones with an email address".
     for (const d of details) {
       if (rec.datasets.some((x) => x.tableName === d.tableName)) continue;
+      const owner = routes.find((r) => [...r.displayOf.values()].includes(d.tableName))?.part;
+      const conn = owner?.conn ?? rec.conn;
       rec.datasets.push({
         tableName: d.tableName,
         profile: {
-          source: { filename: `${rec.conn.dialect}:${rec.conn.database}.${d.tableName}`, format: "json" },
+          source: { filename: `${conn.dialect}:${conn.database}.${d.tableName}`, format: "json" },
           rowCount: d.rowCount ?? 0,
           columns: d.columns.map((c) => ({ name: c.name, type: c.type, nullable: c.nullable })),
           sampleRows: d.sampleRows,
@@ -507,7 +533,9 @@ async function handleTableProfileInner(connectionId: string, body: unknown, tena
           })),
           sampleRows: d.sampleRows.slice(0, 5),
         })),
-        warnings: rec.warnings.slice(-3),
+        // Per-member failures surface instead of looking like "this table has no
+        // columns" — a partial result must say which database went missing.
+        warnings: [...rec.warnings.slice(-3), ...profileWarnings],
       },
     };
   } catch (err: any) {
