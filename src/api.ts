@@ -60,6 +60,14 @@ async function request<T>(endpoint: string, options: RequestInit = {}): Promise<
   }
   const json: any = await res.json().catch(() => ({}));
   dbg(`← ${res.status} ${url}`, json);
+  if (!res.ok && Array.isArray(json?.warnings) && json.warnings.length) {
+    // E4: the server explains WHY it failed (e.g. every widget dropped, with
+    // per-widget reasons) — a bare "HTTP 422" throws that context away.
+    const err: any = new Error(String(json.error || `HTTP ${res.status}`) + " — " + json.warnings.slice(0, 4).join("; "));
+    err.warnings = json.warnings;
+    err.status = res.status;
+    throw err;
+  }
   if (!res.ok) throw new Error(json?.error ?? `Request failed (HTTP ${res.status})`);
   return json as T;
 }
@@ -85,13 +93,21 @@ export interface BuildDashboardRequest {
   /** al1: analyst-loop evidence pack (findings computed from the live DB) — outranks
    *  the brief's analytical half as the spec planner's directive on the first build. */
   analystDirective?: string;
+  /** Conversation join: enables chat memory for the planner, version history, and undo/redo. */
+  conversationId?: string;
+  /** The widget the user clicked in the preview — "this"/"that" in the next edit. */
+  selectedWidget?: { id?: string; title?: string };
 }
 export interface BuildDashboardResult {
-  app: GeneratedApp;
+  app: GeneratedApp | null;
   spec: DashboardSpec;
   warnings: string[];
   /** Human-readable description of what this turn changed. */
   summary?: string[];
+  /** Which pipeline served the turn: agents | planner | history (undo/redo). */
+  pipeline?: string;
+  /** True when a history intent had nothing to do (e.g. undo at the first version). */
+  noChange?: boolean;
 }
 export function buildDashboard(body: BuildDashboardRequest): Promise<BuildDashboardResult> {
   return request<BuildDashboardResult>("/api/dashboard/build", {

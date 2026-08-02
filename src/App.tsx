@@ -13,7 +13,7 @@ import DashboardPage from "./pages/DashboardPage";
 import ChatPage from "./pages/ChatPage";
 import ProjectsPage from "./pages/ProjectsPage";
 import StyleGuidePage from "./pages/StyleGuidePage";
-import WorkbenchPage from "./pages/WorkbenchPage";
+import SelectPage from "./pages/SelectPage";
 import { assignTableNames, ingestFile, newId, type Source, type Table } from "./lib/datasets";
 import { COLO_PROJECT_ID, listSources, sourceTablesToTables, type SourceInfo } from "./api";
 import { isWorkbenchProject, isLiveProject, isServerSource, wbDeleteSource, wbDiscardStage, wbCombineSources, type WbExtracted } from "./workbench-api";
@@ -62,6 +62,9 @@ function AppRoutes() {
   // al1: analyst-loop evidence riding a workbench build handoff — follows the
   // initialPrompt lifecycle exactly and feeds the FIRST dashboard build only.
   const [initialDirective, setInitialDirective] = useState<string | null>(null);
+  // Stage 4: join semantics for the current source. Conversation-scoped, NOT
+  // spent on the first build — see ChatPage.
+  const [combinedSchema, setCombinedSchema] = useState<string | null>(null);
   const [resetKey, setResetKey] = useState(0);
   // Restore the active project ONLY when the chat page (/build) is reloaded directly, so a
   // refresh keeps the same session while a fresh landing starts a new one.
@@ -189,6 +192,7 @@ function AppRoutes() {
     for (const { key, route } of [
       { key: "t2ui:wb:conv", route: "/workbench" },
       { key: "t2ui:wb:pg:conv", route: "/postgres" },
+      { key: "t2ui:sel:conv", route: "/select" },
     ]) {
       if (path.startsWith(route)) continue; // reloaded on that page -> keep its stage
       try {
@@ -228,6 +232,7 @@ function AppRoutes() {
     }
     setWbSources((prev) => [src, ...prev.filter((s) => s.projectId !== src.projectId)]);
     selectWbSource(src);
+    setCombinedSchema(extracted.combinedSchema ?? null);
     if (buildPrompt) { setInitialPrompt(buildPrompt); setInitialDirective(extracted.evidence ?? null); }
   }, [selectWbSource, projectId, wbSources]);
 
@@ -365,14 +370,18 @@ function AppRoutes() {
           />
         }
       />
+      {/* Pick-your-tables: connection string -> browse the schema -> narrow it by
+          clicking or chatting -> "Continue to text2UI" publishes the selection as
+          the active source, which is exactly what the landing page builds from. */}
       <Route
-        path="/workbench"
-        element={<WorkbenchPage onUseWorkbenchSource={handleUseWorkbenchSource} />}
+        path="/select"
+        element={<SelectPage onUseWorkbenchSource={handleUseWorkbenchSource} />}
       />
-      <Route
-        path="/postgres"
-        element={<WorkbenchPage pgOnly onUseWorkbenchSource={handleUseWorkbenchSource} />}
-      />
+      {/* /select supersedes the old SQL Workbench and Postgres pages. Redirect
+          rather than 404 so existing links, bookmarks and stale dev-server tabs
+          land somewhere useful. */}
+      <Route path="/workbench" element={<Navigate to="/select" replace />} />
+      <Route path="/postgres" element={<Navigate to="/select" replace />} />
       <Route
         path="/dashboard"
         element={
@@ -398,6 +407,7 @@ function AppRoutes() {
             tables={tables}
             initialPrompt={initialPrompt}
             initialDirective={initialDirective}
+            combinedSchema={combinedSchema}
             onConsumeInitialPrompt={() => { setInitialPrompt(null); setInitialDirective(null); }}
             onFiles={loadFiles}
             onRemoveSource={removeSource}

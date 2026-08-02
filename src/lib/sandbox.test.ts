@@ -59,6 +59,10 @@ console.log("sandbox.test.ts: all assertions passed");
   const tables = [{ tableName: "data", rows: [{ a: 1 }] }];
   const cfg = buildSandpackConfig(app, tables, { bffUrl: "http://localhost:8787", projectId: "sabc" });
   assert.ok(cfg.files["/data.js"].includes("/api/query"), "remote engine fetches the BFF");
+  // Foreign-origin sandboxes ride the postMessage bridge; direct fetch is the fallback.
+  assert.ok(cfg.files["/data.js"].includes("t2ui.query"), "remote engine posts queries over the host bridge");
+  assert.ok(cfg.files["/data.js"].includes("t2ui.queryResult"), "remote engine listens for bridge replies");
+  assert.ok(cfg.files["/data.js"].includes("bridge timeout"), "bridge degrades to direct fetch on timeout");
   assert.ok(!cfg.files["/rows.js"], "no rows inlined in remote mode");
   assert.ok(!cfg.customSetup.dependencies["@duckdb/duckdb-wasm"], "no WASM dep in remote mode");
   // remote mode is valid with zero local tables

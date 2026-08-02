@@ -12,6 +12,9 @@ import { mkdirSync } from "node:fs";
 import { dirname } from "node:path";
 import { attachMysql, qstr, qid, duckTypeToColumnType, type MysqlConn } from "./mysql";
 import type { Dataset, ColumnProfile } from "../../shared/types";
+import { enrichColumns } from "../../shared/profile-enrich";
+import { exactColumnStats } from "./exact-stats";
+import { attachMeasuredForeignKeys } from "./relationships";
 
 const bt = (s: string) => "`" + String(s).replace(/`/g, "``") + "`"; // MySQL identifier
 
@@ -142,8 +145,8 @@ export async function snapshotMysql(conn: MysqlConn, opts: SnapshotOptions): Pro
     );
     return rows.map((r) => ({ col: String((r as any).col), type: String((r as any).type) }));
   };
-  const profileFrom = (local: string, cols: Col[], sample: Record<string, unknown>[], rowCount: number, label: string): Dataset => {
-    const columns: ColumnProfile[] = cols.map(({ col, type }) => {
+  const profileFrom = async (local: string, cols: Col[], sample: Record<string, unknown>[], rowCount: number, label: string): Promise<Dataset> => {
+    let columns: ColumnProfile[] = cols.map(({ col, type }) => {
       const values = sample.map((r) => r[col]).filter((v) => v !== null && v !== undefined);
       return {
         name: col, type: duckTypeToColumnType(type),
@@ -151,6 +154,10 @@ export async function snapshotMysql(conn: MysqlConn, opts: SnapshotOptions): Pro
         uniqueCount: new Set(values.map((v) => String(v))).size, sampleValues: values.slice(0, 5),
       };
     });
+    columns = enrichColumns(columns, sample);
+    // The snapshot table lives in OUR DuckDB — exact stats are cheap and make
+    // exhaustiveness truthful (statsExact).
+    try { columns = await exactColumnStats((q, l) => readAll(q, l ?? "stats"), qid(local), columns); } catch { /* floor stands */ }
     return { tableName: local, profile: { source: { filename: label, format: "json" }, rowCount, columns, sampleRows: sample } };
   };
 
@@ -200,7 +207,7 @@ export async function snapshotMysql(conn: MysqlConn, opts: SnapshotOptions): Pro
         : `mysql:${db}.${table} (last ${days}d on ${picked.col})`;
       snapshots.push({
         table: spec, kind: "fact", dateColumn: picked?.col ?? null, dateMode: mode, days, rowCount,
-        dataset: profileFrom(local, cols, sample, rowCount, label),
+        dataset: await profileFrom(local, cols, sample, rowCount, label),
       });
     }
 
@@ -218,10 +225,12 @@ export async function snapshotMysql(conn: MysqlConn, opts: SnapshotOptions): Pro
       const sample = await readAll(`SELECT * FROM ${dest} LIMIT ${sampleN}`, `sample ${table}`);
       snapshots.push({
         table: spec, kind: "lookup", dateColumn: null, days, rowCount,
-        dataset: profileFrom(local, cols, sample, rowCount, `mysql:${db}.${table} (full)`),
+        dataset: await profileFrom(local, cols, sample, rowCount, `mysql:${db}.${table} (full)`),
       });
     }
 
+    // A3: measured relationship edges across the snapshotted tables.
+    try { await attachMeasuredForeignKeys((q, l) => readAll(q, l ?? "fk"), snapshots.map((sn) => sn.dataset).filter((d): d is NonNullable<typeof d> => !!d)); } catch { /* no edges */ }
     try { await c.run("CHECKPOINT"); } catch { /* best-effort */ }
     return { dbPath, snapshots, warnings };
   } finally {

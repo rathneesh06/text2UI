@@ -14,6 +14,12 @@ const PLAN_TIMEOUT_MS = Number(process.env.DASHBOARD_PLANNER_TIMEOUT_MS ?? 20000
 
 // Compact OpenAPI-subset schema. Widgets are a single permissive object (Gemini does
 // not handle discriminated unions well); we normalize/validate in code afterwards.
+const FILTER_ITEM = { type: "object", properties: { col: { type: "string" }, op: { type: "string", enum: ["=", "!=", ">", ">=", "<", "<=", "in", "not_in", "between", "contains", "not_null", "is_null"] }, value: { type: "string", description: "literal value; pass numbers as strings. For contains: the substring to search" }, values: { type: "array", items: { type: "string" }, description: "for in/not_in: the list; for between: exactly [lo, hi]" } }, required: ["col", "op"] };
+const BASE_METRIC = {
+  type: "object",
+  properties: { col: { type: "string" }, agg: { type: "string", enum: ["count", "count_distinct", "sum", "avg", "min", "max", "median"] }, where: { type: "array", items: FILTER_ITEM } },
+  required: ["col", "agg"],
+};
 const METRIC = {
   type: "object",
   properties: {
@@ -21,6 +27,7 @@ const METRIC = {
     agg: { type: "string", enum: ["count", "count_distinct", "sum", "avg", "min", "max", "median"] },
     label: { type: "string" },
     format: { type: "string", enum: ["number", "compact", "percent", "currency", "hours", "days"] },
+    expr: { type: "object", description: "derived metric: ratio=num/den, pct=num/den*100, diff=num-den — use for rates and percentages; never format a plain sum as percent", properties: { op: { type: "string", enum: ["ratio", "pct", "diff"] }, num: BASE_METRIC, den: BASE_METRIC }, required: ["op", "num", "den"] }, compare: { type: "object", description: "A4: adds a vs-previous-period delta chip. ONLY when a real temporal column exists; grain should suit the data span (month for a year of data). Windows are computed from the data, never by you.", properties: { grain: { type: "string", enum: ["day", "week", "month", "quarter", "year"] }, dateCol: { type: "string" } }, required: ["grain", "dateCol"] },
   },
   required: ["col", "agg"],
 };
@@ -45,10 +52,12 @@ const WIDGET = {
     metric: METRIC,
     x: DIMENSION,
     series: { type: "array", items: METRIC },
-    columns: { type: "array", items: { type: "object", properties: { col: { type: "string" }, label: { type: "string" }, agg: { type: "string", enum: ["count", "count_distinct", "sum", "avg", "min", "max", "median"] } }, required: ["col"] } },
+    columns: { type: "array", items: { type: "object", properties: { col: { type: "string" }, label: { type: "string" }, agg: { type: "string", enum: ["count", "count_distinct", "sum", "avg", "min", "max", "median"] }, format: { type: "string", enum: ["number", "percent", "currency", "hours", "days", "compact"] } }, required: ["col"] } },
     groupBy: { type: "array", items: DIMENSION },
     limit: { type: "integer" },
     sort: { type: "object", properties: { by: { type: "string" }, dir: { type: "string", enum: ["asc", "desc"] } } },
+    join: { type: "object", description: "ONE lookup join to a related table — allowed ONLY for relationships listed as VERIFIED in the profile digest. on = [baseColumn, referencedColumn].", properties: { table: { type: "string" }, on: { type: "array", items: { type: "string" } } }, required: ["table", "on"] },
+    filters: { type: "array", description: "scope this widget to a SUBSET of rows ('only open tickets'). Use EXACT observed literals.", items: FILTER_ITEM },
   },
   required: ["id", "kind", "title", "table"],
 };
@@ -59,7 +68,7 @@ export const DASHBOARD_SCHEMA = {
     meta: {
       type: "object",
       properties: {
-        title: { type: "string" }, subtitle: { type: "string" },
+        title: { type: "string" }, subtitle: { type: "string" }, insight: { type: "string" },
         audience: { type: "string" }, theme: { type: "string", enum: ["light", "dark"] },
         accent: { type: "string", description: "Primary accent color as hex, e.g. #0d9488." },
         chartPalette: { type: "array", items: { type: "string" }, description: "Chart series colors as hex values." },
@@ -123,7 +132,10 @@ Rules:
 - Give each widget a stable, unique id. KPIs go in the first section. Use width to lay out: kpi=quarter, charts=half, tables=full.
 - Keep it focused and readable (a KPI strip plus 4-8 charts/tables is plenty). Do not exceed what the data supports.
 
-On an EDIT turn you are given the CURRENT spec. Return the FULL updated spec, changing as little as possible: keep existing widget ids and untouched widgets exactly, and apply only what the user asked.`;
+On an EDIT turn you are given the CURRENT spec. Return the FULL updated spec, changing as little as possible: keep existing widget ids and untouched widgets exactly, and apply only what the user asked.
+CONVERSATION AWARENESS (edit turns): when a CONVERSATION section is provided, resolve references through it — "the chart we added", "like before", "the same color as earlier", "no, the OTHER one" all point at things said or done in prior turns. When a SELECTED WIDGET is provided, that is the user's "this"/"that"/"it": apply the edit to that exact widget (match its id) unless the user clearly names a different one. Never reinterpret the whole dashboard because of a reference you cannot resolve — leave unclear things unchanged.
+To show a SUBSET of rows ("only open tickets", "P1 only"), set widget.filters: [{col,op,value}] with EXACT observed literals — never bake the subset into the title alone. Ops beyond equality: contains (substring match, value = the text), in/not_in (values = the list), between (values = exactly [lo, hi] — dates as YYYY-MM-DD). To show a column from a RELATED table (e.g. tickets by status NAME when tickets only carries status_id), set widget.join = {table, on:[baseCol, refCol]} — prefer relationships the digest lists as VERIFIED; a plausible unlisted join is measured against the live data and kept only if it proves out.
+`;
 
 function schemaText(datasets: Dataset[]): string {
   return datasets.map((d) => {
@@ -132,12 +144,21 @@ function schemaText(datasets: Dataset[]): string {
   }).join("\n");
 }
 
-function buildUserPrompt(datasets: Dataset[], userPrompt: string, currentSpec?: DashboardSpec, styleHints?: string, directive?: string): string {
+function buildUserPrompt(datasets: Dataset[], userPrompt: string, currentSpec?: DashboardSpec, styleHints?: string, directive?: string, chatContext?: string, selectedWidget?: { id?: string; title?: string }): string {
   const parts = [
     "DATA PROFILE:",
     schemaText(datasets),
     "",
   ];
+  if (chatContext) {
+    parts.push("CONVERSATION (recent turns + decisions — resolve references like \"before\"/\"that one\" against this):");
+    parts.push(chatContext);
+    parts.push("");
+  }
+  if (selectedWidget && (selectedWidget.id || selectedWidget.title)) {
+    parts.push(`SELECTED WIDGET (the user clicked this in the preview — it is what \"this\"/\"that\"/\"it\" refers to): id=${selectedWidget.id ?? "?"} title=\"${selectedWidget.title ?? ""}\"`);
+    parts.push("");
+  }
   if (styleHints) {
     parts.push("VISUAL DIRECTION (from the planning stage — realize it via meta.theme/accent/chartPalette):");
     parts.push(styleHints);
@@ -180,7 +201,7 @@ function coerce(parsed: any): DashboardSpec | null {
   return {
     version: 1,
     meta: {
-      title: String(parsed.meta.title ?? "Dashboard"), subtitle: parsed.meta.subtitle, audience: parsed.meta.audience,
+      title: String(parsed.meta.title ?? "Dashboard"), subtitle: parsed.meta.subtitle, audience: parsed.meta.audience, insight: typeof parsed.meta.insight === "string" && parsed.meta.insight.trim() ? parsed.meta.insight : undefined,
       theme: parsed.meta.theme === "dark" ? "dark" : "light",
       // Style fields are sanitized deterministically — a bad hex silently drops.
       accent: HEX_RE.test(String(parsed.meta.accent ?? "")) ? String(parsed.meta.accent) : undefined,
@@ -192,14 +213,14 @@ function coerce(parsed: any): DashboardSpec | null {
   };
 }
 
-export interface PlanSpecInput { datasets: Dataset[]; userPrompt: string; currentSpec?: DashboardSpec; styleHints?: string; directive?: string }
+export interface PlanSpecInput { datasets: Dataset[]; userPrompt: string; currentSpec?: DashboardSpec; styleHints?: string; directive?: string; chatContext?: string; selectedWidget?: { id?: string; title?: string } }
 
 /** Plan (or edit) a DashboardSpec. Never throws; returns null on failure/timeout. */
 export async function planSpec(input: PlanSpecInput, run: PlannerRun = callGemini, timeoutMs = PLAN_TIMEOUT_MS): Promise<DashboardSpec | null> {
   const timeout = new Promise<null>((resolve) => setTimeout(() => resolve(null), timeoutMs));
   const call = (async (): Promise<DashboardSpec | null> => {
     try {
-      const { text } = await run(SYSTEM, buildUserPrompt(input.datasets, input.userPrompt, input.currentSpec, input.styleHints, input.directive), { ...ORCHESTRATE_OPTS, responseSchema: DASHBOARD_SCHEMA });
+      const { text } = await run(SYSTEM, buildUserPrompt(input.datasets, input.userPrompt, input.currentSpec, input.styleHints, input.directive, input.chatContext, input.selectedWidget), { ...ORCHESTRATE_OPTS, responseSchema: DASHBOARD_SCHEMA });
       const spec = coerce(JSON.parse(stripFences(text)));
       if (spec) console.log(`[dashboard-planner] spec: "${spec.meta.title}" with ${spec.sections.reduce((n, s) => n + s.widgets.length, 0)} widget(s)`);
       else console.warn("[dashboard-planner] model returned no usable spec");

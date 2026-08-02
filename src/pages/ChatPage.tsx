@@ -17,6 +17,7 @@ import {
 } from "react-icons/hi";
 import PromptInput from "../components/PromptInput";
 import Sandbox from "../components/Sandbox";
+import ChatMarkdown from "../components/ChatMarkdown";
 import {
   orchestratePlan, generate, generateStream, generateReport, generatePpt, downloadBase64,
   exportProject, buildDashboard, buildDeck, gateTurn, uploadDatasets, COLO_PROJECT_ID, REMOTE_DATA, BFF_URL,
@@ -36,6 +37,9 @@ interface Props {
   initialPrompt: string | null;
   /** al1: analyst-loop evidence riding a workbench handoff (first build only). */
   initialDirective?: string | null;
+  /** Join semantics for the current source. Conversation-scoped and included on
+   *  EVERY turn — unlike initialDirective, which is spent on the first build. */
+  combinedSchema?: string | null;
   onConsumeInitialPrompt: () => void;
   onFiles: (files: FileList | File[]) => void;
   onRemoveSource: (id: string) => void;
@@ -73,11 +77,18 @@ function detectArtifactSwitch(prompt: string): "ppt" | "pdf" | "dashboard" | nul
 }
 
 export default function ChatPage({
-  projectId, tables, initialPrompt, initialDirective = null, onConsumeInitialPrompt,
+  projectId, tables, initialPrompt, initialDirective = null, combinedSchema = null, onConsumeInitialPrompt,
   onFiles, onRemoveSource, fileError, onNewProject, onBuildMeta,
 }: Props) {
   const [turns, setTurns] = useState<Turn[]>([]);
   const [conversationId, setConversationId] = useState<string | null>(null);
+  // Stale-closure guard: the FIRST turn receives a fresh conversationId from
+  // orchestrate/gate and must use it for the build call IN THE SAME closure —
+  // React state won't have committed yet. Reading only the state variable meant
+  // the first build posted without a conversationId, so version 1 was never
+  // recorded and the first "undo" found nothing beneath it.
+  const convIdRef = useRef<string | null>(null);
+  const adoptConvId = (id?: string | null) => { if (id) { convIdRef.current = id; setConversationId(id); } };
   const [result, setResult] = useState<Result | null>(null);
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
@@ -98,6 +109,38 @@ export default function ChatPage({
   const [exporting, setExporting] = useState(false);
   const [bundling, setBundling] = useState(false);
 
+  // Widget selection from the live preview — the "this" of the next edit prompt.
+  // The generated app posts t2ui.featureSelected on any widget click (id + title);
+  // holding it here is what turns the chat into a direct-manipulation editor:
+  // click a chart, type "make this a pie", done.
+  const [selectedWidget, setSelectedWidget] = useState<{ id?: string; title?: string; kind?: string } | null>(null);
+  // GHOST-SELECTION GUARD: after every build/edit, re-validate the selection
+  // against the new spec — clear it if the widget is gone (an edit removed it),
+  // refresh the chip's title/kind if the widget changed. The chip can never
+  // point at a widget that no longer exists.
+  useEffect(() => {
+    if (!selectedWidget?.id || !spec) return;
+    const live = (spec.sections ?? []).flatMap((s: any) => s.widgets ?? []).find((w: any) => w.id === selectedWidget.id);
+    if (!live) { setSelectedWidget(null); return; }
+    if (live.title !== selectedWidget.title || live.kind !== selectedWidget.kind) {
+      setSelectedWidget({ id: live.id, title: live.title, kind: live.kind });
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [spec]);
+  useEffect(() => {
+    const onMsg = (e: MessageEvent) => {
+      const data = e.data as any;
+      if (!data || data.type !== "t2ui.featureSelected" || !data.payload) return;
+      const p = data.payload;
+      // Toggle-off / Escape in the preview clears the chip too — one state,
+      // never two truths.
+      if (p.cleared) { setSelectedWidget(null); return; }
+      if (p.id || p.title) setSelectedWidget({ id: p.id, title: p.title, kind: p.kind ?? p.type });
+    };
+    window.addEventListener("message", onMsg);
+    return () => window.removeEventListener("message", onMsg);
+  }, []);
+
   const turnSeq = useRef(0);
   const tailBuf = useRef("");
   // The first-turn orchestrator brief, carried into the spec-dashboard build so
@@ -106,6 +149,24 @@ export default function ChatPage({
   // al1: evidence captured before the initial prompt is consumed; spent on the
   // FIRST successful dashboard build, then cleared (edits use currentSpec).
   const pendingDirective = useRef<string | null>(null);
+  /**
+   * Two directives, spent DIFFERENTLY on purpose.
+   *
+   * pendingDirective (analyst findings) is a one-off observation about the data
+   * as it looked at build time — right to spend on the first build and then drop.
+   *
+   * combinedSchema (how the tables relate) is structural. A user editing the
+   * dashboard three turns later still needs to know that orders joins customers
+   * on customer_ref, so it rides EVERY build and edit turn and is never cleared.
+   */
+  const combinedRef = useRef<string | null>(null);
+  useEffect(() => { combinedRef.current = combinedSchema ?? null; }, [combinedSchema]);
+  const directiveFor = (isFirstBuild: boolean): string | null => {
+    const parts: string[] = [];
+    if (isFirstBuild && pendingDirective.current) parts.push(pendingDirective.current);
+    if (combinedRef.current) parts.push(combinedRef.current);
+    return parts.length ? parts.join("\n\n") : null;
+  };
   const builds = useRef(0);
   const startedRef = useRef(false);
   const threadRef = useRef<HTMLDivElement>(null);
@@ -139,15 +200,32 @@ export default function ChatPage({
     let wasReload = false;
     try { wasReload = sessionStorage.getItem(RELOAD_FLAG) === "1"; sessionStorage.removeItem(RELOAD_FLAG); } catch {}
     if (!wasReload) {
-      // Fresh entry into the project → start a brand-new session, don't resurrect old chat.
+      // Fresh entry into the project: DURABLE PROJECTS — restore the saved
+      // dashboard + chat link from the SERVER (the local snapshot is only for
+      // reloads). The board renders deterministically from the stored spec;
+      // live numbers refresh once the data source is reconnected.
       try { localStorage.removeItem(SESSION_KEY); } catch {}
+      (async () => {
+        try {
+          const r = await fetch(`${BFF_URL}/api/project/${encodeURIComponent(projectId)}/state`);
+          if (!r.ok) return;
+          const st = await r.json();
+          if (!st?.spec) return;
+          if (st.conversationId) adoptConvId(st.conversationId);
+          setSpec(st.spec);
+          if (st.app) { setResult({ kind: "dashboard", app: st.app }); setDashVersion((v) => v + 1); }
+          const n = Array.isArray(st.chat) ? st.chat.length : 0;
+          setTurns([{ id: Date.now(), prompt: "(project reopened)", phase: "done", stages: [], hydrated: true,
+            assistantText: `Restored your saved dashboard${n ? ` — ${n} earlier chat messages are remembered for edits` : ""}. If this project uses a live database, reconnect it to refresh the numbers; everything else works right away.` } as any]);
+        } catch { /* no saved state / server unreachable — start clean */ }
+      })();
       return;
     }
     try {
       const raw = localStorage.getItem(SESSION_KEY);
       if (!raw) return;
       const s = JSON.parse(raw);
-      if (s.conversationId) setConversationId(s.conversationId);
+      if (s.conversationId) adoptConvId(s.conversationId);
       if (s.deckId) setDeckId(s.deckId);
       if (s.deckSpec) setDeckSpec(s.deckSpec);
       if (s.spec) setSpec(s.spec);
@@ -248,9 +326,15 @@ export default function ChatPage({
       const answerInstead = async (reply: string, dataQuestion?: boolean) => {
         if (dataQuestion && serverSource) {
           append("Looking that up in the data…");
+          const req = { projectId, prompt, ...(conversationId ? { conversationId } : {}) };
+          // One-shot. Token streaming was built for this path but never actually
+          // exercised — no token ever streamed, so the sniff buffer, need_more
+          // suppression and caret were all unverified code sitting in the request
+          // path. Removed rather than shipped untested. The reply still renders as
+          // markdown; that was never part of streaming.
           try {
-            const r = await sourceChat({ projectId, prompt, ...(conversationId ? { conversationId } : {}) });
-            if (r.conversationId) setConversationId(r.conversationId);
+            const r = await sourceChat(req);
+            if (r.conversationId) adoptConvId(r.conversationId);
             patch({ phase: "done", tail: null, assistantText: r.answer });
             return;
           } catch { /* fall back to the model's grounded reply */ }
@@ -282,14 +366,14 @@ export default function ChatPage({
             artifactSummary: spec?.meta?.title ?? deckSpec?.meta?.title ?? undefined,
             datasets,
           });
-          if (g.conversationId) setConversationId(g.conversationId);
+          if (g.conversationId) adoptConvId(g.conversationId);
           if (g.action !== "edit" && g.reply) { await answerInstead(g.reply, g.dataQuestion); return; }
         } catch { /* gate unavailable — behave exactly as before (edit) */ }
       } else {
         let plan: Awaited<ReturnType<typeof orchestratePlan>>;
         try {
           plan = await orchestratePlan({ datasets, userPrompt: prompt, ...(conversationId ? { conversationId } : {}), ...access });
-          if ((plan as any).conversationId) setConversationId((plan as any).conversationId);
+          if ((plan as any).conversationId) adoptConvId((plan as any).conversationId);
         } catch {
           append("Planner unavailable — building a dashboard directly…");
           plan = { conversationId: conversationId ?? "", outputMode: "dashboard", enhancedPrompt: prompt } as any;
@@ -329,29 +413,50 @@ export default function ChatPage({
         return;
       }
 
-      // ---- Dashboard on colo → spec-driven dashboard (pilot) ----
-      if (mode === "dashboard" && isColo) {
-        append(spec ? "Updating the dashboard spec…" : "Planning the dashboard spec…");
-        patch({ phase: "building" });
-        const { app, spec: nextSpec, warnings, summary } = await buildDashboard({
-          datasets, userPrompt: prompt, ...(spec ? { currentSpec: spec } : {}),
-          ...(lastBrief.current && !spec ? { brief: lastBrief.current } : {}),
-          ...(pendingDirective.current && !spec ? { analystDirective: pendingDirective.current } : {}),
-        });
-        pendingDirective.current = null;
-        setSpec(nextSpec);
-        setResult({ kind: "dashboard", app });
-        setDashVersion((v) => v + 1);
-        // al5: SHOW the notes. "· 3 notes" hid the reason a widget vanished
-        // (dropped column, coerced agg, empty section) — the one thing the user
-        // needs to fix their prompt or spot a pipeline defect.
-        const note = warnings.length
-          ? `\n\nNotes:\n${warnings.slice(0, 5).map((w) => `• ${w}`).join("\n")}${warnings.length > 5 ? `\n• …and ${warnings.length - 5} more` : ""}`
-          : "";
-        patch({ phase: "done", tail: null, assistantText: (summary?.length ? summary.join(" ") : nextSpec.meta.title || "Dashboard ready") + note });
-        builds.current += 1;
-        onBuildMeta?.({ versionCount: builds.current });
-        return;
+      // ---- Dashboard → spec-driven pipeline (ALL sources) ----
+      // RESTORED: this used to be gated to colo/workbench/live sources only — a
+      // leftover of the text2SQL integration pilot — which silently pushed every
+      // uploaded-data build onto the fragile legacy codegen path. The spec pipeline
+      // (enhancement layer → widget agents → validate → deterministic render) is
+      // now the ONE dashboard pipeline for every source; legacy codegen survives
+      // strictly as the in-flight fallback below if this call fails.
+      if (mode === "dashboard") {
+        try {
+          append(spec ? "Updating the dashboard spec…" : "Planning the dashboard spec…");
+          patch({ phase: "building" });
+          const { app, spec: nextSpec, warnings, summary, noChange } = await buildDashboard({
+            datasets, userPrompt: prompt, ...(spec ? { currentSpec: spec } : {}),
+            ...(lastBrief.current && !spec ? { brief: lastBrief.current } : {}),
+            ...((d) => (d ? { analystDirective: d } : {}))(directiveFor(!spec)),
+            ...((convIdRef.current ?? conversationId) ? { conversationId: (convIdRef.current ?? conversationId)! } : {}),
+            ...(selectedWidget && spec ? { selectedWidget: { id: selectedWidget.id, title: selectedWidget.title } } : {}),
+          });
+          pendingDirective.current = null;
+          setSelectedWidget(null);   // a selection targets ONE edit, like any editor
+          if (noChange || !app) {    // e.g. "undo" at the first version — reply, keep the canvas
+            patch({ phase: "done", tail: null, assistantText: summary?.length ? summary.join(" ") : "No change." });
+            return;
+          }
+          setSpec(nextSpec);
+          setResult({ kind: "dashboard", app });
+          setDashVersion((v) => v + 1);
+          // al5: SHOW the notes. "· 3 notes" hid the reason a widget vanished
+          // (dropped column, coerced agg, empty section) — the one thing the user
+          // needs to fix their prompt or spot a pipeline defect.
+          const note = warnings.length
+            ? `\n\nNotes:\n${warnings.slice(0, 5).map((w) => `• ${w}`).join("\n")}${warnings.length > 5 ? `\n• …and ${warnings.length - 5} more` : ""}`
+            : "";
+          patch({ phase: "done", tail: null, assistantText: (summary?.length ? summary.join(" ") : nextSpec.meta.title || "Dashboard ready") + note });
+          builds.current += 1;
+          onBuildMeta?.({ versionCount: builds.current });
+          return;
+        } catch (specErr) {
+          // Network-level failures should surface normally; only fall back when the
+          // spec pipeline itself declined (planner/agents 5xx or empty validation).
+          const msg = (specErr as Error)?.message ?? String(specErr);
+          if (/failed to fetch|networkerror|load failed|fetch failed|connection refused/i.test(msg)) throw specErr;
+          append(`Spec pipeline unavailable (${msg}) — falling back to code generation…`);
+        }
       }
 
       // ---- Legacy path: non-colo dashboards (codegen) + PDF reports ----
@@ -546,8 +651,16 @@ export default function ChatPage({
                         {t.tail && <pre className="cp-tail">{t.tail}</pre>}
                       </div>
                     )}
-                    {t.phase === "clarify" && <div className="cp-clarify">{t.assistantText}</div>}
-                    {t.phase === "done" && <div>{t.assistantText}</div>}
+                    {/* Assistant prose is markdown now. The `cp-md` modifier resets the
+                        inherited `white-space: pre-wrap` from .cp-msg-body — without it
+                        every rendered block double-spaces. The error branch stays plain
+                        text (and keeps pre-wrap), because a stack trace needs its newlines. */}
+                    {t.phase === "clarify" && <div className="cp-clarify cp-md"><ChatMarkdown text={t.assistantText ?? ""} /></div>}
+                    {t.phase === "done" && (
+                      <div className="cp-md">
+                        <ChatMarkdown text={t.assistantText ?? ""} />
+                      </div>
+                    )}
                     {t.phase === "error" && <div className="cp-err">{t.assistantText}</div>}
                   </div>
                 </div>
@@ -557,6 +670,13 @@ export default function ChatPage({
         </div>
 
         <div className="cp-composer">
+          {selectedWidget && (
+            <div className="cp-selchip" title="Your next edit targets this widget. Click × to clear.">
+              <span className="cp-selchip-dot" />
+              <span className="cp-selchip-text">Selected: {selectedWidget.title ?? selectedWidget.id}{selectedWidget.kind ? ` (${selectedWidget.kind})` : ""}</span>
+              <button className="cp-selchip-x" onClick={() => setSelectedWidget(null)} aria-label="Clear selection">×</button>
+            </div>
+          )}
           {(fileError ?? error) && serverUp !== false && (
             <div className="cp-composer-err">{fileError ?? error}</div>
           )}

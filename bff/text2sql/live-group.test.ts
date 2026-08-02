@@ -49,12 +49,14 @@ const profileOf = (tableName: string, cols: { name: string; type: string }[]): a
   profile: { source: { filename: "x", format: "json" }, rowCount: 30, columns: cols, sampleRows: [] },
 });
 const partA: GroupPart = {
+  id: "mem_a",
   conn: { dialect: "mysql", host: "a", port: 3306, user: "u", password: "p", database: "ticketsdb" } as any,
   label: "u@a/ticketsdb",
   allTables: [{ name: "tickets", schema: "main", table: "tickets", ref: `src."main"."tickets"`, approxRows: 30 }],
   datasets: [profileOf("tickets", [{ name: "id", type: "integer" }, { name: "user_id", type: "integer" }, { name: "ticket_type", type: "varchar" }])],
 };
 const partB: GroupPart = {
+  id: "mem_b",
   conn: { dialect: "postgres", host: "b", port: 5432, user: "u", password: "p", database: "usersdb" } as any,
   label: "u@b/usersdb",
   allTables: [

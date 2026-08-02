@@ -7,13 +7,14 @@
 export type Agg = "count" | "count_distinct" | "sum" | "avg" | "min" | "max" | "median";
 export type TimeGrain = "day" | "week" | "month" | "quarter" | "year";
 export type ValueFormat = "number" | "compact" | "percent" | "currency" | "hours" | "days";
-export type FilterOp = "=" | "!=" | ">" | ">=" | "<" | "<=" | "in" | "not_null" | "is_null";
+export type FilterOp = "=" | "!=" | ">" | ">=" | "<" | "<=" | "in" | "not_in" | "between" | "contains" | "not_null" | "is_null";
 export type WidgetWidth = "quarter" | "third" | "half" | "full";
 
 export interface Filter {
   col: string;
   op: FilterOp;
-  /** omitted for is_null / not_null; array for `in`. */
+  /** omitted for is_null / not_null; array for `in`/`not_in`; [lo, hi] pair
+   *  for `between`; substring text for `contains` (compiles to escaped ILIKE). */
   value?: string | number | boolean | Array<string | number>;
 }
 
@@ -23,7 +24,33 @@ export interface Metric {
   agg: Agg;
   label?: string;
   format?: ValueFormat;
+  /** A2: derived metric — a CLOSED expression AST, never free SQL. When
+   *  present, col/agg are ignored and the value is computed from num/den:
+   *    ratio → num*1.0/nullif(den,0)
+   *    pct   → num*100.0/nullif(den,0)   (format "percent" auto-applies)
+   *    diff  → num - den
+   *  Division by zero yields NULL (renders as "—"), never garbage. */
+  expr?: MetricExpr;
+  /** A4: period comparison — a delta chip "vs prev <grain>". Windows are
+   *  anchored at max(dateCol) IN THE DATA (latest bucket vs the one before),
+   *  computed deterministically in SQL; the model never writes the windows.
+   *  Valid only when dateCol is a real temporal column; validation repairs a
+   *  missing/wrong dateCol from the table's temporal column or strips compare
+   *  (the KPI itself always survives). */
+  compare?: Compare;
 }
+
+export type CompareGrain = "day" | "week" | "month" | "quarter" | "year";
+export interface Compare { grain: CompareGrain; dateCol: string }
+
+export type ExprOp = "ratio" | "pct" | "diff";
+/** One side of a derived expression: a plain aggregate, no nesting. `where`
+ *  makes the side CONDITIONAL (compiles to `agg(...) FILTER (WHERE ...)`) —
+ *  this is what makes real rates expressible when attainment lives in a
+ *  categorical column: SLA attainment = pct of count WHERE sla_status='met'
+ *  over count(*). Same closed Filter grammar as widget filters. */
+export interface BaseMetric { col: string; agg: Agg; where?: Filter[] }
+export interface MetricExpr { op: ExprOp; num: BaseMetric; den: BaseMetric }
 
 /** A grouping dimension; timeGrain buckets a date/timestamp column. */
 export interface Dimension {
@@ -32,13 +59,26 @@ export interface Dimension {
   label?: string;
 }
 
+/** A3 — one verified lookup join per widget. `on` = [baseCol, refCol]; the
+ *  edge (base.on[0] → table.on[1]) must exist in the base table's verified
+ *  foreignKeys or validation drops the widget. `cols` is FILLED BY VALIDATION:
+ *  the referenced columns that live only on the joined table — compile
+ *  qualifies those with the join alias and everything else with the base. */
+export interface WidgetJoin {
+  table: string;
+  on: [string, string];
+  cols?: string[];
+}
+
 export interface KpiWidget {
   id: string;
   kind: "kpi";
   title: string;
+  subtitle?: string;
   table: string;
   metric: Metric;
   filters?: Filter[];
+  join?: WidgetJoin;
   width?: WidgetWidth;        // default "quarter"
 }
 
@@ -51,6 +91,7 @@ export interface ChartWidget {
   x: Dimension;
   series: Metric[];           // pie/donut use the first series only
   filters?: Filter[];
+  join?: WidgetJoin;
   sort?: { by: "x" | "y"; dir: "asc" | "desc" };
   limit?: number;
   width?: WidgetWidth;        // default "half"
@@ -72,12 +113,58 @@ export interface TableWidget {
   columns: TableColumn[];
   groupBy?: Dimension[];
   filters?: Filter[];
+  join?: WidgetJoin;
   sort?: { by: string; dir: "asc" | "desc" };  // by = a column label or col
   limit?: number;
   width?: WidgetWidth;        // default "full"
 }
 
 export type Widget = KpiWidget | ChartWidget | TableWidget;
+
+// ---- Global filters (Phase A1) ---------------------------------------------
+// Dashboard-level filters rendered as a filter bar. They are DERIVED
+// deterministically from the data profile at compile time (temporal min/max →
+// date range, low-cardinality categoricals → selects) and persisted on the
+// spec so edit turns see them. The client only ever sends filter VALUES; the
+// server rebuilds the WHERE clause (bff/dashboard/filters.ts) — no SQL, and
+// no SQL fragments, ever cross the wire from the sandbox for filtered queries.
+export type GlobalFilterKind = "daterange" | "select" | "multiselect";
+
+export interface GlobalFilter {
+  id: string;
+  col: string;
+  kind: GlobalFilterKind;
+  label: string;
+  /** Optional anchor table (informational; applicability is computed per compile). */
+  table?: string;
+}
+
+/** Compile-time enrichment of a GlobalFilter: everything the renderer needs to
+ *  draw the control without another round trip. */
+export interface CompiledGlobalFilter extends GlobalFilter {
+  /** Tables (among the rendered widgets') that have this column — the filter
+   *  applies to a widget iff its table is in this list. */
+  tables: string[];
+  /** daterange only: which column to filter PER TABLE. A date range applies to
+   *  every table that has ANY temporal column, using that table's own best
+   *  date column — tables don't have to share the anchor column's name. */
+  cols?: Record<string, string>;
+  /** select/multiselect: the choices, from profile topValues (capped). */
+  options?: string[];
+  /** daterange: ISO date bounds (YYYY-MM-DD) from the profile min/max. */
+  min?: string;
+  max?: string;
+}
+
+/** A filter VALUE as sent by the client at query time. Self-describing so the
+ *  server can rebuild WHERE without session state. Every field is re-validated
+ *  and escaped server-side (bff/dashboard/filters.ts) before touching SQL. */
+export interface AppliedFilter {
+  col: string;
+  kind: GlobalFilterKind;
+  /** select: string · multiselect: string[] · daterange: { from?, to? } (ISO dates). */
+  value: string | string[] | { from?: string; to?: string };
+}
 
 export interface Section {
   id: string;
@@ -94,12 +181,17 @@ export interface DashboardMeta {
   accent?: string;
   /** Chart series palette (hex[]) — "make the charts teal" lands here. */
   chartPalette?: string[];
+  /** One-line callout rendered as a highlight banner under the KPI strip. */
+  insight?: string;
 }
 
 export interface DashboardSpec {
   version: 1;
   meta: DashboardMeta;
   sections: Section[];
+  /** Global filter bar. undefined → compile derives from the profile;
+   *  [] → explicitly no filters (an edit removed them all). */
+  filters?: GlobalFilter[];
 }
 
 // ---- Compiled form (server output → renderer input) ------------------------
@@ -110,6 +202,8 @@ export interface CompiledWidget {
   sql: string;
   /** stable result-column keys for chart series (alias → label), for the renderer. */
   seriesKeys?: { key: string; label: string; format?: ValueFormat }[];
+  /** table result columns (alias → label + per-column format), for the renderer. */
+  columns?: { key: string; label: string; format?: ValueFormat }[];
 }
 
 export interface CompiledSection {
@@ -122,6 +216,8 @@ export interface RenderPlan {
   meta: DashboardMeta;
   sections: CompiledSection[];
   warnings: string[];
+  /** A1: the filter bar, fully resolved (options, bounds, applicability). */
+  filters?: CompiledGlobalFilter[];
   /** al5: the spec AFTER validation/repair — what actually renders. The handler
    *  returns THIS to the client (persisted as currentSpec), so the next edit
    *  turn reasons about widgets that exist on screen, and the change summary

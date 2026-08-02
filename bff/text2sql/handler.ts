@@ -19,15 +19,20 @@
 import { getChatStore, type ChatStore } from "../chat-store";
 import {
   openConnection, openConnectionWith, getConnection, getHandle, closeConnectionHandle, publicView, profileTables,
-  markExecution, openGroup, type ConnRecord, type GroupPart,
+  markExecution, openGroup, newMemberId, memberIdForCatalog, parseRef, removeGroupMember, soloMemberId,
+  type ConnRecord, type GroupPart,
 } from "../sources/connection-registry";
+import { getSelection, setSelection } from "../sources/selection-store";
+import { describeError } from "../sources/describe-error";
 import { connFromParts, type DbConnParts } from "../sources/db-conn";
 import {
   registerWorkbenchSource, getWorkbenchSource, wbSlug, wbDbPath,
   stagingDbPath, addStaged, getStaged, finalizeStaged, discardStaged, releaseInstance,
   type WorkbenchSource, type StagedState,
 } from "../sources/workbench-store";
-import { snapshotTables } from "../sources/db-conn";
+import { snapshotTables, snapshotFromHandle, attachGroup, type WbSnapshotResult } from "../sources/db-conn";
+import { mkdirSync } from "node:fs";
+import { dirname } from "node:path";
 import { COLO_PROJECT_ID, coloAvailable, coloProfiles, coloQuery } from "../sources/colo";
 import { isWorkbenchProject, wbQuery, combineSources } from "../sources/workbench-store";
 import { qid } from "../sources/mysql";
@@ -35,7 +40,21 @@ import { guardSelect } from "./guard";
 import { runAnalystLoop, formatEvidenceDirective, compactEvidence, type AnalystRun } from "./analyst";
 import { planSqlTurn, type PlanSqlRun, type SqlTurnPlan } from "./planner";
 import { composeAnswer, composeFallback, type ComposeRun } from "./composer";
+import { runChatAnalyst, fallbackSummary } from "./interpret";
+import { callGemini, PLAN_OPTS } from "../aiflow";
+
+// The main chat's analyst caps. Separate env vars from the /select analyst's
+// T2SQL_ANALYST_* on purpose: that one queries whatever production database a
+// user pasted a string for and stays tight; this one queries a local DuckDB
+// snapshot, so it can afford to look around. Read per call so a test or an
+// operator can change them without a restart.
+const SOURCE_MAX_QUERIES = () => Math.max(1, Number(process.env.T2SQL_SOURCE_MAX_QUERIES ?? 5));
+const SOURCE_MAX_ROUNDS = () => Math.max(1, Number(process.env.T2SQL_SOURCE_MAX_ROUNDS ?? 3));
+const SOURCE_BUDGET_MS = () => Math.max(5_000, Number(process.env.T2SQL_SOURCE_BUDGET_MS ?? 60_000));
 import type { Dataset } from "../../shared/types";
+import { enrichColumns } from "../../shared/profile-enrich";
+import { exactColumnStats } from "../sources/exact-stats";
+import { duckTypeToColumnType } from "../sources/mysql";
 
 const QUERY_MAX_ROWS = Number(process.env.T2SQL_QUERY_MAX_ROWS ?? 500);
 const ROWS_TO_CLIENT = Number(process.env.T2SQL_ROWS_TO_CLIENT ?? 200);
@@ -53,6 +72,9 @@ export interface SqlHandlerDeps {
   compose?: ComposeRun;     // Gemini runner for the composer
   analyst?: AnalystRun;     // the analyst loop (tests inject a fake)
   chatStore?: ChatStore;
+  /** Streaming seam: each guarded query as it is about to run, so the SSE route
+   *  can emit a `query` event. Additive — omit it and nothing changes. */
+  onQuery?: (sql: string) => void;
 }
 
 type Out = { status: number; body: any };
@@ -69,9 +91,21 @@ export async function handleSqlConnect(body: unknown, tenantId: string): Promise
   }
   try {
     // Structured parts (the dedicated Postgres page): every field taken literally.
+    // `fast`: the selection page connects to LIST tables, nothing more — it
+    // profiles a table when the user clicks it. Skipping the connect-time
+    // sampling, catalog-wide column metadata and information_schema row counts
+    // is the difference between seconds and minutes on a large server.
+    const fast = b.fast === true;
     const rec = hasParts
-      ? await openConnectionWith(tenantId, connFromParts(b.parts as DbConnParts))
-      : await openConnection(tenantId, b.connectionString);
+      ? await openConnectionWith(tenantId, connFromParts(b.parts as DbConnParts), undefined, { fast })
+      : await openConnection(tenantId, b.connectionString, undefined, { fast });
+    // Per-source data-plane choice (goal 3): "live" queries the DB directly and
+    // stores NOTHING; "snapshot" extracts first. Validated here, defaulted by
+    // the T2SQL_LIVE_SOURCE env flag when unset.
+    if (b.mode !== undefined) {
+      if (b.mode !== "live" && b.mode !== "snapshot") return bad('mode must be "live" or "snapshot"');
+      rec.mode = b.mode;
+    }
     // al3: addTo binds this database with an existing connection (or group) into
     // ONE group record — merged schema, one attach, cross-DB joins. The chat,
     // analyst, and live source then run over the union via the group's id.
@@ -79,8 +113,14 @@ export async function handleSqlConnect(body: unknown, tenantId: string): Promise
       const base = getConnection(tenantId, b.addTo.trim());
       if (!base) return { status: 404, body: { error: "the connection to add to is unknown or expired — reconnect it first" } };
       const asPart = (r: ConnRecord): GroupPart[] =>
-        r.groupParts?.length ? r.groupParts : [{ conn: r.conn, label: r.label, allTables: r.allTables, datasets: r.datasets }];
+        // An existing group keeps its members' ids untouched — regrouping must not
+        // change anyone's identity. A plain connection becomes a member here, so
+        // this is where its id is minted, once.
+        r.groupParts?.length
+          ? r.groupParts
+          : [{ id: newMemberId(), conn: r.conn, label: r.label, allTables: r.allTables, datasets: r.datasets }];
       const group = openGroup(tenantId, [...asPart(base), ...asPart(rec)]);
+      group.mode = rec.mode ?? base.mode;
       console.log(`[text2sql] grouped ${group.groupParts!.length} databases as ${group.id}`);
       return { status: 200, body: publicView(group) };
     }
@@ -91,10 +131,76 @@ export async function handleSqlConnect(body: unknown, tenantId: string): Promise
   }
 }
 
+// ---- POST /api/sql/:connectionId/members/:memberId/remove -------------------------
+// Close a database tab. Keyed on the STABLE member id: every surviving member
+// keeps its identity, only attach positions shift, and nothing durable stores a
+// position. Tables that came from the removed database are pruned from the
+// selection and RETURNED, because silently un-ticking a table the user chose is
+// worse than the removal itself.
+export async function handleRemoveMember(
+  connectionId: string,
+  memberId: string,
+  body: unknown,
+  tenantId: string,
+): Promise<Out> {
+  const rec = getConnection(tenantId, String(connectionId ?? ""));
+  if (!rec) return { status: 404, body: { error: "unknown or expired connection — reconnect" } };
+  const id = String(memberId ?? "").trim();
+  if (!id) return bad("memberId is required");
+
+  const before = rec.groupParts?.map((p) => p.id) ?? [soloMemberId(rec)];
+  if (!before.includes(id)) return { status: 404, body: { error: "unknown member — it may already have been removed" } };
+
+  const { rec: survivor, removed, removedTables } = removeGroupMember(rec, id);
+
+  // Prune the selection to what still exists. Only names from the removed member
+  // go; everything else keeps its tick and its column projection.
+  let pruned: string[] = [];
+  const conversationId = String((body as any)?.conversationId ?? "").trim();
+  if (conversationId && removedTables.length) {
+    try {
+      const cur = await getSelection(conversationId, tenantId);
+      const gone = new Set(removedTables);
+      const kept = cur.tables.filter((t) => !gone.has(t));
+      pruned = cur.tables.filter((t) => gone.has(t));
+      if (pruned.length) {
+        const columns = { ...(cur.columns ?? {}) };
+        for (const t of pruned) delete columns[t];
+        await setSelection(conversationId, tenantId, kept, { columns });
+      }
+    } catch (err: any) {
+      // A pruning failure must not strand the removal — report it instead.
+      console.warn(`[text2sql] member removed but selection prune failed: ${describeError(err)}`);
+    }
+  }
+
+  console.log(`[text2sql] removed member ${id} (${removed?.label ?? "?"}) from ${rec.id}; ${survivor ? (survivor.groupParts?.length ?? 1) : 0} left`);
+  if (!survivor) {
+    return { status: 200, body: { connectionId: null, closed: true, removedLabel: removed?.label ?? null, prunedTables: pruned } };
+  }
+  return {
+    status: 200,
+    body: { ...publicView(survivor), removedLabel: removed?.label ?? null, prunedTables: pruned },
+  };
+}
+
 // ---- GET /api/sql/:connectionId/schema -----------------------------------------
 export function handleSqlSchema(connectionId: string, tenantId: string): Out {
   const rec = getConnection(tenantId, String(connectionId ?? ""));
   if (!rec) return { status: 404, body: { error: "unknown or expired connection — reconnect" } };
+  return { status: 200, body: publicView(rec) };
+}
+
+// ---- POST /api/sql/:connectionId/mode --------------------------------------------
+// Deterministic per-source toggle between the live and snapshot data planes.
+// Takes effect on the NEXT build; already-published sources are untouched.
+export function handleSqlMode(connectionId: string, body: unknown, tenantId: string): Out {
+  const rec = getConnection(tenantId, String(connectionId ?? ""));
+  if (!rec) return { status: 404, body: { error: "unknown or expired connection — reconnect" } };
+  const mode = (body as any)?.mode;
+  if (mode !== "live" && mode !== "snapshot") return bad('mode must be "live" or "snapshot"');
+  rec.mode = mode;
+  console.log(`[text2sql] ${rec.id}: data-plane mode set to ${mode}`);
   return { status: 200, body: publicView(rec) };
 }
 
@@ -103,11 +209,12 @@ export function handleSqlSchema(connectionId: string, tenantId: string): Out {
 // into the conversation's single staging DuckDB file. Publishing to the build
 // page happens only via finalizeStaged() ("Extract DB") — or implicitly on a
 // build intent, which needs a queryable source immediately.
-async function stageSnapshot(
+export async function stageSnapshot(
   rec: ConnRecord,
   tables: string[],
   tenantId: string,
   conversationId: string,
+  onPhase?: (msg: string) => void,
 ): Promise<{ staged: StagedState; warnings: string[]; skipped: string[] }> {
   const cleaned = [...new Set(tables.map((t) => String(t).trim()).filter(Boolean))];
   if (!cleaned.length) throw new Error("no tables to extract");
@@ -115,8 +222,53 @@ async function stageSnapshot(
   // and queried, the lazy query cache holds the file open — evict it before the
   // snapshot writer opens the same file (re-extract into the same stage).
   await releaseInstance(stagingDbPath(conversationId));
+  const dbPath = stagingDbPath(conversationId);
   // Same file every time -> tables append (CREATE OR REPLACE dedupes re-extracts).
-  const result = await snapshotTables(rec.conn, { tables: cleaned, dbPath: stagingDbPath(conversationId) });
+  //
+  // GROUPS TAKE A DIFFERENT PATH. rec.conn is only parts[0] ("placeholder for
+  // shape" — see openGroup), and a group attaches as src0, src1, … not "src", so
+  // the single-connection path resolved NOTHING against a group and silently
+  // skipped every table: a multi-database commit extracted from the first
+  // database only, or not at all.
+  const members = rec.groupParts ?? [];
+  let result: WbSnapshotResult;
+  if (members.length) {
+    // The selection speaks MERGED DISPLAY NAMES: mergeGroupParts renames
+    // collisions (access_audit_log -> access_audit_log_2), and those invented
+    // names exist in no real catalog, so resolving them directly skips the table.
+    // Each merged entry carries its true origin in `ref` (src1."public"."orders"),
+    // so translate to the fully-qualified db:schema.table form the resolver
+    // matches first. Names we can't map are passed through unchanged and fail
+    // the normal way, with a "table not found" the user can read.
+    // parseRef is the ONE parser for `src{i}."schema"."table"` — shared with
+    // routeTablesToMembers, because a second copy is how this bug came back.
+    const byName = new Map(rec.allTables.map((t) => [t.name, t]));
+    const qualified = cleaned.map((want) => {
+      const r = parseRef(byName.get(want)?.ref ?? "");
+      return r ? `${r.catalog}:${r.schema}.${r.table}` : want;
+    });
+    mkdirSync(dirname(dbPath), { recursive: true });
+    const h = await attachGroup(members.map((p) => p.conn), { dbPath, onPhase });
+    try {
+      result = await snapshotFromHandle(h, members[0].conn.dialect, {
+        tables: qualified, dbPath, onPhase,
+        catalogs: members.map((_, i) => `src${i}`),
+      });
+      // Translate the attach-time catalog (src0/src1 — positional, valid only for
+      // THIS attach) into the stable member id before anything persists it.
+      result = {
+        ...result,
+        datasets: result.datasets.map((d) => ({
+          ...d,
+          origin: { ...d.origin, memberId: memberIdForCatalog(members, d.origin.catalog) ?? undefined },
+        })),
+      };
+    } finally {
+      h.close();
+    }
+  } else {
+    result = await snapshotTables(rec.conn, { tables: cleaned, dbPath, onPhase });
+  }
   const skipped: string[] = result.skipped;
   if (!result.datasets.length && !getStaged(conversationId)) {
     throw new Error(`extraction produced no tables (${skipped.join("; ") || "unknown reason"})`);
@@ -135,23 +287,6 @@ function stagedView(st: StagedState) {
       columns: t.profile.columns.map((c) => ({ name: c.name, type: c.type })),
     })),
   };
-}
-
-// ---- POST /api/sql/extract ------------------------------------------------------
-export async function handleSqlExtract(body: unknown, tenantId: string, deps: SqlHandlerDeps = {}): Promise<Out> {
-  const b = body as any;
-  if (!b || typeof b !== "object") return bad("body must be a JSON object");
-  const rec = getConnection(tenantId, String(b.connectionId ?? ""));
-  if (!rec) return { status: 404, body: { error: "unknown or expired connection — reconnect" } };
-  if (!Array.isArray(b.tables) || !b.tables.length) return bad("tables[] is required");
-  try {
-    const store = deps.chatStore ?? getChatStore();
-    const conversationId = await store.createConversation(`Workbench: ${rec.conn.database}`, b.conversationId || undefined);
-    const { staged, warnings, skipped } = await stageSnapshot(rec, b.tables, tenantId, conversationId);
-    return { status: 200, body: { conversationId, staged: stagedView(staged), warnings: [...warnings, ...skipped] } };
-  } catch (err: any) {
-    return { status: 500, body: { error: err?.message ?? "extraction failed" } };
-  }
 }
 
 // ---- POST /api/source/chat — data questions INSIDE the build chat -----------------
@@ -210,30 +345,66 @@ export async function handleSourceChat(body: unknown, tenantId: string, deps: Sq
     return say({ answer: fallback });
   }
 
+  // Pre-validate so an unsafe plan still gets the specific, actionable message
+  // rather than being explained by the composer. runChatAnalyst guards again through
+  // this same guardSelect — one guard, applied twice, never a second one.
   const guarded = guardSelect(plan.sql ?? "", 500);
   if (!guarded.ok) return say({ answer: `I couldn't form a safe query for that (${guarded.error}). Try rephrasing.` });
-  const t0 = Date.now();
-  let rows: Record<string, unknown>[];
-  try {
-    rows = await runQuery(guarded.sql);
-  } catch (err: any) {
-    return say({ answer: `The lookup failed: ${err?.message ?? err}`, sql: guarded.sql });
-  }
-  const executionMeta = { durationMs: Date.now() - t0, rowsReturned: rows.length, sourceType: "snapshot" as const };
-  const simple = rows.length === 0 || (rows.length === 1 && Object.keys(rows[0]).length === 1);
-  const answer = simple
-    ? composeFallback({ question: prompt, sql: guarded.sql, rows })
-    : await composeAnswer({ question: prompt, sql: guarded.sql, rows }, deps.compose);
-  return say({ answer, sql: guarded.sql, rows: rows.slice(0, 50), columns: rows.length ? Object.keys(rows[0]) : [], executionMeta });
-}
 
-// ---- GET /api/sql/stage/:conversationId — rehydrate the staged panel ------------
-// Pairs with durable staging: after a page reload (or BFF restart) the client can
-// restore the right panel and still press "Extract DB" without reconnecting.
-export function handleSqlStageGet(conversationId: string, tenantId: string): Out {
-  const st = getStaged(String(conversationId ?? ""));
-  if (!st || st.tenantId !== tenantId) return { status: 200, body: { staged: { count: 0, tables: [] } } };
-  return { status: 200, body: { conversationId: st.conversationId, staged: stagedView(st) } };
+  const t0 = Date.now();
+  const analyst = await runChatAnalyst(
+    { prompt, plannedSql: [plan.sql ?? ""], history },
+    {
+      runQuery: async (sql) => {
+        const started = Date.now();
+        const r = await runQuery(sql);
+        return {
+          columns: r.length ? Object.keys(r[0]) : [], rows: r,
+          truncated: false, elapsedMs: Date.now() - started,
+        };
+      },
+      guard: (sql, rowCap) => guardSelect(sql, rowCap ?? 500),
+      model: (system, user) => (deps.compose ?? callGemini)(system, user, PLAN_OPTS),
+      rowCap: 500,
+      onQuery: deps.onQuery,
+      // Deliberately looser than the /select analyst's T2SQL_ANALYST_* caps: this
+      // runs against a local DuckDB snapshot, where an extra query costs
+      // milliseconds and cannot put anyone's production database under load.
+      maxQueries: SOURCE_MAX_QUERIES(),
+      maxRounds: SOURCE_MAX_ROUNDS(),
+      budgetMs: SOURCE_BUDGET_MS(),
+      // The deterministic shortcut, restored: one query returning one cell (or
+      // nothing) has no shape to interpret, so skip the composer and save the
+      // round trip. Matches the sibling call site in handleSqlChat.
+      shouldCompose: (outcomes) => {
+        if (outcomes.length !== 1) return true; // several results => worth interpreting
+        const o = outcomes[0];
+        if (!o.ok) return true;                 // a failure needs explaining
+        return !(o.rows.length === 0 || (o.rows.length === 1 && Object.keys(o.rows[0]).length === 1));
+      },
+    },
+  );
+
+  // The first successful query backs the result grid the client renders. A turn
+  // may have run several; the rest live in the prose.
+  const primary = analyst.outcomes.find((o) => o.ok) ?? analyst.outcomes[0];
+  if (!primary) return say({ answer: "I couldn't run a query for that.", sql: guarded.sql });
+  if (!primary.ok) return say({ answer: `The lookup failed: ${primary.error}`, sql: primary.sql });
+
+  const rows = primary.rows;
+  const executionMeta = {
+    durationMs: Date.now() - t0, rowsReturned: rows.length, sourceType: "snapshot" as const,
+    queriesRun: analyst.outcomes.length, stoppedBy: analyst.stoppedBy,
+  };
+  // Three sources, in order: the interpretive answer; the deterministic one-liner
+  // when we skipped the composer on purpose (modelDown=false — nothing to
+  // apologise for); and fallbackSummary when the model was asked and didn't
+  // answer, which says so.
+  const answer = analyst.answer
+    ?? (analyst.stoppedBy === "compose_skipped"
+      ? composeFallback({ question: prompt, sql: primary.sql, rows, truncated: primary.truncated }, false)
+      : fallbackSummary(analyst.outcomes));
+  return say({ answer, sql: primary.sql, rows: rows.slice(0, 50), columns: primary.columns, executionMeta });
 }
 
 // ---- POST /api/sources/combine — merge published extracts into ONE source --------
@@ -261,22 +432,6 @@ export async function handleCombineSources(body: unknown, tenantId: string): Pro
 export function handleSqlStageDiscard(conversationId: string, tenantId: string): Out {
   const removed = discardStaged(String(conversationId ?? ""), tenantId);
   return { status: 200, body: { discarded: removed } };
-}
-
-// ---- POST /api/sql/extract-db — the "Extract DB" button: publish the stage ------
-export async function handleSqlExtractDb(body: unknown, tenantId: string): Promise<Out> {
-  const b = body as any;
-  if (!b || typeof b !== "object") return bad("body must be a JSON object");
-  if (typeof b.conversationId !== "string" || !b.conversationId) return bad("conversationId is required");
-  const st = getStaged(b.conversationId);
-  if (!st) return bad("nothing staged in this conversation yet — extract some tables first");
-  if (st.tenantId !== tenantId) return { status: 404, body: { error: "unknown conversation" } };
-  try {
-    const source = finalizeStaged(b.conversationId, typeof b.label === "string" ? b.label : undefined);
-    return { status: 200, body: { projectId: source.projectId, label: source.label, tables: source.tables } };
-  } catch (err: any) {
-    return bad(err?.message ?? "extract DB failed");
-  }
 }
 
 // ---- POST /api/sql/chat -----------------------------------------------------------
@@ -343,7 +498,8 @@ export async function handleSqlChat(body: unknown, tenantId: string, deps: SqlHa
       // shapes"): previews, empty results, and single-cell answers need no model.
       const simpleShape = rows.length === 0 || (rows.length === 1 && Object.keys(rows[0]).length === 1);
       const answer = plan.intent === "preview" || simpleShape
-        ? composeFallback({ question: prompt, sql: guarded.sql, rows, truncated })
+        // false: the model was skipped on purpose here, so don't apologise for it.
+        ? composeFallback({ question: prompt, sql: guarded.sql, rows, truncated }, false)
         : await composeAnswer({ question: prompt, sql: guarded.sql, rows, truncated }, deps.compose);
       return reply({
         intent: plan.intent, answer, sql: guarded.sql,
@@ -397,7 +553,7 @@ export async function handleSqlChat(body: unknown, tenantId: string, deps: SqlHa
       // query the live DB through per-table views; nothing survives a restart.
       // Setup failure falls back to the snapshot path below (the product keeps
       // working; the log says why the live path was skipped).
-      if (LIVE_SOURCE_ENABLED()) {
+      if (sourceIsLive(rec)) {
         try {
           const want = plan.tables?.length ? plan.tables : rec.datasets.map((d) => d.tableName);
           let liveDatasets = await profileTables(rec, want).catch(() => [] as Dataset[]);
@@ -496,6 +652,8 @@ async function runOnLiveAttach(rec: ConnRecord, sql: string, timeoutMs = QUERY_T
 // (BFF restart / TTL) — by design; a 410 tells the client to reconnect.
 export const LIVE_PREFIX = "live_";
 const LIVE_SOURCE_ENABLED = () => (process.env.T2SQL_LIVE_SOURCE ?? "0") === "1";
+/** Goal 3, surfaced: the per-source mode wins; the env flag is only the default. */
+const sourceIsLive = (rec: ConnRecord) => (rec.mode ?? (LIVE_SOURCE_ENABLED() ? "live" : "snapshot")) === "live";
 const viewsApplied = new WeakMap<object, number>();
 
 function liveViewDefs(rec: ConnRecord): { name: string; ref: string }[] {
@@ -544,24 +702,30 @@ async function materializeFindings(
     for (let n = 2; taken.has(name); n++) name = `${viewSlug(f.question)}_${n}`;
     try {
       await h.run(`CREATE OR REPLACE VIEW main.${qid(name)} AS ${f.sql}`, 15_000, `finding view ${name}`);
-      const sample = await h.readAll(`SELECT * FROM main.${qid(name)} LIMIT 5`, `sample ${name}`);
+      const sample = await h.readAll(`SELECT * FROM main.${qid(name)} LIMIT 200`, `sample ${name}`);
       const cnt = await h.readAll(`SELECT count(*) AS n FROM main.${qid(name)}`, `count ${name}`);
+      // Real column types from DESCRIBE (typeof-sniffing collapsed dates to
+      // string → no min/max → no derived daterange filter for finding views).
+      const desc = await h.readAll(`DESCRIBE main.${qid(name)}`, `describe ${name}`).catch(() => [] as Record<string, unknown>[]);
+      const typeOf = new Map(desc.map((d) => [String((d as any).column_name), duckTypeToColumnType(String((d as any).column_type))]));
       const columns = Object.keys(sample[0] ?? {}).map((col) => ({
         name: col,
-        type: typeof sample[0]?.[col] === "number" ? "number" : "string",
+        type: typeOf.get(col) ?? (typeof sample[0]?.[col] === "number" ? "number" : "string"),
         nullable: sample.some((r) => r[col] == null),
         uniqueCount: new Set(sample.map((r) => String(r[col]))).size,
         sampleValues: sample.map((r) => r[col]).filter((v) => v != null).slice(0, 5),
       }));
       if (!columns.length) continue;
       taken.add(name);
+      let enriched = enrichColumns(columns as any, sample);
+      try { enriched = await exactColumnStats((q, l) => h.readAll(q, l ?? "stats"), `main.${qid(name)}`, enriched); } catch { /* floor stands */ }
       defs.push({ name, sql: f.sql });
       out.push({
         tableName: name,
         profile: {
           source: { filename: `live finding: ${f.id}`, format: "json" },
           rowCount: Number((cnt[0] as any)?.n ?? sample.length),
-          columns: columns as any,
+          columns: enriched as any,
           sampleRows: sample,
         },
       } as Dataset);

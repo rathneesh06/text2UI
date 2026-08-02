@@ -9,6 +9,9 @@
 import { DuckDBInstance, type DuckDBConnection } from "@duckdb/node-api";
 import { qid, duckTypeToColumnType } from "./mysql";
 import type { Dataset, ColumnProfile } from "../../shared/types";
+import { enrichColumns } from "../../shared/profile-enrich";
+import { exactColumnStats } from "./exact-stats";
+import { attachMeasuredForeignKeys } from "./relationships";
 
 /** Each view is defensive: source tables may be absent if you snapshotted a
  *  subset, so creation failures are recorded as warnings, not fatal. */
@@ -127,8 +130,10 @@ export async function applyModelOn(c: DuckDBConnection, opts: { onPhase?: (m: st
   for (const name of created) {
     const colRows = await readAll(`DESCRIBE ${qid(name)}`);
     const cnt = await readAll(`SELECT count(*) AS n FROM ${qid(name)}`);
-    const sample = await readAll(`SELECT * FROM ${qid(name)} LIMIT 5`);
-    const columns: ColumnProfile[] = colRows.map((r) => {
+    // 200-row sample as the enrichment floor (5 rows made uniqueCount nonsense
+    // and starved topValues); sampleRows stays small for prompt-context size.
+    const sample = await readAll(`SELECT * FROM ${qid(name)} LIMIT 200`);
+    let columns: ColumnProfile[] = colRows.map((r) => {
       const colName = String((r as any).column_name);
       const colType = String((r as any).column_type);
       const values = sample.map((s) => s[colName]).filter((x) => x !== null && x !== undefined);
@@ -140,11 +145,18 @@ export async function applyModelOn(c: DuckDBConnection, opts: { onPhase?: (m: st
         sampleValues: values.slice(0, 5),
       };
     });
+    columns = enrichColumns(columns, sample);
+    // We own this DuckDB: full-table GROUP BY / min-max are cheap and make the
+    // observed-value + range guards TRUTHFUL (exact uniqueCounts, real bounds).
+    columns = await exactColumnStats(readAll, qid(name), columns);
     datasets.push({
       tableName: name,
-      profile: { source: { filename: `view:${name}`, format: "json" }, rowCount: Number((cnt[0] as any).n ?? 0), columns, sampleRows: sample },
+      profile: { source: { filename: `view:${name}`, format: "json" }, rowCount: Number((cnt[0] as any).n ?? 0), columns, sampleRows: sample.slice(0, 5) },
     });
   }
+  // A3: prove name-heuristic join candidates against the actual data —
+  // only measured/constraint edges may ever compile a widget.join.
+  try { await attachMeasuredForeignKeys(readAll, datasets); } catch { /* no edges */ }
 
   try { await c.run("CHECKPOINT"); } catch { /* best-effort */ }
   return { datasets, created, warnings };

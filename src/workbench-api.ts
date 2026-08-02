@@ -2,6 +2,7 @@
 // Kept beside api.ts rather than inside it so the workbench feature lands as an
 // additive module; mirrors api.ts's request conventions (auth header, dbg log).
 import type { Dataset, DataProfile } from "../shared/types";
+import type { Dependency } from "../shared/dependencies";
 import { BFF_URL, dbg } from "./api";
 
 function authHeaders(): Record<string, string> {
@@ -34,11 +35,34 @@ export interface WbConnection {
   connectionId: string;
   status?: "active" | "degraded";
   label: string;
-  allTables: { name: string; approxRows: number; schema?: string; ref?: string }[];
+  /** `memberId` is stamped SERVER-SIDE from each table's ref. Never re-derive it
+   *  by parsing `src{i}.` here: that index is attach-scoped and shifts when a
+   *  member is removed, which is what the stable ids exist to prevent. */
+  allTables: { name: string; approxRows: number; schema?: string; ref?: string; memberId?: string | null }[];
   datasets: Dataset[];
   warnings: string[];
-  /** al3: present when this "connection" is a GROUP of databases. */
-  members?: string[];
+  /** One entry per database. Always present — a single connection reports one
+   *  synthetic member, so the client has no special case. */
+  members: { id: string; label: string }[];
+}
+
+/** Response to closing a database tab. `connectionId: null` means the last
+ *  member went and the connection is closed. */
+export interface WbMemberRemoved extends Omit<Partial<WbConnection>, "connectionId"> {
+  connectionId: string | null;
+  closed?: boolean;
+  removedLabel: string | null;
+  /** Selected tables that came from the removed database — surfaced to the user
+   *  rather than silently un-ticked. */
+  prunedTables: string[];
+}
+
+/** Close one database. Keyed on the stable member id, never a position. */
+export function wbRemoveMember(connectionId: string, memberId: string, conversationId?: string): Promise<WbMemberRemoved> {
+  return request<WbMemberRemoved>(
+    `/api/sql/${encodeURIComponent(connectionId)}/members/${encodeURIComponent(memberId)}/remove`,
+    { method: "POST", body: JSON.stringify({ ...(conversationId ? { conversationId } : {}) }) },
+  );
 }
 
 export interface WbExtracted {
@@ -48,56 +72,30 @@ export interface WbExtracted {
   /** al1: analyst-loop findings, present on build handoffs when T2SQL_ANALYST=1 —
    *  carried into the first dashboard build as its analytical directive. */
   evidence?: string;
-}
-
-export interface WbStagedTable {
-  tableName: string;
-  rowCount: number;
-  columns: { name: string; type?: string }[];
-}
-export interface WbStaged { count: number; tables: WbStagedTable[] }
-
-export interface WbChatResponse {
-  conversationId: string;
-  intent: "query" | "preview" | "extract" | "build" | "chat";
-  answer: string;
-  sql?: string;
-  rows?: Record<string, unknown>[];
-  columns?: string[];
-  truncated?: boolean;
-  /** extract intent: the accumulated stage for the right panel */
-  staged?: WbStaged;
-  executionMeta?: { durationMs: number; rowsReturned: number; sourceType: string };
-  policy?: { outcome: "allowed" | "capped" | "rejected"; reason?: string };
-  extracted?: WbExtracted;
-  handoff?: WbExtracted & { artifact: "dashboard" | "ppt"; buildPrompt: string };
+  /** Stage 4: how the selected tables relate across databases. Unlike `evidence`
+   *  this is NOT spent on the first build — a user editing three turns later
+   *  still needs to know the join semantics. */
+  combinedSchema?: string;
 }
 
 /** Connect + introspect. The connection string is sent once over the wire and the
  *  BFF never echoes credentials back. */
-export function wbConnect(connectionString: string, addTo?: string): Promise<WbConnection> {
+export function wbConnect(connectionString: string, addTo?: string, mode?: "live" | "snapshot", opts: { fast?: boolean } = {}): Promise<WbConnection> {
   return request<WbConnection>("/api/sql/connect", {
     method: "POST",
     // al3: addTo binds this DB with an existing connection/group into ONE group
     // (merged schema, cross-DB joins) — the response's connectionId is the group.
-    body: JSON.stringify({ connectionString, ...(addTo ? { addTo } : {}) }),
+    // mode (goal 3): "live" reads straight from the database and stores nothing;
+    // omitted → the server default (snapshot unless T2SQL_LIVE_SOURCE=1).
+    // fast: list table names only — the selection page profiles on click, so it
+    // skips the connect-time sampling that dominates latency on big servers.
+    body: JSON.stringify({ connectionString, ...(addTo ? { addTo } : {}), ...(mode ? { mode } : {}), ...(opts.fast ? { fast: true } : {}) }),
   });
 }
 
 /** Rehydrate the schema for an existing connection (e.g. after navigation). */
 export function wbSchema(connectionId: string): Promise<WbConnection> {
   return request<WbConnection>(`/api/sql/${encodeURIComponent(connectionId)}/schema`);
-}
-
-/** One conversational turn against the connected database. */
-export function wbChat(body: { connectionId: string; conversationId?: string; prompt: string }): Promise<WbChatResponse> {
-  return request<WbChatResponse>("/api/sql/chat", { method: "POST", body: JSON.stringify(body) });
-}
-
-/** Stage tables (the schema-tree button). Staged tables accumulate in the
- *  conversation until wbExtractDb publishes them as ONE source. */
-export function wbExtract(body: { connectionId: string; tables: string[]; conversationId?: string }): Promise<{ conversationId: string; staged: WbStaged; warnings: string[] }> {
-  return request("/api/sql/extract", { method: "POST", body: JSON.stringify(body) });
 }
 
 /** Answer a data question inside the BUILD chat by querying the published
@@ -108,11 +106,6 @@ export function sourceChat(body: { projectId: string; conversationId?: string; p
   executionMeta?: { durationMs: number; rowsReturned: number; sourceType: string };
 }> {
   return request("/api/source/chat", { method: "POST", body: JSON.stringify(body) });
-}
-
-/** Rehydrate the staged panel (after page reload / BFF restart). */
-export function wbStage(conversationId: string): Promise<{ conversationId?: string; staged: WbStaged }> {
-  return request(`/api/sql/stage/${encodeURIComponent(conversationId)}`);
 }
 
 /** Merge published extracts into ONE combined source (multi-connection builds). */
@@ -130,71 +123,75 @@ export function wbDeleteSource(projectId: string): Promise<{ deleted: boolean }>
   return request(`/api/sources/${encodeURIComponent(projectId)}`, { method: "DELETE" });
 }
 
-/** "Extract DB": publish everything staged in this conversation as one source. */
-export function wbExtractDb(body: { conversationId: string; label?: string }): Promise<WbExtracted> {
-  return request("/api/sql/extract-db", { method: "POST", body: JSON.stringify(body) });
+/* ---- table selection: the pick-your-tables page (/select) ---- */
+
+export interface WbCatalogTable {
+  index: number;          // 1-based, exactly the number shown in the rail
+  name: string;
+  approxRows: number;
+  profiled: boolean;      // false -> clicking it needs a wbProfile round-trip
+  columnCount: number | null;
+  /** Which database this table came from. Stamped server-side — do NOT derive it
+   *  by parsing a ref's `src{i}` prefix; that index shifts on member removal. */
+  memberId?: string | null;
+}
+export interface WbColumn {
+  name: string;
+  type: string | null;
+  nullable: boolean | null;
+  uniqueCount: number | null;
+  sampleValues: unknown[];
+}
+export interface WbTableDetail {
+  tableName: string;
+  rowCount: number;
+  columns: WbColumn[];
+  sampleRows: Record<string, unknown>[];
+}
+export interface WbSelectionReply {
+  conversationId: string;
+  reply: string;
+  selection: string[];
+  /** Per-table column narrowing. A table absent here keeps every column. */
+  columns?: Record<string, string[]>;
+  added: string[];
+  removed: string[];
+  unresolved?: string[];
+  ambiguous?: { ref: string; candidates: string[] }[];
+  focus?: string;         // the assistant asked to OPEN a table's columns
+  canUndo: boolean;
+  understood: boolean;
+  source?: "model" | "offline";   // "offline" = the model was unreachable
+  /** Cross-database relationships captured so far in this conversation. */
+  dependencies?: Dependency[];
 }
 
-/* ---- dedicated Postgres page: structured connect (no URL parsing pitfalls) ---- */
-
-export interface WbConnParts {
-  dialect?: "mysql" | "postgres";
-  host: string;
-  port?: number | string;
-  database: string;
-  user?: string;
-  password?: string;
-  ssl?: boolean;
+/** The rail's list: every table, numbered as the user sees it. */
+export function wbCatalog(connectionId: string): Promise<{ connectionId: string; label: string; tables: WbCatalogTable[]; members: { id: string; label: string }[]; warnings: string[] }> {
+  return request(`/api/sql/${encodeURIComponent(connectionId)}/catalog`);
 }
 
-/** Connect from structured fields — every value is sent literally, so passwords
- *  with @ % # $ ! need zero escaping. The BFF never echoes credentials back. */
-export function wbConnectParts(parts: WbConnParts): Promise<WbConnection> {
-  return request<WbConnection>("/api/sql/connect", {
-    method: "POST",
-    body: JSON.stringify({ parts }),
-  });
+/** Columns for the middle panel; profiles on demand for big schemas. */
+export function wbProfile(connectionId: string, tables: string[]): Promise<{ tables: WbTableDetail[]; warnings: string[] }> {
+  return request(`/api/sql/${encodeURIComponent(connectionId)}/profile`, { method: "POST", body: JSON.stringify({ tables }) });
 }
 
-/** Best-effort client-side parse of a postgres:// URI into form fields (the
- *  "paste to fill" convenience). Percent-escapes are decoded when valid; the
- *  authoritative connect always sends the FORM values, so a wrong guess here is
- *  visible and fixable before connecting. */
-export function pgUriToParts(uri: string): Partial<WbConnParts> | null {
-  const s = (uri ?? "").trim();
-  const m = s.match(/^postgres(?:ql)?(?:\+[a-z0-9]+)?:\/\//i);
-  if (!m) return null;
-  const dec = (x: string) => { try { return /%[0-9a-f]{2}/i.test(x) ? decodeURIComponent(x) : x; } catch { return x; } };
-  const rest = s.slice(m[0].length);
-  const slash = rest.indexOf("/");
-  const authority = slash >= 0 ? rest.slice(0, slash) : rest;
-  let tail = slash >= 0 ? rest.slice(slash + 1) : "";
-  let query = "";
-  const qm = tail.search(/[?#]/);
-  if (qm >= 0) { query = tail.slice(qm + 1); tail = tail.slice(0, qm); }
-  const at = authority.lastIndexOf("@");
-  const userinfo = at >= 0 ? authority.slice(0, at) : "";
-  const hostport = at >= 0 ? authority.slice(at + 1) : authority;
-  let user = "", password = "";
-  if (userinfo) {
-    const colon = userinfo.indexOf(":");
-    if (colon >= 0) { user = userinfo.slice(0, colon); password = userinfo.slice(colon + 1); }
-    else user = userinfo;
-  }
-  let host = hostport, port: string | undefined;
-  const lastColon = hostport.lastIndexOf(":");
-  if (lastColon >= 0 && /^\d+$/.test(hostport.slice(lastColon + 1))) {
-    host = hostport.slice(0, lastColon);
-    port = hostport.slice(lastColon + 1);
-  }
-  const ssl = /(^|&)(ssl|sslmode|ssl-mode)=(1|true|require|required|verify[^&]*|yes|on)(&|$)/i.test(query);
-  return {
-    dialect: "postgres",
-    host: host.replace(/^\[|\]$/g, ""),
-    ...(port ? { port } : {}),
-    database: dec(tail),
-    user: dec(user),
-    password: dec(password),
-    ssl,
-  };
+/** One conversational selection turn ("select 1, 2, 3", "drop the audit ones"). */
+export function wbSelect(body: { connectionId: string; conversationId?: string; prompt: string }): Promise<WbSelectionReply> {
+  return request("/api/sql/select", { method: "POST", body: JSON.stringify(body) });
+}
+
+/** Push the checkbox state — clicking and typing edit the SAME selection. */
+export function wbSetSelection(body: { connectionId: string; conversationId?: string; tables: string[]; columns?: Record<string, string[]>; note?: boolean }): Promise<{ conversationId: string; selection: string[]; columns: Record<string, string[]>; added: string[]; removed: string[]; canUndo: boolean }> {
+  return request("/api/sql/selection", { method: "POST", body: JSON.stringify(body) });
+}
+
+/** Rehydrate selection + transcript after a reload. */
+export function wbGetSelection(conversationId: string): Promise<{ conversationId: string; selection: string[]; columns: Record<string, string[]>; connectionId: string | null; connectionLabel: string | null; canUndo: boolean; turns: { role: string; content: string }[]; dependencies?: Dependency[] }> {
+  return request(`/api/sql/selection/${encodeURIComponent(conversationId)}`);
+}
+
+/** "Continue to text2UI": the selection becomes a build source. */
+export function wbCommitSelection(body: { connectionId: string; conversationId?: string; tables?: string[]; label?: string; mode?: "live" | "snapshot" }): Promise<WbExtracted & { conversationId: string; mode: "live" | "snapshot"; warnings?: string[] }> {
+  return request("/api/sql/selection/commit", { method: "POST", body: JSON.stringify(body) });
 }

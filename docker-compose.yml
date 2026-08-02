@@ -35,7 +35,7 @@ services:
       PORT: "8787"
       STORAGE: postgres
       PG_URL: postgres://text2ui:text2ui@db:5432/text2ui
-      ALLOWED_ORIGINS: http://localhost:4173
+      ALLOWED_ORIGINS: http://localhost:4173,http://localhost:5173
       MARKITDOWN_URL: http://markitdown:8001
     ports:
       - "8787:8787"

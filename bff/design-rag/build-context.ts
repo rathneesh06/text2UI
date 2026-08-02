@@ -16,6 +16,7 @@ import { DESIGN_RAG_ENABLED } from "./config";
 import { makeEmbeddingClient, type EmbeddingClient } from "./embeddings";
 import { makePgVectorStore } from "./store";
 import { retrieveReferences, type RetrievalStore, type DesignRef } from "./retrieve";
+import { staticReferences, type StaticRefDeps } from "./static-refs";
 
 export interface BuildReferences {
   referenceBlock: string;          // injected into the build prompt (text notes)
@@ -33,6 +34,8 @@ export interface BuildRefDeps {
   readImage?: (path: string) => Promise<Buffer>;
   domainOf?: (input: AssembleInput) => string;
   schemaOf?: (input: AssembleInput) => string;
+  /** Test seam for the curated set that runs ahead of retrieval. */
+  staticRefs?: StaticRefDeps;
 }
 
 function isBuildTurn(input: AssembleInput): boolean {
@@ -43,8 +46,21 @@ export async function retrieveForBuild(
   input: AssembleInput,
   deps: BuildRefDeps = {},
 ): Promise<BuildReferences> {
+  if (!isBuildTurn(input)) return EMPTY;
+
+  // CURATED SET FIRST. A hand-picked folder of references beats whatever the
+  // corpus happens to retrieve, so it runs in FRONT of the pgvector path rather
+  // than replacing it: if it yields nothing — switched off, folder missing, no
+  // PNGs — we fall through to today's retrieval exactly as it worked before.
+  // staticReferences never throws, so this cannot cost a build.
+  const curated = await staticReferences(deps.staticRefs);
+  if (curated.images.length) {
+    console.log(`[design-refs] using ${curated.images.length} curated reference(s) — skipping retrieval`);
+    return curated;
+  }
+
   const enabled = deps.enabled ?? DESIGN_RAG_ENABLED;
-  if (!enabled || !isBuildTurn(input)) return EMPTY;
+  if (!enabled) return EMPTY;
   try {
     const store = deps.store !== undefined ? deps.store : makePgVectorStore();
     if (!store) return EMPTY;

@@ -8,6 +8,9 @@ import { writeFileSync, mkdtempSync, rmSync } from "fs";
 import { tmpdir } from "os";
 import { join } from "path";
 import type { Dataset, DataProfile, ColumnProfile, ColumnType } from "../../shared/types";
+import { enrichColumns } from "../../shared/profile-enrich";
+import { exactColumnStats } from "../sources/exact-stats";
+import { attachMeasuredForeignKeys } from "../sources/relationships";
 
 const qid = (s: string) => `"${String(s).replace(/"/g, '""')}"`;
 const qstr = (s: string) => `'${String(s).replace(/'/g, "''")}'`;
@@ -45,7 +48,7 @@ async function profileTable(conn: DuckDBConnection, table: string, format: DataP
     : {};
   const sample = await readRows(conn, `SELECT * FROM ${qid(table)} LIMIT 20`);
 
-  const columns: ColumnProfile[] = desc.map((d) => {
+  let columns: ColumnProfile[] = desc.map((d) => {
     const name = String(d.column_name);
     return {
       name,
@@ -56,6 +59,9 @@ async function profileTable(conn: DuckDBConnection, table: string, format: DataP
     };
   });
 
+  columns = enrichColumns(columns, sample);
+  // We own this DuckDB — exact stats replace the 20-row floor (statsExact).
+  try { columns = await exactColumnStats((q, l) => readRows(conn, q), qid(table), columns); } catch { /* floor stands */ }
   const profile: DataProfile = {
     source: { filename: `upload:${table}`, format },  // upload: marker → never treated as colo
     rowCount: Number(rowCount ?? 0),
@@ -79,6 +85,8 @@ export async function loadCsvFiles(files: { tableName: string; path: string }[])
     await conn.run(`CREATE TABLE ${qid(f.tableName)} AS SELECT * FROM read_csv_auto(${qstr(f.path)}, header=true, sample_size=-1)`);
     datasets.push(await profileTable(conn, f.tableName, "csv"));
   }
+  // A3: measured relationship edges across the uploaded tables.
+  try { await attachMeasuredForeignKeys(async (q) => readRows(conn, q), datasets); } catch { /* no edges */ }
   return makeHandle(inst, conn, datasets);
 }
 
@@ -98,5 +106,6 @@ export async function loadRows(tables: { tableName: string; rows: Record<string,
   } finally {
     rmSync(dir, { recursive: true, force: true });
   }
+  try { await attachMeasuredForeignKeys(async (q) => readRows(conn, q), datasets); } catch { /* no edges */ }
   return makeHandle(inst, conn, datasets);
 }

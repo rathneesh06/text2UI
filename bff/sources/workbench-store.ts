@@ -19,6 +19,7 @@ import { existsSync, mkdirSync, readFileSync, writeFileSync, renameSync, rmSync 
 import { join } from "node:path";
 import { DuckDBInstance } from "@duckdb/node-api";
 import { assertReadOnly } from "../storage/guard";
+import { qid } from "./mysql";
 import type { QueryResult } from "../storage/types";
 import type { Dataset } from "../../shared/types";
 
@@ -220,6 +221,62 @@ export function addStaged(conversationId: string, tenantId: string, dbPath: stri
   staged.set(conversationId, state);
   saveStages();
   return state;
+}
+
+/**
+ * Narrow staged tables to the columns the user actually picked.
+ *
+ * Runs AFTER the snapshot, against the local stage file — the remote database is
+ * not touched again. Rewriting the table (rather than filtering only the profile)
+ * matters because everything downstream — the planner, generated SQL, the UI
+ * builder — reads the real schema; a column the user deselected should not exist
+ * for them to find.
+ *
+ * `projection` is keyed by Dataset.tableName (the physical, sanitised name).
+ * A table absent from the map keeps every column.
+ */
+export async function projectStagedColumns(
+  conversationId: string,
+  projection: Record<string, string[]>,
+): Promise<string[]> {
+  const st = staged.get(conversationId);
+  const warnings: string[] = [];
+  const wanted = Object.entries(projection).filter(([, cols]) => cols?.length);
+  if (!st || !wanted.length) return warnings;
+
+  const inst = await getInstance(st.dbPath);
+  const c = await inst.connect();
+  try {
+    for (const [table, cols] of wanted) {
+      const ds = st.tables.find((t) => t.tableName === table);
+      if (!ds) continue;
+      // Only columns that actually exist, in their original order — a stale
+      // name from the client must not produce invalid SQL.
+      const have = new Set(ds.profile.columns.map((x) => x.name));
+      const keep = ds.profile.columns.map((x) => x.name).filter((n) => cols.includes(n));
+      const missing = cols.filter((n) => !have.has(n));
+      if (missing.length) warnings.push(`${table}: no such column ${missing.join(", ")} — ignored`);
+      if (!keep.length) { warnings.push(`${table}: no valid columns selected — kept all`); continue; }
+      if (keep.length === ds.profile.columns.length) continue; // nothing narrowed
+      try {
+        const list = keep.map((n) => qid(n)).join(", ");
+        await c.run(`CREATE OR REPLACE TABLE ${qid(table)} AS SELECT ${list} FROM ${qid(table)}`);
+        // Keep the profile honest with the table it now describes.
+        ds.profile.columns = ds.profile.columns.filter((x) => keep.includes(x.name));
+        ds.profile.sampleRows = (ds.profile.sampleRows ?? []).map((r) => {
+          const out: Record<string, unknown> = {};
+          for (const n of keep) out[n] = (r as any)[n];
+          return out;
+        });
+      } catch (e) {
+        warnings.push(`${table}: could not narrow columns (${(e as Error).message}) — kept all`);
+      }
+    }
+  } finally {
+    c.disconnectSync();
+  }
+  saveStages();
+  return warnings;
 }
 
 export function getStaged(conversationId: string): StagedState | null {

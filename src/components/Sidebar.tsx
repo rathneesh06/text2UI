@@ -1,7 +1,7 @@
 // Sidebar.tsx — the design's left rail (Figma image 4): NAVIGATION, TABLES,
 // + New Project. My Projects is live now (session-local registry in App).
 import { NavLink } from "react-router-dom";
-import { HiOutlineFolderOpen, HiOutlineDatabase, HiOutlineServer } from "react-icons/hi";
+import { HiOutlineFolderOpen, HiOutlineDatabase } from "react-icons/hi";
 import type { Table } from "../lib/datasets";
 import "./Sidebar.css";
 
@@ -31,18 +31,11 @@ export default function Sidebar({ onNewProject, tables, selectedTableName, onSel
             <span>My Projects</span>
           </NavLink>
           <NavLink
-            to="/workbench"
+            to="/select"
             className={({ isActive }) => `sidebar__link ${isActive ? "sidebar__link--active" : ""}`}
           >
             <HiOutlineDatabase className="sidebar__link-icon" />
-            <span>SQL Workbench</span>
-          </NavLink>
-          <NavLink
-            to="/postgres"
-            className={({ isActive }) => `sidebar__link ${isActive ? "sidebar__link--active" : ""}`}
-          >
-            <HiOutlineServer className="sidebar__link-icon" />
-            <span>Postgres</span>
+            <span>Connect a database</span>
           </NavLink>
         </nav>
 

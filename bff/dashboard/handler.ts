@@ -1,20 +1,77 @@
-// bff/dashboard/handler.ts — the spec-driven build endpoint. One call runs the whole
-// pipeline: plan (or edit) a DashboardSpec, validate+compile it to SQL, and render it
-// to a runnable app. It returns BOTH the app AND the spec; the client persists the
-// spec and sends it back as `currentSpec` next turn, so each prompt edits the same
-// dashboard. Pure handler (deps injectable) so it can be unit-tested without a server.
+// bff/dashboard/handler.ts — the spec-driven build endpoint, restored and upgraded.
+//
+// One call runs the whole pipeline:
+//
+//   enhance (ALWAYS)  →  specialist agents (parallel)  →  merge  →  validate/compile  →  render
+//                         kpi · bar · line · pie · table
+//
+//   1. The QUERY ENHANCEMENT LAYER (./enhance) runs on EVERY turn and produces the
+//      baseline instructions deterministically — schema roles, house rules, coverage
+//      minimums — regardless of how small the data or the prompt is. The best
+//      available model directive (analyst evidence > orchestrator brief > LLM
+//      rewrite) enriches it; none of them can suppress it.
+//   2. BUILD turns fan out to the per-widget agents (./agents): separate focused
+//      calls for KPI cards, bar charts, line/area trends, pie/donut compositions,
+//      and tables, each with a deterministic profile-derived fallback. The merger
+//      (./merge) assembles the harvest into one DashboardSpec.
+//   3. EDIT turns keep the single-planner minimal-mutation path (./planner) — a
+//      node-level edit of the persisted spec is one surgical change, not five
+//      parallel proposals — with the enhancement layer's instructions attached.
+//   4. The monolithic planner remains as a fallback for builds (kill-switch
+//      DASHBOARD_AGENTS=0, or an empty harvest), so the endpoint's contract and
+//      failure behavior only ever got stronger.
+//
+// It returns BOTH the app AND the spec; the client persists the spec and sends it
+// back as `currentSpec` next turn, so each prompt edits the same dashboard.
+// Pure handler (deps injectable) so it can be unit-tested without a server.
 import type { Dataset } from "../../shared/types";
 import type { DashboardSpec } from "../../shared/dashboard-spec";
-import { planSpec, rewritePrompt, HEX_RE, type PlanSpecInput } from "./planner";
+import { planSpec, HEX_RE, type PlanSpecInput } from "./planner";
+import { enhanceQuery, briefToStyleHints, briefToAnalyticalDirective, type Enhancement } from "./enhance";
+import { runChartAgents, type AgentRun, type AgentHarvest } from "./agents";
+import { decomposeQuery, type PlanDesign } from "./decompose";
+import { staticReferences } from "../design-rag/static-refs";
+import { designTokenBlock, DESIGN_FAMILY } from "../design-tokens";
+import { buildSemanticModel, semanticDigest } from "../datasources/semantic";
+import { audit, newTurnId } from "../datasources/audit";
+import { mergeHarvest, seededPalette } from "./merge";
 import { compileSpec } from "./compile";
+import { pushVersion, undo, redo, decisionsText, detectHistoryIntent, cursorIndex } from "./session";
+import { reconcileEdit } from "./reconcile";
+import { planEditOps, applyOps, deterministicSelectionOps } from "./patch";
 import { renderPlanToApp } from "./renderer";
+import { verifySpecJoins, type ReadAll } from "../sources/relationships";
+import { captureRunner, recordTurn, replayCaptureEnabled } from "./replay-capture";
+
+// Re-exported so existing imports/tests keep working after the brief helpers
+// moved into the enhancement layer where they belong.
+export { briefToStyleHints, briefToAnalyticalDirective };
 
 type Planner = (input: PlanSpecInput) => Promise<DashboardSpec | null>;
+const AGENTS_ENABLED = (process.env.DASHBOARD_AGENTS ?? "1") === "1";
+
+export interface HandlerDeps {
+  planner?: Planner;
+  agentRun?: AgentRun;
+  /** injectable for tests: skip the enhancement layer's LLM rewrite */
+  skipRewrite?: boolean;
+  /** OPEN-GRAMMAR: a guarded query handle for this project. When present,
+   *  model-proposed joins not already verified are MEASURED at build time
+   *  (uniqueness + containment proofs) before validation judges them. */
+  readAll?: ReadAll;
+}
 
 export async function handleDashboardBuild(
   body: unknown,
-  planner: Planner = planSpec,
+  plannerOrDeps: Planner | HandlerDeps = {},
 ): Promise<{ status: number; body: any }> {
+  // Back-compat: the old signature took the planner function directly. A directly
+  // injected planner also PINS the planner path (tests inject fakes and must stay
+  // offline — fanning out to the real agents would defeat the injection).
+  const legacyPlannerInjected = typeof plannerOrDeps === "function";
+  let deps: HandlerDeps = legacyPlannerInjected ? { planner: plannerOrDeps as Planner } : (plannerOrDeps as HandlerDeps);
+  const planner = deps.planner ?? planSpec;
+
   const b = body as any;
   if (!b || typeof b !== "object") return { status: 400, body: { error: "body must be a JSON object" } };
   if (!Array.isArray(b.datasets) || !b.datasets.length) return { status: 400, body: { error: "datasets[] is required" } };
@@ -22,38 +79,335 @@ export async function handleDashboardBuild(
 
   const datasets = b.datasets as Dataset[];
   const currentSpec = b.currentSpec as DashboardSpec | undefined;
-  // The orchestrator's brief becomes BOTH directives for the spec planner: its
-  // palette/designDirection as visual direction, and its kpis/charts as the
-  // analytical directive. When there is no brief (edit turns, direct builds),
-  // the query-rewriting stage expands the raw ask into schema-grounded modeling
-  // instructions instead. Either path may fail soft — the raw prompt proceeds.
-  const styleHints = briefToStyleHints(b.brief);
-  // al1: an analyst-loop evidence pack (real findings computed from the live DB
-  // before the build) outranks both the brief's analytical half and the query
-  // rewriter -- it is the most grounded directive we can have.
-  const analystDirective = typeof b.analystDirective === "string" && b.analystDirective.trim() ? b.analystDirective.trim() : null;
-  const directive = analystDirective
-    ?? briefToAnalyticalDirective(b.brief)
-    ?? await rewritePrompt({ datasets, userPrompt: b.userPrompt, ...(currentSpec ? { currentSpec } : {}) });
-  // al4 diagnostic: WHICH directive reached the spec planner. If a workbench
-  // build logs "brief"/"rewriter" instead of "analyst evidence", the evidence
-  // was dropped on the way (that produced duplicate count(*) KPIs pre-al4).
-  console.log(`[dashboard] directive: ${analystDirective ? `analyst evidence (${analystDirective.length} chars)` : briefToAnalyticalDirective(b.brief) ? "orchestrator brief" : directive ? "query rewriter" : "none"}`);
+  const conversationId: string = typeof b.conversationId === "string" ? b.conversationId : "";
+  const selectedWidget = b.selectedWidget && typeof b.selectedWidget === "object"
+    ? { id: b.selectedWidget.id ? String(b.selectedWidget.id) : undefined, title: b.selectedWidget.title ? String(b.selectedWidget.title) : undefined }
+    : undefined;
 
+  // ---- Diff History: undo/redo are deterministic, instant, and exact ----------
+  // A bare "undo"/"redo" NEVER goes to a model — the session's version stack is
+  // the truth, and re-rendering a stored spec cannot drift.
+  // DAY-1 MERGE: on agents-path BUILD turns the plan-brief call (decompose +
+  // design) replaces the standalone LLM rewrite — one fewer sequential model
+  // round-trip, and the directive floor (baseline + semantic digest) still
+  // always applies. Edits and the planner path keep the rewriter.
+  const agentsPath = !currentSpec && AGENTS_ENABLED && !legacyPlannerInjected;
+  // Phase D: replay capture — wrap whichever runner this turn will use so
+  // every model response is recorded in order. Opt-in, fire-and-forget.
+  const replayCap = replayCaptureEnabled() ? captureRunner(deps.agentRun) : null;
+  if (replayCap) deps = { ...deps, agentRun: replayCap.run } as typeof deps;
+  const historyIntent = currentSpec && conversationId ? detectHistoryIntent(b.userPrompt) : null;
+  const turnId = newTurnId();
+  if (historyIntent) {
+    const v = historyIntent === "undo" ? undo(conversationId) : redo(conversationId);
+    if (!v) {
+      return { status: 200, body: { app: null, spec: currentSpec, warnings: [], noChange: true, pipeline: "history",
+        summary: [historyIntent === "undo" ? "Nothing to undo — this is the earliest version I have." : "Nothing to redo — you are on the latest version."] } };
+    }
+    const plan = compileSpec(v.spec, datasets);
+    if (!plan.sections.length) {
+      audit({ turnId, conversationId, stage: "history", detail: { intent: historyIntent, outcome: "stale-version-422", warnings: plan.warnings.slice(0, 6) } });
+      return { status: 422, body: { error: "stored version no longer valid for this data", warnings: plan.warnings } };
+    }
+    const app = renderPlanToApp(plan);
+    const n = cursorIndex(conversationId) + 1;
+    console.log(`[dashboard] ${historyIntent} -> version ${n} ("${v.spec.meta.title}")`);
+    audit({ turnId, conversationId, stage: "history", detail: { intent: historyIntent, version: n, title: v.spec.meta.title } });
+    return { status: 200, body: { app, spec: plan.spec, warnings: plan.warnings, pipeline: "history",
+      summary: [`${historyIntent === "undo" ? "Reverted to" : "Restored"} version ${n} — the one from "${v.prompt.slice(0, 60)}".`] } };
+  }
+
+  // ---- Context Manager: the conversation reaches the edit planner -------------
+  const chatContext = buildChatContext(b.history, conversationId);
+
+  audit({ turnId, conversationId, stage: "prompt", detail: { userPrompt: String(b.userPrompt).slice(0, 500), edit: !!currentSpec, tables: datasets.map((d) => d.tableName) } });
+
+  // ---- Semantic model: deterministic business abstraction over the profiles ---
+  // (entities, candidate metrics, join candidates — the doc's semantic layer,
+  // generic instead of handwritten-per-schema, with the candidate-metrics tier
+  // solving cold start.)
+  const semModel = buildSemanticModel(datasets);
+  const semDigest = semanticDigest(semModel);
+
+  // ---- Stage 1: the query enhancement layer (always on, never null) ----------
+  const enhancement = await enhanceQuery({
+    semanticDigest: semDigest,
+    datasets, userPrompt: b.userPrompt,
+    ...(currentSpec ? { currentSpec } : {}),
+    ...(b.brief ? { brief: b.brief } : {}),
+    ...(typeof b.analystDirective === "string" ? { analystDirective: b.analystDirective } : {}),
+    ...(deps.skipRewrite || legacyPlannerInjected || agentsPath ? { skipRewrite: true } : {}),
+  });
+  console.log(`[dashboard] directive source: ${enhancement.directiveSource} (${enhancement.combined.length} chars, baseline always applied) · semantic: ${semModel.metrics.length} candidate metric(s), ${semModel.joins.length} join candidate(s)`);
+  audit({ turnId, conversationId, stage: "enhance", detail: { directiveSource: enhancement.directiveSource, candidateMetrics: semModel.metrics.length, joinCandidates: semModel.joins.length } });
+
+  let spec: DashboardSpec | null = null;
+  let planDesign: PlanDesign | undefined;
+  let pipeline: "agents" | "planner" | "patch" = "planner";
+  const degradedNotes: string[] = []; // E1: model-failure fallbacks are user-facing facts
+
+  if (!currentSpec && AGENTS_ENABLED && !legacyPlannerInjected) {
+    // ---- Stage 2 (builds): parallel specialist agents + deterministic merge ----
+    // QUERY BREAKDOWN LAYER: decompose the request into grounded analytical
+    // tasks, routed to the agent families below. Trivial prompts skip the model
+    // call; failures fall back to deterministic schema-derived tasks.
+    // DESIGN REFERENCES reach the spec pipeline HERE and nowhere else. Until now
+    // retrieveForBuild was called only on the assembler (React-codegen) path, so
+    // every dashboard built through these agents was reference-blind — the
+    // visible reason curated references never showed up in the output.
+    // staticReferences() never throws; no refs means the previous behaviour.
+    const curated = await staticReferences();
+    const { tasks, source: taskSource, design, reasoning } = await decomposeQuery(
+      datasets, b.userPrompt, enhancement.combined, deps.agentRun,
+      { images: curated.images, tokenBlock: designTokenBlock(DESIGN_FAMILY) },
+    );
+    planDesign = design;
+    audit({ turnId, conversationId, stage: "decompose", detail: { source: taskSource, tasks: tasks.map((t) => ({ kind: t.kind, q: t.question.slice(0, 80) })), ...(design ? { design } : {}), ...(reasoning ? { reasoning: reasoning.slice(0, 300) } : {}) } });
+    const harvest = await runChartAgents(
+      { datasets, userPrompt: b.userPrompt, directive: withStyle(enhancement), tasks },
+      deps.agentRun,
+    );
+    audit({ turnId, conversationId, stage: "agents", detail: { reports: harvest.reports } });
+    // E1: a fallback caused by MODEL FAILURE (error/timeout) — as opposed to
+    // an agent being inapplicable to this schema — degrades quality and must
+    // be said out loud, not buried in the audit file.
+    const failed = harvest.reports.filter((r) => r.modelFailed);
+    if (failed.length) {
+      degradedNotes.push(`AI planning was unavailable for ${failed.map((r) => r.name).join(", ")} — deterministic schema-based widgets were used instead. Re-run the request to try the model again.`);
+    }
+    const merged = mergeHarvest(harvest, datasets, b.userPrompt, { ...designStyle(planDesign, datasets), ...mergeStyle(b.brief) });
+    if (countWidgets(merged) > 0) { spec = merged; pipeline = "agents"; }
+    else console.warn("[dashboard] agent harvest empty — falling back to the monolithic planner");
+  }
+
+  let healedNotes: string[] = [];
+  // ---- EDIT turns: patch-based by default (the Figma model) -------------------
+  // The model emits a minimal op list against widget ids; application is
+  // deterministic, so widgets not named in an op physically cannot change, and
+  // removals are gated on explicit removal intent (or the selected widget).
+  // Falls back to the full-spec planner + reconciliation if op planning fails.
+  // Hermeticity rule: an injected planner WITHOUT an injected runner means the
+  // caller (a test, or a legacy call site) wants the planner path — op planning
+  // must not escape to the live API. Production (no deps) uses the real model;
+  // op-planning tests inject agentRun.
+  const opsPathEnabled = !legacyPlannerInjected && !(deps.planner && !deps.agentRun);
+  if (!spec && currentSpec && opsPathEnabled) {
+    // TARGETED-EDIT FAST-PATH: a selected widget + a direct gesture ("make
+    // this a donut", "remove this", "rename this to X", "show only 5") is
+    // fully determined — resolved with NO model call, so a targeted edit can
+    // never degrade into a full-board re-plan for the common cases.
+    const fast = deterministicSelectionOps(String(b.userPrompt), selectedWidget?.id, currentSpec);
+    if (fast) {
+      console.log(`[edit-ops] deterministic selection fast-path: ${fast.map((o) => `${o.op}(${(o as any).id})`).join(" ")}`);
+      audit({ turnId, conversationId, stage: "edit_ops", detail: { fastPath: true, ops: fast } });
+    }
+    const ops = fast ?? await planEditOps(
+      { datasets, userPrompt: b.userPrompt, currentSpec, chatContext, selectedWidget, directive: enhancement.styleHints ?? undefined },
+      deps.agentRun,
+    );
+    if (ops) {
+      const r = applyOps(currentSpec, ops, b.userPrompt, selectedWidget?.id);
+      if (ops.length === 0) {
+        // The model judged the request unactionable — better to say so than guess.
+        audit({ turnId, conversationId, stage: "edit_ops", detail: { applied: [], rejected: [], unactionable: true } });
+        return { status: 200, body: { app: null, spec: currentSpec, warnings: [], noChange: true, pipeline: "patch",
+          summary: ["I wasn't sure what to change there — could you name the widget or describe the edit more specifically?"] } };
+      }
+      if (r.applied.length === 0) {
+        // Ops were emitted but every one was rejected by the deterministic
+        // apply gates. Nothing changed — say exactly that (and why), never
+        // "Updated the dashboard" over an unchanged board.
+        audit({ turnId, conversationId, stage: "edit_ops", detail: { applied: [], rejected: r.rejected } });
+        return { status: 200, body: { app: null, spec: currentSpec, warnings: [], noChange: true, pipeline: "patch",
+          summary: ["I couldn't apply that edit: " + r.rejected.join("; ") + ". Could you rephrase or point at the widget?"] } };
+      }
+      // E2: ops "applied" can still be a NET-ZERO change (e.g. the metric
+      // identity guard reverted the only real mutation). An unchanged board
+      // must never be announced as "Updated the dashboard".
+      if (JSON.stringify(r.spec) === JSON.stringify(currentSpec)) {
+        const why = [...r.notes, ...r.rejected];
+        audit({ turnId, conversationId, stage: "edit_ops", detail: { applied: r.applied, rejected: r.rejected, notes: r.notes, netZero: true } });
+        return { status: 200, body: { app: null, spec: currentSpec, warnings: why, noChange: true, pipeline: "patch",
+          summary: ["That edit wouldn't change anything" + (why.length ? ": " + why.join("; ") : ".")] } };
+      }
+      spec = r.spec;
+      pipeline = "patch" as any;
+      // E3: decline-class notes (guards that kept things as they were) are
+      // user-facing facts, not internal logs — surface them with rejections.
+      healedNotes = [...r.notes, ...r.rejected];
+      audit({ turnId, conversationId, stage: "edit_ops", detail: { applied: r.applied, rejected: r.rejected, notes: r.notes } });
+      if (r.rejected.length) console.log(`[dashboard] ops rejected: ${r.rejected.join(" | ")}`);
+    } else {
+      // HONEST DEGRADATION: the fallback re-plans the WHOLE board (reconcile
+      // heals kept widgets, but layout/wording can shift). The user must be
+      // told this was the coarse path, not the precise one.
+      console.warn("[dashboard] op planning failed — falling back to full-spec edit + reconciliation");
+      healedNotes = [...healedNotes,
+        "The precise edit planner was unavailable for this request, so a full-board re-plan was applied (unchanged widgets were healed back). If only one widget should change, keep it selected and phrase the change directly."];
+    }
+  }
+  if (!spec) {
+    // ---- Planner path: edit turns, kill-switch, or agent-harvest fallback ------
+    spec = await runPlannerPath(planner, datasets, b.userPrompt, enhancement, currentSpec, chatContext, selectedWidget);
+    if (!spec) {
+      audit({ turnId, conversationId, stage: "reject", detail: { status: 502, reason: "planner produced no spec (model failure likely)" } });
+      return { status: 502, body: { error: "planner could not produce a dashboard spec — the model call likely failed. Check the BFF logs and GEMINI_API_KEY (verify with GET /health?model=1)." } }
+    }
+    // EDIT RECONCILIATION: the previous version is the truth for everything the
+    // user didn't touch — heal any kept widget the model re-emitted with missing
+    // required fields, BEFORE validation gets a chance to drop it. A style-only
+    // edit can no longer gut the board because the model forgot the series arrays.
+    if (currentSpec) {
+      const r = reconcileEdit(currentSpec, spec, b.userPrompt);
+      spec = r.spec;
+      healedNotes = r.healed;
+      if (r.healed.length) audit({ turnId, conversationId, stage: "history", detail: { reconcileHealed: r.healed.slice(0, 10) } });
+      if (r.healed.length) console.log(`[dashboard] edit reconciliation healed ${r.healed.length} field(s): ${r.healed.slice(0, 4).join(" | ")}${r.healed.length > 4 ? " | …" : ""}`);
+    }
+  }
+
+  // Vibrancy guarantee: never ship on drab defaults — the plan design first,
+  // then the SEEDED palette (per-domain distinct), never a fixed constant.
+  if (!spec.meta.chartPalette?.length) spec.meta.chartPalette = planDesign?.palette ?? seededPalette(paletteSeed(datasets));
+  if (!spec.meta.accent || !HEX_RE.test(spec.meta.accent)) spec.meta.accent = planDesign?.accent ?? spec.meta.chartPalette[0];
+  // The concrete tokens the plan chose from the references. Only filled when the
+  // spec doesn't already carry them, so a user's explicit edit ("make it dark")
+  // still wins over the plan's opinion.
+  const m = spec.meta as unknown as Record<string, unknown>;
+  if (planDesign?.background && !m.background) m.background = planDesign.background;
+  if (planDesign?.surface && !m.surface) m.surface = planDesign.surface;
+  if (planDesign?.theme && !spec.meta.theme) spec.meta.theme = planDesign.theme;
+  if (planDesign?.headingFont && !m.headingFont) m.headingFont = planDesign.headingFont;
+  if (planDesign?.radius !== undefined && m.radius === undefined) m.radius = planDesign.radius;
+
+  // ---- Stage 2.9: measure-on-demand join verification --------------------------
+  // The verified-edge law stands; this turns "rejected because unmeasured" into
+  // "proven or refuted right now" whenever we own a query handle.
+  if (deps.readAll) {
+    try {
+      const jv = await verifySpecJoins(spec, datasets, deps.readAll);
+      if (jv.measured) audit({ turnId, conversationId, stage: "validate", detail: { joinMeasuredOnDemand: jv.measured, proven: jv.proven } });
+      if (jv.proven.length) console.log(`[dashboard] measured-on-demand: proved ${jv.proven.length} join edge(s)`);
+    } catch { /* best-effort — validation falls back to the existing rejection */ }
+  }
+
+  // ---- Stage 3: validate + compile to deterministic SQL, then render ----------
+  const plan = compileSpec(spec, datasets);
+  if (!plan.sections.length) {
+    audit({ turnId, conversationId, stage: "reject", detail: { status: 422, reason: "no valid widgets after validation", warnings: plan.warnings.slice(0, 8) } });
+    return { status: 422, body: { error: "no valid widgets after validation", warnings: plan.warnings } };
+  }
+
+  const app = renderPlanToApp(plan);
+  // al5: return the VALIDATED spec — the one that actually rendered. Returning
+  // the raw planner spec meant the summary counted widgets validation had
+  // dropped ("5 widgets" for a 4-widget board) and the client persisted ghost
+  // widgets as currentSpec, so the next edit turn reasoned about things that
+  // were not on screen.
+  const rendered = plan.spec;
+  const dropped = allWidgets(spec).length - allWidgets(rendered).length;
+  if (dropped > 0) console.log(`[dashboard] validation dropped ${dropped} widget(s): ${plan.warnings.join(" | ")}`);
+  const warnings = [...healedNotes, ...degradedNotes, ...plan.warnings];
+  // POST-VALIDATION NET-ZERO (the "Updated the dashboard / no metric —
+  // dropped" incident): applyOps added something, validation dropped it, the
+  // board is byte-identical to before — say exactly that, with the drop
+  // reasons, never a success message.
+  if (currentSpec && JSON.stringify(rendered) === JSON.stringify(currentSpec)) {
+    audit({ turnId, conversationId, stage: "render", detail: { pipeline, netZeroAfterValidation: true, warnings: plan.warnings.slice(0, 6) } });
+    return { status: 200, body: { app: null, spec: currentSpec, warnings, noChange: true, pipeline,
+      summary: ["That edit didn't land" + (warnings.length ? ": " + warnings.slice(0, 3).join("; ") : ".") + " Try naming the metric or column explicitly."] } };
+  }
+  const summary = summarizeSpecChange(currentSpec, rendered);
+  // Phase D: record the replayable turn — full input + ordered model I/O +
+  // the VALIDATED spec that rendered. History/undo turns return earlier and
+  // are deliberately not recorded (they are deterministic stack operations).
+  if (replayCap) {
+    recordTurn({ v: 1, at: new Date().toISOString(), turnId, pipeline,
+      body: { userPrompt: String(b.userPrompt), datasets, currentSpec: currentSpec ?? null,
+        history: (b as any).history ?? null, brief: b.brief ?? null,
+        selectedWidget: selectedWidget ?? null, conversationId },
+      model: replayCap.log, spec: rendered, warnings: plan.warnings });
+  }
+  audit({ turnId, conversationId, stage: "render", detail: { pipeline, widgets: allWidgets(rendered).length, dropped, warnings: plan.warnings.slice(0, 6), sql: plan.sections.flatMap((sc: any) => sc.widgets.map((cw: any) => cw.sql)).slice(0, 30) } });
+  // Diff History: every accepted version enters the conversation's undo stack.
+  if (conversationId) pushVersion(conversationId, rendered, summary.join(" "), b.userPrompt);
+  return {
+    status: 200,
+    body: { app, spec: rendered, warnings, summary, pipeline },
+  };
+}
+
+/** Render the recent conversation + rolling decisions for the edit planner.
+ *  History arrives from the route (chat store) or the client; decisions come
+ *  from this module's session. Either alone is still useful; both is best. */
+function buildChatContext(history: unknown, conversationId: string): string | null {
+  const parts: string[] = [];
+  if (Array.isArray(history) && history.length) {
+    const turns = history
+      .filter((m: any) => m && (m.role === "user" || m.role === "assistant") && typeof m.content === "string" && m.content.trim())
+      .slice(-8)
+      .map((m: any) => `${m.role === "user" ? "User" : "Assistant"}: ${String(m.content).slice(0, 220)}`);
+    if (turns.length) parts.push(turns.join("\n"));
+  }
+  const d = decisionsText(conversationId);
+  if (d) parts.push(d);
+  return parts.length ? parts.join("\n\n") : null;
+}
+
+/** The enhancement's combined directive plus the visual direction, for the agents. */
+function withStyle(e: Enhancement): string {
+  return e.styleHints ? `${e.combined}\n\nVISUAL DIRECTION: ${e.styleHints}` : e.combined;
+}
+
+/** Deterministic palette seed: the dominant table name anchors the domain. */
+function paletteSeed(datasets: Dataset[]): string {
+  return datasets.map((d) => d.tableName).sort().join("|") || "t2ui";
+}
+
+/** The plan-brief's typed design channel → merger style opts. The seeded
+ *  palette is the floor, so a failed model call still ships colorful. */
+function designStyle(design: PlanDesign | undefined, datasets: Dataset[]): { accent?: string; chartPalette?: string[] } {
+  const pal = design?.palette?.length ? design.palette : seededPalette(paletteSeed(datasets));
+  return { accent: design?.accent ?? pal[0], chartPalette: pal };
+}
+
+/** Pull concrete style choices out of an orchestrator brief for the merger. */
+function mergeStyle(brief: any): { title?: string; subtitle?: string; accent?: string; chartPalette?: string[] } {
+  const out: { title?: string; subtitle?: string; accent?: string; chartPalette?: string[] } = {};
+  if (brief && typeof brief === "object") {
+    if (typeof brief.title === "string" && brief.title.trim()) out.title = brief.title.trim();
+    if (typeof brief.narrative === "string" && brief.narrative.trim()) out.subtitle = brief.narrative.trim().slice(0, 160);
+    const p = brief.palette;
+    if (p && typeof p === "object") {
+      if (HEX_RE.test(String(p.primary ?? ""))) out.accent = String(p.primary);
+      const pal = [p.primary, p.accent, ...(Array.isArray(p.neutrals) ? p.neutrals : [])]
+        .map(String).filter((c) => HEX_RE.test(c));
+      if (pal.length >= 3) out.chartPalette = pal.slice(0, 8);
+    }
+  }
+  return out;
+}
+
+/** The original single-planner flow, kept intact: plan once, verify house-style
+ *  coverage, one corrective retry when short, accept-with-warning otherwise. */
+async function runPlannerPath(
+  planner: Planner, datasets: Dataset[], userPrompt: string,
+  enhancement: Enhancement, currentSpec?: DashboardSpec,
+  chatContext?: string | null, selectedWidget?: { id?: string; title?: string },
+): Promise<DashboardSpec | null> {
   const planOnce = (extra?: string) => planner({
     datasets,
-    userPrompt: extra ? `${b.userPrompt}\n\n${extra}` : b.userPrompt,
+    userPrompt: extra ? `${userPrompt}\n\n${extra}` : userPrompt,
     currentSpec,
-    ...(styleHints ? { styleHints } : {}),
-    ...(directive ? { directive } : {}),
+    ...(enhancement.styleHints ? { styleHints: enhancement.styleHints } : {}),
+    ...(chatContext ? { chatContext } : {}),
+    ...(selectedWidget ? { selectedWidget } : {}),
+    directive: enhancement.combined,   // the enhancement layer's guarantee: never absent
   });
 
   let spec = await planOnce();
-  if (!spec) return { status: 502, body: { error: "planner could not produce a dashboard spec" } };
+  if (!spec) return null;
 
-  // HOUSE-STYLE ENFORCEMENT (deterministic — the model is instructed, but the
-  // guarantee lives here): >=4 charts and >=3 KPIs on builds, one corrective
-  // retry when short, then accept with a warning rather than block.
   const shortfalls = coverageShortfalls(spec, datasets);
   if (shortfalls.length && !currentSpec) {
     console.log(`[dashboard] coverage shortfall -> re-plan: ${shortfalls.join("; ")}`);
@@ -72,40 +426,7 @@ export async function handleDashboardBuild(
       }
     }
   }
-  // Vibrancy guarantee: never ship on drab defaults.
-  if (!spec.meta.chartPalette?.length) spec.meta.chartPalette = ["#7c3aed", "#06b6d4", "#f59e0b", "#10b981", "#f43f5e", "#3b82f6"];
-  if (!spec.meta.accent || !HEX_RE.test(spec.meta.accent)) spec.meta.accent = spec.meta.chartPalette[0];
-
-  const plan = compileSpec(spec, datasets);
-  if (!plan.sections.length) {
-    return { status: 422, body: { error: "no valid widgets after validation", warnings: plan.warnings } };
-  }
-
-  const app = renderPlanToApp(plan);
-  // al5: return the VALIDATED spec — the one that actually rendered. Returning
-  // the raw planner spec meant the summary counted widgets validation had
-  // dropped ("5 widgets" for a 4-widget board) and the client persisted ghost
-  // widgets as currentSpec, so the next edit turn reasoned about things that
-  // were not on screen.
-  const rendered = plan.spec;
-  const dropped = allWidgets(spec).length - allWidgets(rendered).length;
-  if (dropped > 0) console.log(`[dashboard] validation dropped ${dropped} widget(s): ${plan.warnings.join(" | ")}`);
-  return { status: 200, body: { app, spec: rendered, warnings: plan.warnings, summary: summarizeSpecChange(currentSpec, rendered) } };
-}
-
-/** The brief's ANALYTICAL half (kpis + charts) as a directive for the spec
- *  planner — first builds get the orchestrator's content plan for free, no
- *  extra model call. */
-export function briefToAnalyticalDirective(brief: any): string | null {
-  if (!brief || typeof brief !== "object") return null;
-  const bits: string[] = [];
-  if (Array.isArray(brief.kpis) && brief.kpis.length) bits.push(`Headline KPI cards: ${brief.kpis.join("; ")}.`);
-  if (Array.isArray(brief.charts) && brief.charts.length) {
-    const cs = brief.charts.map((c: any) => `${c?.type ?? "chart"} of ${c?.y ?? "?"} by ${c?.x ?? "?"}${c?.why ? ` — ${c.why}` : ""}`).join("; ");
-    bits.push(`Charts: ${cs}.`);
-  }
-  if (typeof brief.enhancedPrompt === "string" && brief.enhancedPrompt.trim()) bits.push(brief.enhancedPrompt.trim());
-  return bits.length ? bits.join(" ") : null;
+  return spec;
 }
 
 /** House-style coverage check: what a build is missing vs the minimums
@@ -122,6 +443,10 @@ function chartCount(spec: DashboardSpec): number {
   return allWidgets(spec).filter((w: any) => CHART_KINDS.has(w.kind)).length;
 }
 
+function countWidgets(spec: DashboardSpec): number {
+  return allWidgets(spec).length;
+}
+
 export function coverageShortfalls(spec: DashboardSpec, datasets: Dataset[]): string[] {
   const widgets = allWidgets(spec);
   const charts = widgets.filter((w: any) => CHART_KINDS.has(w.kind));
@@ -136,22 +461,6 @@ export function coverageShortfalls(spec: DashboardSpec, datasets: Dataset[]): st
   if (charts.length >= wantCharts && types.size < wantTypes) out.push(`only ${types.size} chart type(s), use at least ${wantTypes} different types (bar/line/area/pie)`);
   if (kpis.length < wantKpis) out.push(`only ${kpis.length} KPI card(s), need at least ${wantKpis}`);
   return out;
-}
-
-/** Flatten an orchestrator brief into a one-line visual directive. Tolerant of
- *  partial/absent briefs — returns null when there is nothing useful. */
-export function briefToStyleHints(brief: any): string | null {
-  if (!brief || typeof brief !== "object") return null;
-  const bits: string[] = [];
-  const p = brief.palette;
-  if (p && typeof p === "object") {
-    if (p.primary) bits.push(`primary ${p.primary}`);
-    if (p.accent) bits.push(`accent ${p.accent}`);
-    if (Array.isArray(p.neutrals) && p.neutrals.length) bits.push(`neutrals ${p.neutrals.join(" ")}`);
-    if (p.vibe) bits.push(`vibe: ${p.vibe}`);
-  }
-  if (typeof brief.designDirection === "string" && brief.designDirection.trim()) bits.push(brief.designDirection.trim());
-  return bits.length ? bits.join(" · ") : null;
 }
 
 const allWidgets = (s: DashboardSpec) => s.sections.flatMap((sec) => sec.widgets ?? []);

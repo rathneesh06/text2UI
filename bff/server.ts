@@ -4,24 +4,28 @@
 // IMPORTANT: `import "dotenv/config"` must be FIRST so process.env is populated
 // before aiflow.ts reads it at module load.
 import "dotenv/config";
+import { audit } from "./datasources/audit";
 import express from "express";
 import cors from "cors";
 import { assemble, assembleSummary, assemblePlan } from "./assembler";
 import { scoreDomain, classifyDomain, buildEnrichment } from "./domain";
 import { runWithMetrics, setPhase } from "./metrics";
-import { callGemini, generateApp, generateAppStream, planApp, BUILD_OPTS, EDIT_OPTS, type GenOptions } from "./aiflow";
+import { callGemini, checkModelHealth, generateApp, generateAppStream, planApp, BUILD_OPTS, EDIT_OPTS, type GenOptions } from "./aiflow";
 import { compileCss } from "./tailwind";
 import { DuckDBStorage } from "./storage/duckdb";
 import { PostgresStorage } from "./storage/postgres";
 import { PROJECT_ID_RE, TABLE_NAME_RE, type StorageEngine, type TenantStorageEngine, type DatasetUpload } from "./storage/types";
-import type { AssembleInput, DataProfile, Dataset, GeneratedApp } from "../shared/types";
+import type { AssembleInput, DataProfile, Dataset, GeneratedApp, OrchestratorBrief } from "../shared/types";
 import { convertToMarkdown, isDocumentFile } from "./markitdown";
 import { buildExportZip, buildConnectedZip } from "./export";
 import { generateReport } from "./report";
 import { COLO_PROJECT_ID, COLO_LABEL, coloAvailable, coloProfiles, coloQuery } from "./sources/colo";
 import { isWorkbenchProject, listWorkbenchSources, wbQuery, removeWorkbenchSource } from "./sources/workbench-store";
-import { handleSqlConnect, handleSqlSchema, handleSqlChat, handleSqlExtract, handleSqlExtractDb, handleSqlStageGet, handleSqlStageDiscard, handleSourceChat, handleCombineSources, liveQuery, LIVE_PREFIX } from "./text2sql/handler";
+import { handleSqlConnect, handleSqlSchema, handleSqlStageDiscard, handleSourceChat, handleCombineSources, handleRemoveMember, liveQuery, LIVE_PREFIX } from "./text2sql/handler";
+import { handleSelectionChat, handleSelectionGet, handleSelectionSet, handleSelectionCommit, handleTableProfile, handleCatalog, describeError, chatStoreDegraded } from "./text2sql/selection-handler";
+import { selectionStoreDegraded } from "./sources/selection-store";
 import { handleDashboardBuild } from "./dashboard/handler";
+import { buildWidgetSql } from "./dashboard/filters";
 import { handleDeckBuild, handleDeckEdit } from "./deck/handler";
 import { loadRows } from "./deck/local-data";
 import { parseDocument } from "./deck/doc-parse";
@@ -36,6 +40,9 @@ import { enrollGeneration } from "./design-rag/enroll";
 import { generateDeck } from "./slides";
 import { orchestrate, composePrompt, gateTurn, ORCHESTRATOR_ENABLED } from "./orchestrator";
 import { getChatStore, type ChatStore } from "./chat-store";
+import { mountTools } from "./tools";
+import { compileSpec } from "./dashboard/compile";
+import { renderPlanToApp } from "./dashboard/renderer";
 import type { OrchestratorResult, ChatMessage } from "../shared/types";
 import { parseAllowedOrigins, corsOptions, securityHeaders, validateConfig, applyConfigCheck } from "./security";
 import { parseAuthTokens, authMiddleware, DEV_TENANT } from "./auth";
@@ -49,6 +56,14 @@ const STORAGE_PATH = process.env.STORAGE_PATH ?? "bff/data/text2ui.duckdb";
 const QUERY_ROW_CAP = Number(process.env.QUERY_ROW_CAP ?? 10_000);
 const QUERY_ROW_CAP_MAX = Number(process.env.QUERY_ROW_CAP_MAX ?? 200_000); // ceiling for explicit rowCap requests (project restore)
 const QUERY_TIMEOUT_MS = Number(process.env.QUERY_TIMEOUT_MS ?? 15_000);
+// Captured ONCE at module load, not per request: /health reports this so a
+// restart is provable. On Windows `tsx watch` + Ctrl-C often orphans the child
+// node process, which keeps holding :8787 — the "new" instance never binds and
+// you carry on talking to the old one. Identical pid/bootedAt across a supposed
+// restart means the process never actually restarted.
+const BOOTED_AT = new Date().toISOString();
+// Cached result of the startup Gemini key check (see the isDirectRun block).
+let modelHealth: { ok: boolean; detail: string; checkedAt: number } | null = null;
 let _rawStorage: StorageEngine | null = null;
 let _storage: TenantStorageEngine | null = null;
 function getRawStorage(): StorageEngine {
@@ -311,17 +326,20 @@ export async function handleChat(body: unknown, deps: ChatDeps = {}): Promise<{ 
     await persistAssistant(result.question);
     return { status: 200, body: { conversationId, needsClarification: true, question: result.question } };
   }
-  if (result && "respond" in result) {
+  if (result && "respond" in result && result.respond === true) {
     await persistAssistant(result.reply);
     return { status: 200, body: { conversationId, respond: true, reply: result.reply, dataQuestion: !!result.dataQuestion } };
   }
   if (!result) { const r = await generate(b); await persistAssistant("Built dashboard"); return withConv(r); }
 
-  const rewritten = { ...b, userPrompt: composePrompt(result) };
-  const dispatch = result.outputMode === "pdf" ? report : result.outputMode === "ppt" ? ppt : generate;
+  // Clarification and respond turns returned above; orchestrate() strips stray
+  // discriminator keys from briefs, so what remains is a build brief.
+  const brief = result as OrchestratorBrief;
+  const rewritten = { ...b, userPrompt: composePrompt(brief) };
+  const dispatch = brief.outputMode === "pdf" ? report : brief.outputMode === "ppt" ? ppt : generate;
   const res = await dispatch(rewritten);
-  if (res.status === 200 && res.body && typeof res.body === "object") res.body = { ...res.body, brief: result, conversationId };
-  await persistAssistant(result.title ?? `Built ${result.outputMode}`, result);
+  if (res.status === 200 && res.body && typeof res.body === "object") res.body = { ...res.body, brief, conversationId };
+  await persistAssistant(brief.title ?? `Built ${brief.outputMode}`, brief);
   return res;
 }
 
@@ -352,7 +370,7 @@ export async function handleOrchestrate(body: unknown, deps: OrchestrateDeps = {
     if (conversationId) history = await store.getHistory(conversationId);
     else conversationId = await store.createConversation(b.userPrompt.slice(0, 80));
     await store.appendMessage(conversationId, { role: "user", content: b.userPrompt });
-  } catch (e) { console.warn(`[orchestrate] memory unavailable: ${(e as Error).message}`); }
+  } catch (e: any) { console.warn(`[orchestrate] memory unavailable: ${e?.name ?? typeof e}: ${e?.message || String(e)}${e?.code ? ` (code ${e.code})` : ""}`); }
 
   const persist = async (content: string, brief?: any) => {
     try { await store.appendMessage(conversationId, { role: "assistant", content, briefJson: brief ? JSON.stringify(brief) : null, outputMode: brief?.outputMode ?? null }); } catch { /* best-effort */ }
@@ -370,16 +388,19 @@ export async function handleOrchestrate(body: unknown, deps: OrchestrateDeps = {
     await persist(result.question);
     return { status: 200, body: { conversationId, needsClarification: true, question: result.question } };
   }
-  if (result && "respond" in result) {
+  if (result && "respond" in result && result.respond === true) {
     console.log(`[orchestrate] -> respond (dataQuestion=${!!result.dataQuestion})`);
     await persist(result.reply);
     return { status: 200, body: { conversationId, respond: true, reply: result.reply, dataQuestion: !!result.dataQuestion } };
   }
   if (!result) { console.log("[orchestrate] planner returned null -> raw dashboard plan"); return rawPlan; }
 
-  console.log(`[orchestrate] -> mode=${result.outputMode} title="${result.title}"`);
-  await persist(result.title ?? `Plan: ${result.outputMode}`, result);
-  return { status: 200, body: { conversationId, brief: result, outputMode: result.outputMode, enhancedPrompt: composePrompt(result) } };
+  // Clarification and respond turns returned above; orchestrate() strips stray
+  // discriminator keys from briefs, so what remains is a build brief.
+  const brief = result as OrchestratorBrief;
+  console.log(`[orchestrate] -> mode=${brief.outputMode} title="${brief.title}"`);
+  await persist(brief.title ?? `Plan: ${brief.outputMode}`, brief);
+  return { status: 200, body: { conversationId, brief, outputMode: brief.outputMode, enhancedPrompt: composePrompt(brief) } };
 }
 
 /** Pure handler for POST /api/datasets — storage is injectable for tests. */
@@ -535,6 +556,36 @@ export async function handleQuery(
 }
 
 
+/** Pure handler for POST /api/dashboard/query — the A1 filtered-widget path.
+ *  The sandbox sends a typed widget + filter VALUES (never SQL). The widget is
+ *  rebuilt by whitelist (sanitizeWidget), the values become escaped WHERE
+ *  conditions (filterConditions), and the SAME deterministic compiler produces
+ *  the SQL, which then rides handleQuery's routing (guards, caps, timeouts). */
+export async function handleDashboardQuery(
+  body: unknown,
+  tenantId: string,
+  storage: TenantStorageEngine = getStorage(),
+): Promise<{ status: number; body: any }> {
+  const b = body as any;
+  if (!b || typeof b !== "object") return { status: 400, body: { error: "body must be a JSON object" } };
+  const { projectId, widget, filters } = b;
+  if (typeof projectId !== "string" || !PROJECT_ID_RE.test(projectId)) {
+    return { status: 400, body: { error: "projectId must match " + PROJECT_ID_RE.source } };
+  }
+  let sql: string;
+  try {
+    sql = buildWidgetSql(widget, filters);
+  } catch (err: any) {
+    // D6: filter-time rejections were invisible in the audit trail — a widget
+    // that renders on build but 400s on filter is exactly the class the trail
+    // exists to catch.
+    audit({ turnId: "", conversationId: String(projectId), stage: "reject", detail: { where: "dashboard/query", error: String(err?.message ?? "invalid widget or filters"), widgetKind: (widget as any)?.kind, table: (widget as any)?.table } });
+    return { status: 400, body: { error: err?.message ?? "invalid widget or filters" } };
+  }
+  audit({ turnId: "", conversationId: String(projectId), stage: "query", detail: { where: "dashboard/query", table: (widget as any)?.table, kind: (widget as any)?.kind, filters: Array.isArray(filters) ? filters.length : 0 } });
+  return handleQuery({ projectId, sql }, tenantId, storage);
+}
+
 /** Pure handler for POST /api/summary — Feature Inspector summaries. */
 export async function handleSummary(
   body: unknown,
@@ -674,6 +725,11 @@ export function createServer() {
   app.use(cors(corsOptions(parseAllowedOrigins(process.env.ALLOWED_ORIGINS))));
   app.use(securityHeaders());
   app.use(express.json({ limit: process.env.BODY_LIMIT ?? "64mb" })); // dataset rows travel once at upload
+  // Migration façade (goal 6): the pipeline as composite tools + OpenAPI for
+  // platform import. Correctness stays inside; the flow carries state.
+  mountTools(app,
+    { listUploadDatasets: (t, p) => getStorage().listDatasets(t, p) },
+    (req) => (req as any).tenantId ?? DEV_TENANT);
 
   // P8: bearer-token-per-tenant auth on the API surface (/health stays open for liveness).
   app.use("/api", authMiddleware(parseAuthTokens(process.env.AUTH_TOKENS)));
@@ -685,7 +741,25 @@ export function createServer() {
     next();
   });
 
-  app.get("/health", (_req, res) => res.json({ ok: true }));
+  app.get("/health", async (req, res) => {
+    // ?model=1: re-verify the Gemini key LIVE (one tiny call). Otherwise return
+    // the cached startup result so liveness probes stay free.
+    if (req.query.model === "1") modelHealth = { ...(await checkModelHealth()), checkedAt: Date.now() };
+    res.json({
+      ok: true,
+      model: modelHealth ?? { ok: null, detail: "not checked yet — GET /health?model=1" },
+      // Restart evidence — see BOOTED_AT.
+      pid: process.pid,
+      bootedAt: BOOTED_AT,
+      uptimeSec: Math.round(process.uptime()),
+      // Which backend is LIVE, not which one was configured: a store that fell
+      // back still reports STORAGE=postgres, so `degraded` is the honest bit.
+      storage: {
+        engine: process.env.STORAGE ?? "duckdb",
+        degraded: selectionStoreDegraded() || chatStoreDegraded(),
+      },
+    });
+  });
 
   app.post("/api/generate", async (req, res) => {
     const tenant = req.tenantId ?? DEV_TENANT;
@@ -831,11 +905,80 @@ export function createServer() {
     res.status(status).json(body);
   });
 
+  // A1: filtered widget queries — the client sends a typed widget + filter
+  // values; the server rebuilds the SQL (never trusts client SQL for filters).
+  app.post("/api/dashboard/query", async (req, res) => {
+    const { status, body } = await handleDashboardQuery(req.body, req.tenantId ?? DEV_TENANT);
+    res.status(status).json(body);
+  });
+
   // Spec-driven dashboard build (planner → validate/compile → deterministic render).
   // Returns { app, spec, warnings }; the client persists `spec` and sends it back as
   // currentSpec next turn so each prompt edits the same dashboard.
+  // CONVERSATION JOIN: when a conversationId rides along, the route (1) hands the
+  // handler the recent chat history so the edit planner can resolve references, and
+  // (2) writes BOTH sides of the turn into conversation memory — the user's ask
+  // (deduped: /api/gate and /api/orchestrate may have appended it already) and the
+  // assistant's change summary, which previously never entered memory at all.
+  // DURABLE PROJECTS: reopen a project — the saved chat + the last dashboard,
+  // recompiled DETERMINISTICALLY from the stored spec + stored profiles (no
+  // model call, no live data needed to RENDER; reconnect refreshes numbers).
+  app.get("/api/project/:projectId/state", async (req, res) => {
+    try {
+      const pid = String(req.params.projectId ?? "");
+      const state = await getChatStore().getProjectState(pid);
+      if (!state?.spec) { res.status(404).json({ error: "no saved state for this project" }); return; }
+      let app_: unknown = null;
+      try {
+        if (Array.isArray(state.datasets) && (state.datasets as any[]).length) {
+          app_ = renderPlanToApp(compileSpec(state.spec as any, state.datasets as any));
+        }
+      } catch (err: any) { console.warn(`[durable] recompile failed for ${pid}: ${err?.message ?? err}`); }
+      const chat = state.conversationId ? await getChatStore().getHistory(state.conversationId, 50).catch(() => []) : [];
+      res.json({ spec: state.spec, app: app_, conversationId: state.conversationId, chat, savedAt: state.savedAt });
+    } catch (err: any) { res.status(500).json({ error: err?.message ?? "state load failed" }); }
+  });
+
   app.post("/api/dashboard/build", async (req, res) => {
-    const { status, body } = await handleDashboardBuild(req.body);
+    const convId = typeof (req.body as any)?.conversationId === "string" ? (req.body as any).conversationId : "";
+    const store = getChatStore();
+    let history: any[] = [];
+    if (convId) {
+      try { history = await store.getHistory(convId, 20); } catch { /* memory best-effort */ }
+    }
+    const buildBody = { ...(req.body as any), history };
+    // OPEN-GRAMMAR: hand the build a guarded query handle (rides handleQuery's
+    // read-only/caps/timeout routing) so proposed joins can be proven on demand.
+    const pid = typeof (buildBody as any).projectId === "string" ? (buildBody as any).projectId : "";
+    const readAll = pid && PROJECT_ID_RE.test(pid)
+      ? async (sql: string) => {
+          const r = await handleQuery({ projectId: pid, sql }, req.tenantId ?? DEV_TENANT);
+          if (r.status !== 200 || !Array.isArray((r.body as any)?.rows)) throw new Error((r.body as any)?.error ?? "query failed");
+          return (r.body as any).rows as Record<string, unknown>[];
+        }
+      : undefined;
+    const { status, body } = await handleDashboardBuild(buildBody, { readAll });
+    // DURABLE PROJECTS: persist the validated spec + the profiles it was
+    // validated against + the chat link, keyed by projectId. Best-effort —
+    // persistence can slow nothing and break nothing.
+    if (status === 200 && (body as any)?.spec && pid) {
+      try {
+        await getChatStore().saveProjectState(pid, {
+          spec: (body as any).spec,
+          datasets: (buildBody as any).datasets ?? undefined,
+          conversationId: typeof (buildBody as any).conversationId === "string" ? (buildBody as any).conversationId : null,
+        });
+      } catch (err: any) { console.warn(`[durable] state save failed for ${pid}: ${err?.message ?? err}`); }
+    }
+    if (status === 200 && convId) {
+      try {
+        const prompt = String((req.body as any).userPrompt ?? "");
+        const lastUser = [...history].reverse().find((m) => m?.role === "user");
+        if (prompt && lastUser?.content !== prompt) await store.appendMessage(convId, { role: "user", content: prompt });
+        const summary = Array.isArray(body.summary) ? body.summary.join(" ") : "";
+        if (summary) await store.appendMessage(convId, { role: "assistant", content: summary });
+      } catch { /* memory best-effort */ }
+    }
     res.status(status).json(body);
   });
 
@@ -949,20 +1092,47 @@ export function createServer() {
     const { status, body } = await handleSqlConnect(req.body, req.tenantId ?? DEV_TENANT);
     res.status(status).json(body);
   });
+
+  // Close a database tab. Literal-ish segments ("members", "remove") make this
+  // more specific than /api/sql/:connectionId/profile, but it is registered ahead
+  // of every parameterised /api/sql/:connectionId/... route regardless.
+  app.post("/api/sql/:connectionId/members/:memberId/remove", async (req, res) => {
+    const { status, body } = await handleRemoveMember(
+      String(req.params.connectionId), String(req.params.memberId), req.body, req.tenantId ?? DEV_TENANT,
+    );
+    res.status(status).json(body);
+  });
+
   app.get("/api/sql/:connectionId/schema", (req, res) => {
     const { status, body } = handleSqlSchema(String(req.params.connectionId), req.tenantId ?? DEV_TENANT);
     res.status(status).json(body);
   });
-  app.post("/api/sql/chat", async (req, res) => {
-    const { status, body } = await handleSqlChat(req.body, req.tenantId ?? DEV_TENANT);
+  // ---- Table selection: pick the tables that matter BEFORE building the UI ----
+  // A large database makes text2SQL guess. This page narrows the catalog by
+  // clicking OR by chatting; every route below reads and writes the ONE
+  // selection stored against the conversation.
+  app.post("/api/sql/select", async (req, res) => {
+    const { status, body } = await handleSelectionChat(req.body, req.tenantId ?? DEV_TENANT);
     res.status(status).json(body);
   });
-  app.post("/api/sql/extract", async (req, res) => {
-    const { status, body } = await handleSqlExtract(req.body, req.tenantId ?? DEV_TENANT);
+  app.get("/api/sql/selection/:conversationId", async (req, res) => {
+    const { status, body } = await handleSelectionGet(String(req.params.conversationId), req.tenantId ?? DEV_TENANT);
     res.status(status).json(body);
   });
-  app.post("/api/sql/extract-db", async (req, res) => {
-    const { status, body } = await handleSqlExtractDb(req.body, req.tenantId ?? DEV_TENANT);
+  app.post("/api/sql/selection", async (req, res) => {
+    const { status, body } = await handleSelectionSet(req.body, req.tenantId ?? DEV_TENANT);
+    res.status(status).json(body);
+  });
+  app.post("/api/sql/selection/commit", async (req, res) => {
+    const { status, body } = await handleSelectionCommit(req.body, req.tenantId ?? DEV_TENANT);
+    res.status(status).json(body);
+  });
+  app.get("/api/sql/:connectionId/catalog", (req, res) => {
+    const { status, body } = handleCatalog(String(req.params.connectionId), req.tenantId ?? DEV_TENANT);
+    res.status(status).json(body);
+  });
+  app.post("/api/sql/:connectionId/profile", async (req, res) => {
+    const { status, body } = await handleTableProfile(String(req.params.connectionId), req.body, req.tenantId ?? DEV_TENANT);
     res.status(status).json(body);
   });
   // Follow-up gate: once an artifact exists, classify each turn (edit vs answer)
@@ -997,10 +1167,7 @@ export function createServer() {
     res.status(status).json(body);
   });
 
-  app.get("/api/sql/stage/:conversationId", (req, res) => {
-    const { status, body } = handleSqlStageGet(String(req.params.conversationId), req.tenantId ?? DEV_TENANT);
-    res.status(status).json(body);
-  });
+  // App.tsx calls this on boot to clean up stages orphaned by a reload.
   app.delete("/api/sql/stage/:conversationId", (req, res) => {
     const { status, body } = handleSqlStageDiscard(String(req.params.conversationId), req.tenantId ?? DEV_TENANT);
     res.status(status).json(body);
@@ -1065,6 +1232,21 @@ export function createServer() {
     }
   });
 
+  // ---- last resort: anything that throws past a route handler ---------------------
+  // Without this, Express's default handler replies with an HTML body. The client
+  // can't parse it, so the user gets "Request failed (HTTP 500)" and the server
+  // log says nothing — which is what made the selection-page ECONNREFUSED take
+  // three rounds to find. Must be registered AFTER the routes, and must keep all
+  // four parameters or Express treats it as ordinary middleware.
+  app.use((err: any, _req: express.Request, res: express.Response, _next: express.NextFunction) => {
+    const detail = describeError(err);
+    console.error("[bff] UNHANDLED:", err?.stack ?? err);
+    if (res.headersSent) return;
+    res.status(err?.status ?? err?.statusCode ?? 500).json({
+      error: detail || "the server hit an unexpected error — check the BFF log for the stack",
+    });
+  });
+
   return app;
 }
 
@@ -1077,5 +1259,23 @@ if (isDirectRun) {
   const port = Number(process.env.PORT ?? 8787);
   applyConfigCheck(validateConfig());
   console.log(`[bff] flags: ORCHESTRATOR_ENABLED=${process.env.ORCHESTRATOR_ENABLED ?? "0"} DESIGN_RAG_ENABLED=${process.env.DESIGN_RAG_ENABLED ?? "0"} STORAGE=${process.env.STORAGE ?? "duckdb"}`);
+  // Model-key preflight: an invalid GEMINI_API_KEY is otherwise nearly
+  // invisible (builds still render via deterministic fallbacks; only edits
+  // hard-fail with a 502). Say it ONCE, loudly, at startup.
+  void checkModelHealth().then((h) => {
+    modelHealth = { ...h, checkedAt: Date.now() };
+    if (h.ok) { console.log("[bff] model check: GEMINI key OK — agents/edits/ratio-KPIs fully enabled"); return; }
+    console.warn("");
+    console.warn("############################################################");
+    console.warn("[bff] MODEL CHECK FAILED — running in DEGRADED mode");
+    console.warn(`[bff]   reason: ${h.detail}`);
+    console.warn("[bff]   builds : deterministic fallback widgets only (no model-chosen");
+    console.warn("[bff]            metrics, no derived ratio/pct KPIs from prompts)");
+    console.warn("[bff]   edits  : patch ops AND full-spec planner will fail -> 502");
+    console.warn("[bff]   fix    : set a valid GEMINI_API_KEY in .env, restart, then");
+    console.warn("[bff]            verify with GET /health?model=1");
+    console.warn("############################################################");
+    console.warn("");
+  });
   createServer().listen(port, () => console.log(`BFF listening on http://localhost:${port}`));
 }

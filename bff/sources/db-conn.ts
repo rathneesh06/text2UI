@@ -19,6 +19,9 @@ import {
 } from "./mysql";
 export type { AttachHandle } from "./mysql"; // engine-agnostic façade re-export (tests + callers)
 import type { ColumnProfile, Dataset } from "../../shared/types";
+import { enrichColumns } from "../../shared/profile-enrich";
+import { exactColumnStats } from "./exact-stats";
+import { attachMeasuredForeignKeys, postgresConstraintEdges, attachConstraintEdges } from "./relationships";
 
 export type Dialect = "mysql" | "postgres";
 
@@ -43,7 +46,11 @@ export interface DbIntrospectResult {
 const PG_SCHEME_RE = /^postgres(?:ql)?(?:\+[a-z0-9]+)?:\/\//i;
 const HIDDEN_PG_SCHEMAS = new Set(["information_schema", "pg_catalog", "pg_toast"]);
 
-export const refFor = (schema: string, table: string) => `src.${qid(schema)}.${qid(table)}`;
+/** `catalog` defaults to "src" (a single attachDb). A GROUP attaches its members
+ *  as src0, src1, … so the catalog must be named explicitly for those. */
+// Catalog stays UNQUOTED: it is always src / src0 / src1 (never user-supplied),
+// and quoting it changes the emitted ref that db-conn's tests pin.
+export const refFor = (schema: string, table: string, catalog = "src") => `${catalog}.${qid(schema)}.${qid(table)}`;
 
 /** Which engine a connection string is for. Explicit only: a postgres:// or
  *  postgresql:// scheme, or dialect=/driver=postgres in key=value form.
@@ -221,7 +228,10 @@ export async function attachGroup(members: DbConn[], opts: AttachOptions = {}): 
   const attachMs = opts.attachTimeoutMs ?? 25_000;
   const queryMs = opts.queryTimeoutMs ?? 30_000;
   const { DuckDBInstance } = await import("@duckdb/node-api");
-  const instance = await DuckDBInstance.create(":memory:");
+  // A group snapshot needs to land in a FILE, not memory: stageSnapshot passes
+  // the staging path so the extracted tables survive the handle being closed.
+  // Default is unchanged, so existing in-memory callers are unaffected.
+  const instance = await DuckDBInstance.create(opts.dbPath ?? ":memory:");
   const c = await instance.connect();
   const readAll = async (sql: string, label: string) => {
     const reader = await withTimeout(c.runAndReadUntil(sql, 1_000_000), queryMs, label);
@@ -359,7 +369,7 @@ async function introspectPostgres(conn: DbConn, opts: IntrospectOptions = {}): P
         warnings.push(`sample failed for ${t.name}: ${(e as Error).message}`);
       }
       const cols = colsByTable.get(key(t.schema, t.table)) ?? [];
-      const columns: ColumnProfile[] = cols.map(({ col, type }) => {
+      let columns: ColumnProfile[] = cols.map(({ col, type }) => {
         const values = sample.map((r) => r[col]).filter((v) => v !== null && v !== undefined);
         return {
           name: col,
@@ -369,6 +379,8 @@ async function introspectPostgres(conn: DbConn, opts: IntrospectOptions = {}): P
           sampleValues: values.slice(0, 5),
         };
       });
+      columns = enrichColumns(columns, sample);
+      try { columns = await exactColumnStats((q, l) => readAll(q, l ?? "stats"), t.ref, columns); } catch { /* sample floor stands */ }
       datasets.push({
         tableName: t.name,
         profile: {
@@ -380,6 +392,21 @@ async function introspectPostgres(conn: DbConn, opts: IntrospectOptions = {}): P
       });
     }
 
+    // A3: verified relationship edges. Constraints from the PG catalog first;
+    // then measure any remaining name-heuristic candidates against the
+    // attached data. Both run through the same DuckDB-side readAll.
+    try {
+      const schemas = [...new Set(toProfile.map((t) => t.schema))];
+      const nameBySource = new Map(toProfile.map((t) => [t.table, t.name] as [string, string]));
+      for (const sc of schemas) {
+        const edges = await postgresConstraintEdges(
+          (q, l) => readAll(`SELECT * FROM postgres_query('src', ${qstr(q)})`, l ?? "fk"), sc);
+        attachConstraintEdges(datasets, edges, (t) => nameBySource.get(t) ?? t);
+      }
+      await attachMeasuredForeignKeys((q, l) => readAll(q, l ?? "fk"), datasets, {
+        tableRef: (n) => toProfile.find((x) => x.name === n)?.ref ?? `"${n.replace(/"/g, '""')}"`,
+      });
+    } catch { /* no edges */ }
     return { datasets, allTables, warnings };
   } finally {
     h.close();
@@ -395,11 +422,28 @@ export interface WbSnapshotOptions {
   sampleRows?: number;
   onPhase?: (msg: string) => void;
   snapshotTimeoutMs?: number;
+  /** Which attached catalogs hold the source tables. A single attachDb exposes
+   *  one catalog called "src"; a GROUP exposes src0, src1, … Default keeps the
+   *  single-connection behaviour exactly as it was. */
+  catalogs?: string[];
 }
+
+/** Which attached database a staged table actually came from. Recorded at
+ *  snapshot time because it is not recoverable afterwards: the merged catalog
+ *  adds collision suffixes (users, users_2), so re-deriving origin from the
+ *  local name later is guesswork. Stage 4's join graph depends on this.
+ *
+ *  `catalog` is the ATTACH-TIME name (src0, src1, …) and is positional, so it is
+ *  only meaningful for the attach that produced it. `memberId` is the stable
+ *  GroupPart id and is the durable key — anything stored or compared later must
+ *  use that, or removing a member silently re-points this origin at a different
+ *  database. Absent for single (non-group) connections, which have no members. */
+export interface DatasetOrigin { catalog: string; schema: string; table: string; memberId?: string }
+export type StagedDataset = Dataset & { origin: DatasetOrigin };
 
 export interface WbSnapshotResult {
   dbPath: string;
-  datasets: Dataset[];
+  datasets: StagedDataset[];
   warnings: string[];
   skipped: string[];
 }
@@ -437,21 +481,40 @@ export async function snapshotFromHandle(
   const skipped: string[] = [];
   const { readAll, run } = h;
 
-  // Resolve the requested names against what actually exists in `src`.
+  // Resolve the requested names against what actually exists. A single attach
+  // exposes one catalog ("src"); a group exposes src0, src1, … — querying only
+  // 'src' against a group matched NOTHING and silently skipped every table.
+  const catalogs = opts.catalogs?.length ? opts.catalogs : ["src"];
+  const inList = catalogs.map((c) => `'${c.replace(/'/g, "''")}'`).join(", ");
   const catalog = (await readAll(
-    `SELECT schema_name AS schema, table_name AS name FROM duckdb_tables() WHERE database_name = 'src'`,
+    `SELECT database_name AS db, schema_name AS schema, table_name AS name
+       FROM duckdb_tables() WHERE database_name IN (${inList})`,
     "list tables",
-  )).map((r) => ({ schema: String(r.schema), table: String(r.name) }))
+  )).map((r) => ({ db: String(r.db), schema: String(r.schema), table: String(r.name) }))
     .filter((t) => !HIDDEN_PG_SCHEMAS.has(t.schema));
 
+  /** Most-specific first: db:schema.table, then schema.table, then bare table. */
   const resolve = (want: string) => {
     const w = want.trim().toLowerCase();
-    return catalog.find((t) => t.table.toLowerCase() === w)
-      ?? catalog.find((t) => `${t.schema}.${t.table}`.toLowerCase() === w)
-      ?? null;
+    const exact = catalog.find((t) => `${t.db}:${t.schema}.${t.table}`.toLowerCase() === w);
+    if (exact) return exact;
+    const qualified = catalog.filter((t) => `${t.schema}.${t.table}`.toLowerCase() === w);
+    if (qualified.length) {
+      if (qualified.length > 1) {
+        warnings.push(`${want}: ambiguous across ${qualified.map((t) => t.db).join(" and ")} — used ${qualified[0].db}`);
+      }
+      return qualified[0];
+    }
+    const bare = catalog.filter((t) => t.table.toLowerCase() === w);
+    if (!bare.length) return null;
+    // Never silently pick one: name both databases so the user can disambiguate.
+    if (bare.length > 1) {
+      warnings.push(`${want}: exists in ${bare.map((t) => t.db).join(" and ")} — used ${bare[0].db}; qualify as db:schema.table to choose`);
+    }
+    return bare[0];
   };
 
-  const datasets: Dataset[] = [];
+  const datasets: StagedDataset[] = [];
   const used = new Set<string>();
   for (const want of opts.tables) {
     const hit = resolve(want);
@@ -463,7 +526,7 @@ export async function snapshotFromHandle(
     log(`snapshotting ${hit.schema}.${hit.table} — entire table…`);
     const dest = `${qid("main")}.${qid(local)}`;
     try {
-      await run(`CREATE OR REPLACE TABLE ${dest} AS SELECT * FROM ${refFor(hit.schema, hit.table)} LIMIT ${rowCap}`, snapMs, `snapshot ${want}`);
+      await run(`CREATE OR REPLACE TABLE ${dest} AS SELECT * FROM ${refFor(hit.schema, hit.table, hit.db)} LIMIT ${rowCap}`, snapMs, `snapshot ${want}`);
     } catch (e) {
       skipped.push(`${want}: ${(e as Error).message}`);
       continue;
@@ -473,7 +536,7 @@ export async function snapshotFromHandle(
     if (rowCount >= rowCap) warnings.push(`${want}: hit ${rowCap.toLocaleString()} row cap`);
     const sample = await readAll(`SELECT * FROM ${dest} LIMIT ${sampleN}`, `sample ${want}`);
     const described = await readAll(`DESCRIBE ${dest}`, `describe ${want}`);
-    const columns: ColumnProfile[] = described.map((d) => {
+    let columns: ColumnProfile[] = described.map((d) => {
       const col = String((d as any).column_name);
       const values = sample.map((r) => r[col]).filter((v) => v !== null && v !== undefined);
       return {
@@ -484,13 +547,18 @@ export async function snapshotFromHandle(
         sampleValues: values.slice(0, 5),
       };
     });
+    columns = enrichColumns(columns, sample);
+    try { columns = await exactColumnStats((q, l) => readAll(q, l ?? "stats"), dest, columns); } catch { /* sample floor stands */ }
     datasets.push({
       tableName: local,
       profile: {
         source: { filename: `${dialect}:${hit.schema}.${hit.table} (full)`, format: "json" },
         rowCount, columns, sampleRows: sample,
       },
+      origin: { catalog: hit.db, schema: hit.schema, table: hit.table },
     });
   }
+  // A3: measured relationship edges against the full local snapshot.
+  try { await attachMeasuredForeignKeys((q, l) => readAll(q, l ?? "fk"), datasets); } catch { /* no edges */ }
   return { dbPath: opts.dbPath, datasets, warnings, skipped };
 }

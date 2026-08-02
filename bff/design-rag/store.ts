@@ -1,6 +1,6 @@
 // bff/design-rag/store.ts — the pgvector data-access layer for Design Retrieval.
 //
-// Wraps the public._design_refs table created in postgres.ts init() (§5.1).
+// Wraps the public.text2ui_design_refs table created in postgres.ts init() (§5.1).
 // Depends only on a structural `Queryable` (query(text, params) -> { rows }),
 // which pg.Pool satisfies at runtime and a mock satisfies in tests — so all of
 // the SQL/param/row-mapping logic is verifiable with no database.
@@ -100,7 +100,7 @@ export class PgVectorStore {
     }
     const capLit = ref.capEmbed && ref.capEmbed.length ? toVectorLiteral(ref.capEmbed) : null;
     const res = await this.db.query(
-      `INSERT INTO public._design_refs
+      `INSERT INTO public.text2ui_design_refs
          (id, domain, mode, image_path, phash, caption, tags, source, license, attribution, source_url, quality, img_embed, cap_embed)
        VALUES ($1,$2,$3,$4,$5,$6,$7::jsonb,$8,$9,$10,$11,$12,$13::vector,$14::vector)
        ON CONFLICT (phash) DO NOTHING
@@ -136,7 +136,7 @@ export class PgVectorStore {
     const sql =
       `SELECT id, domain, mode, image_path, phash, caption, tags, source, license, attribution, source_url,
               quality, retrievals, (img_embed <=> $1::vector) AS distance
-         FROM public._design_refs
+         FROM public.text2ui_design_refs
         WHERE ${where.join(" AND ")}
         ORDER BY img_embed <=> $1::vector
         LIMIT $${limitIdx}`;
@@ -148,7 +148,7 @@ export class PgVectorStore {
   async incRetrievals(ids: string[]): Promise<void> {
     if (!ids.length) return;
     await this.db.query(
-      `UPDATE public._design_refs SET retrievals = retrievals + 1 WHERE id = ANY($1)`,
+      `UPDATE public.text2ui_design_refs SET retrievals = retrievals + 1 WHERE id = ANY($1)`,
       [ids],
     );
   }
@@ -157,7 +157,7 @@ export class PgVectorStore {
    *  so we can skip the expensive caption/embed work for a near-duplicate). */
   async existsByPhash(phash: string): Promise<boolean> {
     const res = await this.db.query(
-      `SELECT 1 FROM public._design_refs WHERE phash = $1 LIMIT 1`,
+      `SELECT 1 FROM public.text2ui_design_refs WHERE phash = $1 LIMIT 1`,
       [phash],
     );
     return res.rows.length > 0;
@@ -169,7 +169,7 @@ export class PgVectorStore {
    *  (fine at this corpus size; bucket by prefix if it ever grows large). */
   async findSimilarPhash(phash: string, maxHamming: number, mode?: DesignMode): Promise<string | null> {
     const res = await this.db.query(
-      `SELECT id, phash FROM public._design_refs${mode ? " WHERE mode = $1" : ""}`,
+      `SELECT id, phash FROM public.text2ui_design_refs${mode ? " WHERE mode = $1" : ""}`,
       mode ? [mode] : [],
     );
     for (const row of res.rows) {
@@ -181,7 +181,7 @@ export class PgVectorStore {
   /** Corpus size, optionally per mode (handy for health checks / tests). */
   async count(mode?: DesignMode): Promise<number> {
     const res = await this.db.query(
-      `SELECT count(*)::int AS n FROM public._design_refs WHERE ($1::text IS NULL OR mode = $1)`,
+      `SELECT count(*)::int AS n FROM public.text2ui_design_refs WHERE ($1::text IS NULL OR mode = $1)`,
       [mode ?? null],
     );
     return Number(res.rows[0]?.n ?? 0);
@@ -193,7 +193,7 @@ export class PgVectorStore {
   async retireRefs(opts: { minQuality: number; graceDays: number; protectedSources?: string[] }): Promise<{ id: string; imagePath: string }[]> {
     const protectedSources = opts.protectedSources ?? ["exemplar-seed"];
     const res = await this.db.query(
-      `DELETE FROM public._design_refs
+      `DELETE FROM public.text2ui_design_refs
         WHERE source <> ALL($1)
           AND ( quality < $2
                 OR (retrievals = 0 AND created_at < now() - (($3)::text || ' days')::interval) )

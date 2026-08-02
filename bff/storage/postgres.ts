@@ -1,7 +1,7 @@
 // storage/postgres.ts — StorageEngine #2: Postgres. Selected with STORAGE=postgres
 // + PG_URL. Same shape as the DuckDB engine on purpose:
 //   - one SCHEMA per project ("p_<projectId>");
-//   - public._datasets metadata registry;
+//   - public.text2ui_datasets metadata registry;
 //   - replace-all dataset semantics; read-only, capped, timed-out queries.
 //
 // Differences forced by the engine:
@@ -76,11 +76,39 @@ export class PostgresStorage implements StorageEngine {
 
   constructor(connectionString: string) {
     this.pool = new pg.Pool({ connectionString, max: 5 });
-    this.ready = this.init();
+    this.ready = this.guardInit();
+  }
+
+  /** Storage outages degrade, never crash (the ECONNREFUSED-kills-the-BFF
+   *  incident): init failures are CAUGHT here — an uncaught rejection parked
+   *  on a constructor field takes the whole process down on modern Node —
+   *  logged once with the actionable fix, and RETRIED lazily on next use so
+   *  bringing the database back restores service without a restart. */
+  private initFailed = false;
+  private warnedDown = false;
+  private guardInit(): Promise<void> {
+    return this.init().then(
+      () => { this.initFailed = false; },
+      (err: any) => {
+        this.initFailed = true;
+        if (!this.warnedDown) {
+          this.warnedDown = true;
+          console.warn(`[storage] ${this.dialect} unavailable (${err?.code ?? err?.message ?? err}) — persistence degraded, requests that need it will fail with a clear error. Is 'docker compose up -d db' running? Retrying on next use.`);
+        }
+      },
+    );
+  }
+  private async ensure(): Promise<void> {
+    await this.ready;
+    if (this.initFailed) {
+      this.ready = this.guardInit();
+      await this.ready;
+      if (this.initFailed) throw new Error(`${this.dialect} storage is unavailable (connection refused) — start it with 'docker compose up -d db' and retry`);
+    }
   }
 
   private async init(): Promise<void> {
-    await this.pool.query(`CREATE TABLE IF NOT EXISTS public._datasets (
+    await this.pool.query(`CREATE TABLE IF NOT EXISTS public.text2ui_datasets (
       project_id  TEXT NOT NULL,
       table_name  TEXT NOT NULL,
       filename    TEXT NOT NULL,
@@ -89,13 +117,13 @@ export class PostgresStorage implements StorageEngine {
       created_at  TIMESTAMPTZ DEFAULT now(),
       PRIMARY KEY (project_id, table_name)
     )`);
-    await this.pool.query(`CREATE TABLE IF NOT EXISTS public._projects (
+    await this.pool.query(`CREATE TABLE IF NOT EXISTS public.text2ui_projects (
       project_id TEXT PRIMARY KEY,
       name       TEXT NOT NULL,
       created_at TIMESTAMPTZ DEFAULT now(),
       edited_at  TIMESTAMPTZ DEFAULT now()
     )`);
-    await this.pool.query(`CREATE TABLE IF NOT EXISTS public._versions (
+    await this.pool.query(`CREATE TABLE IF NOT EXISTS public.text2ui_versions (
       project_id  TEXT NOT NULL,
       version_num BIGINT NOT NULL,
       label       TEXT NOT NULL,
@@ -116,7 +144,7 @@ export class PostgresStorage implements StorageEngine {
     const dim = DESIGN_EMBED_DIM;
     try {
       await this.pool.query(`CREATE EXTENSION IF NOT EXISTS vector`);
-      await this.pool.query(`CREATE TABLE IF NOT EXISTS public._design_refs (
+      await this.pool.query(`CREATE TABLE IF NOT EXISTS public.text2ui_design_refs (
         id          TEXT PRIMARY KEY,
         domain      TEXT NOT NULL,
         mode        TEXT NOT NULL DEFAULT 'dashboard',
@@ -135,14 +163,14 @@ export class PostgresStorage implements StorageEngine {
         created_at  TIMESTAMPTZ DEFAULT now()
       )`);
       // Backfill provenance columns on databases created before they existed.
-      await this.pool.query(`ALTER TABLE public._design_refs ADD COLUMN IF NOT EXISTS attribution TEXT`);
-      await this.pool.query(`ALTER TABLE public._design_refs ADD COLUMN IF NOT EXISTS source_url TEXT`);
-      await this.pool.query(`CREATE INDEX IF NOT EXISTS idx_design_refs_img_hnsw
-        ON public._design_refs USING hnsw (img_embed vector_cosine_ops)`);
-      await this.pool.query(`CREATE INDEX IF NOT EXISTS idx_design_refs_domain
-        ON public._design_refs (domain, mode, quality)`);
-      await this.pool.query(`CREATE UNIQUE INDEX IF NOT EXISTS idx_design_refs_phash
-        ON public._design_refs (phash)`);
+      await this.pool.query(`ALTER TABLE public.text2ui_design_refs ADD COLUMN IF NOT EXISTS attribution TEXT`);
+      await this.pool.query(`ALTER TABLE public.text2ui_design_refs ADD COLUMN IF NOT EXISTS source_url TEXT`);
+      await this.pool.query(`CREATE INDEX IF NOT EXISTS idx_text2ui_design_refs_img_hnsw
+        ON public.text2ui_design_refs USING hnsw (img_embed vector_cosine_ops)`);
+      await this.pool.query(`CREATE INDEX IF NOT EXISTS idx_text2ui_design_refs_domain
+        ON public.text2ui_design_refs (domain, mode, quality)`);
+      await this.pool.query(`CREATE UNIQUE INDEX IF NOT EXISTS idx_text2ui_design_refs_phash
+        ON public.text2ui_design_refs (phash)`);
       this.designRefsReady = true;
     } catch (err) {
       this.designRefsReady = false;
@@ -154,7 +182,7 @@ export class PostgresStorage implements StorageEngine {
   }
 
   async replaceDatasets(projectId: string, datasets: DatasetUpload[]): Promise<DatasetMeta[]> {
-    await this.ready;
+    await this.ensure();
     const schema = schemaFor(projectId);
     for (const d of datasets) checkTableName(d.tableName);
 
@@ -194,10 +222,10 @@ export class PostgresStorage implements StorageEngine {
       }
 
       // refresh registry
-      await client.query(`DELETE FROM public._datasets WHERE project_id = $1`, [projectId]);
+      await client.query(`DELETE FROM public.text2ui_datasets WHERE project_id = $1`, [projectId]);
       for (const d of datasets) {
         await client.query(
-          `INSERT INTO public._datasets (project_id, table_name, filename, row_count, profile_json)
+          `INSERT INTO public.text2ui_datasets (project_id, table_name, filename, row_count, profile_json)
            VALUES ($1, $2, $3, $4, $5)`,
           [projectId, d.tableName, d.filename, d.rows.length, JSON.stringify(d.profile)],
         );
@@ -215,11 +243,11 @@ export class PostgresStorage implements StorageEngine {
   }
 
   async listDatasets(projectId: string): Promise<DatasetMeta[]> {
-    await this.ready;
+    await this.ensure();
     schemaFor(projectId); // validates
     const r = await this.pool.query(
       `SELECT table_name, filename, row_count, profile_json
-       FROM public._datasets WHERE project_id = $1 ORDER BY table_name`, [projectId],
+       FROM public.text2ui_datasets WHERE project_id = $1 ORDER BY table_name`, [projectId],
     );
     return r.rows.map((row: any) => ({
       tableName: row.table_name,
@@ -230,7 +258,7 @@ export class PostgresStorage implements StorageEngine {
   }
 
   async query(projectId: string, sql: string, opts: QueryOptions = {}): Promise<QueryResult> {
-    await this.ready;
+    await this.ensure();
     const schema = schemaFor(projectId);
     if (!opts.allowWrites) assertReadOnly(sql); // classifier first: consistent errors across engines
     const rowCap = opts.rowCap ?? DEFAULT_ROW_CAP;
@@ -262,24 +290,24 @@ export class PostgresStorage implements StorageEngine {
   }
 
   async upsertProject(projectId: string, name: string): Promise<void> {
-    await this.ready;
+    await this.ensure();
     schemaFor(projectId);
     await this.pool.query(
-      `INSERT INTO public._projects (project_id, name) VALUES ($1, $2)
+      `INSERT INTO public.text2ui_projects (project_id, name) VALUES ($1, $2)
        ON CONFLICT (project_id) DO UPDATE SET name = EXCLUDED.name, edited_at = now()`,
       [projectId, name],
     );
   }
 
   async listProjects(): Promise<ProjectRecord[]> {
-    await this.ready;
+    await this.ensure();
     const r = await this.pool.query(`
       SELECT p.project_id, p.name, p.created_at, p.edited_at,
              COALESCE(v.n, 0) AS version_count,
              COALESCE(d.tables, ARRAY[]::text[]) AS table_names
-      FROM public._projects p
-      LEFT JOIN (SELECT project_id, count(*) AS n FROM public._versions GROUP BY project_id) v USING (project_id)
-      LEFT JOIN (SELECT project_id, array_agg(table_name ORDER BY table_name) AS tables FROM public._datasets GROUP BY project_id) d USING (project_id)
+      FROM public.text2ui_projects p
+      LEFT JOIN (SELECT project_id, count(*) AS n FROM public.text2ui_versions GROUP BY project_id) v USING (project_id)
+      LEFT JOIN (SELECT project_id, array_agg(table_name ORDER BY table_name) AS tables FROM public.text2ui_datasets GROUP BY project_id) d USING (project_id)
       ORDER BY p.edited_at DESC`);
     return r.rows.map((row: any) => ({
       projectId: row.project_id,
@@ -292,14 +320,14 @@ export class PostgresStorage implements StorageEngine {
   }
 
   async getProject(projectId: string) {
-    await this.ready;
+    await this.ensure();
     schemaFor(projectId);
     const p = await this.pool.query(
-      `SELECT project_id, name, created_at, edited_at FROM public._projects WHERE project_id = $1`, [projectId],
+      `SELECT project_id, name, created_at, edited_at FROM public.text2ui_projects WHERE project_id = $1`, [projectId],
     );
     if (!p.rows.length) return null;
     const v = await this.pool.query(
-      `SELECT version_num, label, app_json, created_at FROM public._versions WHERE project_id = $1 ORDER BY version_num`,
+      `SELECT version_num, label, app_json, created_at FROM public.text2ui_versions WHERE project_id = $1 ORDER BY version_num`,
       [projectId],
     );
     const row = p.rows[0];
@@ -320,23 +348,23 @@ export class PostgresStorage implements StorageEngine {
   }
 
   async saveVersion(projectId: string, v: { num: number; label: string; app: unknown }): Promise<void> {
-    await this.ready;
+    await this.ensure();
     schemaFor(projectId);
     await this.pool.query(
-      `INSERT INTO public._versions (project_id, version_num, label, app_json) VALUES ($1, $2, $3, $4)
+      `INSERT INTO public.text2ui_versions (project_id, version_num, label, app_json) VALUES ($1, $2, $3, $4)
        ON CONFLICT (project_id, version_num) DO UPDATE SET label = EXCLUDED.label, app_json = EXCLUDED.app_json`,
       [projectId, v.num, v.label, JSON.stringify(v.app)],
     );
-    await this.pool.query(`UPDATE public._projects SET edited_at = now() WHERE project_id = $1`, [projectId]);
+    await this.pool.query(`UPDATE public.text2ui_projects SET edited_at = now() WHERE project_id = $1`, [projectId]);
   }
 
   async deleteProject(projectId: string): Promise<void> {
-    await this.ready;
+    await this.ensure();
     const schema = schemaFor(projectId);
     await this.pool.query(`DROP SCHEMA IF EXISTS ${qid(schema)} CASCADE`);
-    await this.pool.query(`DELETE FROM public._datasets WHERE project_id = $1`, [projectId]);
-    await this.pool.query(`DELETE FROM public._versions WHERE project_id = $1`, [projectId]);
-    await this.pool.query(`DELETE FROM public._projects WHERE project_id = $1`, [projectId]);
+    await this.pool.query(`DELETE FROM public.text2ui_datasets WHERE project_id = $1`, [projectId]);
+    await this.pool.query(`DELETE FROM public.text2ui_versions WHERE project_id = $1`, [projectId]);
+    await this.pool.query(`DELETE FROM public.text2ui_projects WHERE project_id = $1`, [projectId]);
   }
 
   async close(): Promise<void> {

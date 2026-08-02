@@ -1,0 +1,249 @@
+// bff/dashboard/decompose.ts — the PLAN-BRIEF layer (query breakdown + design).
+//
+// DAY-1 MERGE: this is now ONE structured call instead of the old sequential
+// rewrite→decompose pair — it returns bounded reasoning (schema-constrained
+// COT), the grounded task list, AND a typed DESIGN channel (accent + vibrant
+// palette + vibe) that the handler lands deterministically into spec.meta.
+// Cold builds drop from three sequential model round-trips to two.
+//
+// Sits ABOVE the specialist agents: the user's question is decomposed into a
+// small set of typed analytical TASKS ("how is attainment trending" → trend;
+// "which priorities are worst" → ranking), and each task is routed to the
+// existing agent whose family answers it. The agents stop guessing what to
+// propose and start answering assigned questions.
+//
+// Design constraints (the critique that shaped this):
+//   1. TRIVIALITY GATE — short generic prompts ("sales dashboard") don't need a
+//      decomposition call; deterministic tasks from the schema roles suffice.
+//      Decomposition LLM cost is only paid when the prompt carries real intent.
+//   2. GROUNDED OR DROPPED — every task must name columns that exist; ungrounded
+//      tasks are discarded rather than sent to agents to hallucinate around.
+//   3. CAPPED FAN-OUT — at most 8 tasks; the merger's dedupe/caps still apply.
+//   4. TOTAL — the LLM call can fail; deterministic decomposition from the
+//      schema roles is the floor, so this layer can never block a build.
+import type { Dataset } from "../../shared/types";
+import { callGemini, ORCHESTRATE_OPTS, type GenResult, type GenOptions, type ImagePart } from "../aiflow";
+import { classifySchema, type SchemaRoles } from "./enhance";
+import { decomposeFewshotBlock } from "./fewshot";
+
+export type TaskKind = "kpi" | "trend" | "ranking" | "composition" | "comparison" | "detail";
+
+export interface AnalysisTask {
+  /** the sub-question in plain language, e.g. "How is SLA attainment trending weekly?" */
+  question: string;
+  kind: TaskKind;
+  /** columns the task should use — validated against the profile */
+  columns: string[];
+  table?: string;
+}
+
+// Widened ADDITIVELY with a 4th images arg so existing fakes (which ignore it)
+// keep type-checking; callGemini already accepts it.
+export type DecomposeRun = (system: string, user: string, opts?: GenOptions, images?: ImagePart[]) => Promise<GenResult>;
+
+/** The typed design channel. Colors are HEX-validated at coercion; anything
+ *  invalid is dropped so downstream never trusts a model color blindly. */
+/** The design decision, made ONCE here and carried to every agent and the
+ *  renderer. Widened past a prose `vibe` to the concrete tokens the renderer can
+ *  actually apply — a vibe string cannot colour a surface. */
+export interface PlanDesign {
+  accent?: string;
+  palette?: string[];
+  vibe?: string;
+  /** Page background and card surface, as #rrggbb. */
+  background?: string;
+  surface?: string;
+  /** "dark" flips the renderer's card/tick/grid treatment. */
+  theme?: "light" | "dark";
+  /** Heading typeface, e.g. "Inter" — rendered as a CSS font-family stack. */
+  headingFont?: string;
+  /** Card corner radius in px. */
+  radius?: number;
+}
+
+const HEX = /^#[0-9a-fA-F]{6}$/;
+function coerceDesign(d: any): PlanDesign | undefined {
+  if (!d || typeof d !== "object") return undefined;
+  const out: PlanDesign = {};
+  if (typeof d.accent === "string" && HEX.test(d.accent.trim())) out.accent = d.accent.trim();
+  if (Array.isArray(d.palette)) {
+    const pal = d.palette.map((c: any) => String(c).trim()).filter((c: string) => HEX.test(c));
+    if (pal.length >= 3) out.palette = pal.slice(0, 8);
+  }
+  if (typeof d.vibe === "string" && d.vibe.trim()) out.vibe = d.vibe.trim().slice(0, 140);
+  if (typeof d.background === "string" && HEX.test(d.background.trim())) out.background = d.background.trim();
+  if (typeof d.surface === "string" && HEX.test(d.surface.trim())) out.surface = d.surface.trim();
+  if (d.theme === "dark" || d.theme === "light") out.theme = d.theme;
+  // A font name reaches a CSS font-family, so keep it to a conservative charset
+  // rather than letting arbitrary model text into a style string.
+  if (typeof d.headingFont === "string" && /^[A-Za-z0-9 _-]{2,40}$/.test(d.headingFont.trim())) out.headingFont = d.headingFont.trim();
+  const r = Number(d.radius);
+  if (Number.isFinite(r) && r >= 0 && r <= 32) out.radius = Math.round(r);
+  return Object.keys(out).length ? out : undefined;
+}
+
+const MAX_TASKS = 8;
+
+const SCHEMA = {
+  type: "object",
+  properties: {
+    reasoning: { type: "string", description: "2-4 sentences BEFORE anything else: what the data supports, how the request maps to tasks, and what visual mood fits the domain." },
+    tasks: {
+      type: "array",
+      items: {
+        type: "object",
+        properties: {
+          question: { type: "string" },
+          kind: { type: "string", enum: ["kpi", "trend", "ranking", "composition", "comparison", "detail"] },
+          table: { type: "string" },
+          columns: { type: "array", items: { type: "string" } },
+        },
+        required: ["question", "kind", "columns"],
+      },
+    },
+    design: {
+      type: "object",
+      description: "Art direction for the dashboard. VIBRANT, high-saturation, domain-fitting — never gray or drab.",
+      properties: {
+        accent: { type: "string", description: "primary accent as #rrggbb" },
+        palette: { type: "array", items: { type: "string" }, description: "5-6 DISTINCT vivid chart colors as #rrggbb, ordered by prominence" },
+        vibe: { type: "string", description: "one line of visual direction, e.g. 'confident fintech: electric violet on cool neutrals'" },
+        background: { type: "string", description: "page background as #rrggbb" },
+        surface: { type: "string", description: "card surface as #rrggbb, clearly distinct from the background" },
+        theme: { type: "string", enum: ["light", "dark"], description: "whichever the background implies" },
+        headingFont: { type: "string", description: "heading typeface NAME only, e.g. Inter" },
+        radius: { type: "integer", description: "card corner radius in px, 0-32" },
+      },
+      required: ["accent", "palette"],
+    },
+  },
+  required: ["tasks", "design"],
+};
+
+const SYSTEM = `You are the task-decomposition layer of a dashboard builder. Break the user's request into 3-8 concrete analytical sub-questions, each answerable by ONE widget family:
+- kpi: a single headline number
+- trend: how something moves over time (needs a date column)
+- ranking: which categories are highest/lowest (bar)
+- composition: share-of-total (pie/donut, low-cardinality category)
+- comparison: two measures or segments side by side
+- detail: a drill-down table
+Ground every task in REAL columns from the data profile — name them in "columns". Cover the user's explicit asks first, then add the most valuable complementary questions.
+Think in "reasoning" FIRST (2-4 sentences), THEN emit tasks.
+You are ALSO the art director: in "design", pick a vivid accent and a 5-6 color high-saturation palette (#rrggbb) that fits the domain and the user's stated mood — colorful and confident, never gray, never drab, colors clearly distinct from one another — plus a one-line vibe. Honor any explicit color/style words in the user's request.
+Output ONLY {"reasoning": "...", "tasks":[...], "design":{...}}.`;
+
+/** Deterministic gate: prompts with no analytical content skip the LLM call. */
+export function isTrivialPrompt(prompt: string): boolean {
+  const p = prompt.trim();
+  if (p.split(/\s+/).length <= 6) return true;
+  // Generic "make me a dashboard" phrasing with no domain nouns beyond filler.
+  return /^(make|build|create|generate|show)( me)?( an?| the)? (comprehensive |nice |good |detailed )*(dashboard|overview|report)( (of|for|from|on) (my|our|the) data)?[.!]?$/i.test(p);
+}
+
+/** Deterministic decomposition from schema roles — the floor and the fallback. */
+export function fallbackTasks(datasets: Dataset[], roles: SchemaRoles): AnalysisTask[] {
+  const tasks: AnalysisTask[] = [];
+  const m = roles.measures[0];
+  const t = roles.temporals[0];
+  const d = roles.dimensions[0];
+  const main = datasets[0]?.tableName;
+  if (main) tasks.push({ question: "What is the overall volume?", kind: "kpi", columns: [datasets[0].profile.columns[0]?.name ?? ""], table: main });
+  if (m) tasks.push({ question: `What is total ${m.col.name}?`, kind: "kpi", columns: [m.col.name], table: m.table });
+  if (t) tasks.push({ question: `How does ${m ? m.col.name : "volume"} move over time?`, kind: "trend", columns: [t.col.name, ...(m ? [m.col.name] : [])], table: t.table });
+  if (d) tasks.push({ question: `Which ${d.col.name} values are largest?`, kind: "ranking", columns: [d.col.name, ...(m ? [m.col.name] : [])], table: d.table });
+  const smallDim = roles.dimensions.find((x) => x.col.uniqueCount >= 2 && x.col.uniqueCount <= 8);
+  if (smallDim) tasks.push({ question: `What is the share by ${smallDim.col.name}?`, kind: "composition", columns: [smallDim.col.name], table: smallDim.table });
+  if (d) tasks.push({ question: `What does the detail look like by ${d.col.name}?`, kind: "detail", columns: [d.col.name], table: d.table });
+  return tasks.filter((x) => x.columns[0]);
+}
+
+function allColumns(datasets: Dataset[]): Set<string> {
+  const s = new Set<string>();
+  for (const d of datasets) for (const c of d.profile.columns) s.add(c.name.toLowerCase());
+  return s;
+}
+
+function stripFences(t: string): string {
+  return t.replace(/^```(?:json)?\s*/i, "").replace(/```\s*$/i, "").trim();
+}
+
+/** Decompose the user's request into grounded tasks. Total — never null, never empty
+ *  (falls back to deterministic tasks), never more than MAX_TASKS. */
+export async function decomposeQuery(
+  datasets: Dataset[], userPrompt: string, directive: string,
+  run: DecomposeRun = callGemini,
+  /** Curated design references + the exact-token block.
+   *
+   *  They go to THIS call and no other. The specialist agents author a widget
+   *  spec, not CSS, so attaching five PNGs to each of eight parallel calls would
+   *  be expensive and mostly irrelevant to their job. The art direction is
+   *  decided once here and reaches every agent through the `design` object,
+   *  and the renderer through spec.meta. */
+  refs: { images?: ImagePart[]; tokenBlock?: string } = {},
+): Promise<{ tasks: AnalysisTask[]; source: "model" | "deterministic"; design?: PlanDesign; reasoning?: string }> {
+  const roles = classifySchema(datasets);
+  if (isTrivialPrompt(userPrompt)) {
+    const tasks = fallbackTasks(datasets, roles);
+    console.log(`[decompose] trivial prompt -> ${tasks.length} deterministic task(s)`);
+    return { tasks, source: "deterministic" };
+  }
+  const cols = allColumns(datasets);
+  const schemaLines = datasets.map((d) => `Table "${d.tableName}": ${d.profile.columns.map((c) => `${c.name}:${c.type}`).join(", ")}`).join("\n");
+  try {
+    const images = refs.images ?? [];
+    if (images.length) console.log(`[design-refs] attached ${images.length} curated reference(s) to the plan call`);
+    const { text } = await run(SYSTEM + decomposeFewshotBlock(), [
+      "DATA PROFILE:", schemaLines, "",
+      "GUIDANCE:", directive.slice(0, 1500), "",
+      // Images carry LAYOUT and palette feel; the token block carries the exact
+      // values a screenshot can only be eyeballed for. Both, or the design drifts.
+      ...(images.length
+        ? ["REFERENCE DESIGNS (attached as images): match their palette, contrast and typographic feel in your `design` choice. Do NOT copy their data, labels or text.", ""]
+        : []),
+      ...(refs.tokenBlock ? [refs.tokenBlock, ""] : []),
+      "USER REQUEST:", userPrompt, "",
+      'Return {"reasoning": "...", "tasks":[...], "design":{...}}.',
+    ].join("\n"), { ...ORCHESTRATE_OPTS, responseSchema: SCHEMA }, images);
+    const parsed = JSON.parse(stripFences(text));
+    const design = coerceDesign(parsed?.design);
+    const reasoning = typeof parsed?.reasoning === "string" ? parsed.reasoning.slice(0, 600) : undefined;
+    const raw: any[] = Array.isArray(parsed?.tasks) ? parsed.tasks : [];
+    const tasks: AnalysisTask[] = raw
+      .filter((t) => t?.question && t?.kind && Array.isArray(t?.columns))
+      .map((t) => ({
+        question: String(t.question).slice(0, 200),
+        kind: t.kind as TaskKind,
+        table: t.table ? String(t.table) : undefined,
+        // GROUNDED OR DROPPED: keep only columns that exist in the profile.
+        columns: t.columns.map((c: any) => String(c)).filter((c: string) => cols.has(c.toLowerCase())),
+      }))
+      .filter((t) => t.columns.length > 0)
+      .slice(0, MAX_TASKS);
+    if (tasks.length) {
+      console.log(`[decompose] ${tasks.length} task(s): ${tasks.map((t) => t.kind).join(", ")}${design ? " · design: " + (design.vibe ?? design.accent ?? "palette") : ""}`);
+      return { tasks, source: "model", ...(design ? { design } : {}), ...(reasoning ? { reasoning } : {}) };
+    }
+    console.warn("[decompose] model returned no grounded tasks — deterministic fallback");
+  } catch (err) {
+    console.warn(`[decompose] failed (${(err as Error).message}) — deterministic fallback`);
+  }
+  return { tasks: fallbackTasks(datasets, roles), source: "deterministic" };
+}
+
+/** Which agent family serves each task kind. comparison → both trend and ranking
+ *  agents see it (either can answer a comparison, over time or across segments). */
+export function tasksForAgent(agent: "kpi" | "line" | "bar" | "pie" | "table", tasks: AnalysisTask[]): AnalysisTask[] {
+  const map: Record<string, TaskKind[]> = {
+    kpi: ["kpi"], line: ["trend", "comparison"], bar: ["ranking", "comparison"],
+    pie: ["composition"], table: ["detail"],
+  };
+  const kinds = new Set(map[agent]);
+  return tasks.filter((t) => kinds.has(t.kind));
+}
+
+/** Render an agent's assigned tasks as prompt lines. */
+export function taskDirective(assigned: AnalysisTask[]): string | null {
+  if (!assigned.length) return null;
+  return "YOUR ASSIGNED QUESTIONS (answer each with one widget, using the named columns):\n" +
+    assigned.map((t, i) => `${i + 1}. ${t.question} [columns: ${t.columns.join(", ")}${t.table ? ` · table: ${t.table}` : ""}]`).join("\n");
+}
